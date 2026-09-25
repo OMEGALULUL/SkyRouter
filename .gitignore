@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Runtime secrets - never commit
+data/
+*.key
+secrets.json
+scheduler_state.json
+cudy_devices.local.yaml
+*.log

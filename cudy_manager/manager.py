@@ -1,0 +1,256 @@
+import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .adapters import AdapterError, CudyAdapter, TendaAdapter
+from .discovery import CudyDiscovery, DiscoveredDevice
+from .models import Device, ValidationError
+from .openwrt import OpenWrtAdapter
+from .secrets import SecretStore, SecretStoreError
+
+logger = logging.getLogger(__name__)
+
+
+class ManagerError(RuntimeError):
+    pass
+
+
+class DeviceManager:
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        data_dir: str | Path | None = None,
+        secret_store: SecretStore | None = None,
+    ):
+        package_dir = Path(__file__).resolve().parent
+        self.config_path = Path(
+            config_path or os.environ.get("ROUTER_MANAGER_CONFIG") or package_dir / "cudy_devices.yaml"
+        ).expanduser()
+        default_data = os.environ.get(
+            "ROUTER_MANAGER_DATA_DIR",
+            str(Path.home() / ".local" / "state" / "skybre-router-manager"),
+        )
+        self.data_dir = Path(data_dir or default_data).expanduser()
+        self.secrets = secret_store or SecretStore(self.data_dir)
+        self.devices: dict[str, Device] = {}
+        self._lock = threading.RLock()
+        self._load_config()
+
+    def _load_config(self) -> None:
+        if not self.config_path.exists():
+            self.save_config()
+            return
+        try:
+            data = yaml.safe_load(self.config_path.read_text()) or {}
+        except (OSError, ValueError) as exc:
+            raise ManagerError(f"device config is unreadable: {self.config_path}") from exc
+        entries = data.get("devices", {}) if isinstance(data, dict) else {}
+        if isinstance(entries, list):
+            converted = {}
+            for item in entries:
+                if isinstance(item, dict) and item.get("id"):
+                    converted[str(item["id"])] = item
+            entries = converted
+        if not isinstance(entries, dict):
+            raise ManagerError("device config must contain a devices mapping")
+        loaded = {}
+        for identifier, raw in entries.items():
+            try:
+                loaded[str(identifier)] = Device.from_dict(str(identifier), raw)
+            except (ValidationError, TypeError, ValueError) as exc:
+                raise ManagerError(f"invalid device {identifier!r}: {exc}") from exc
+        with self._lock:
+            self.devices = loaded
+        self._validate_references()
+
+    def _validate_references(self) -> None:
+        for device in self.devices.values():
+            for reference in (device.password_ref, device.snmp_community_ref):
+                if reference and not self.secrets.has(reference):
+                    raise ManagerError(f"device {device.identifier!r} references a missing secret")
+
+    def save_config(self) -> None:
+        with self._lock:
+            payload = {"devices": {identifier: device.to_config() for identifier, device in self.devices.items()}}
+        self.config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
+        temporary.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+        try:
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, self.config_path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def _store_secret(self, identifier: str, kind: str, value: str | None) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str) or not value:
+            raise ValidationError(f"{kind} must be a non-empty string")
+        return self.secrets.put(value, f"device-{identifier}-{kind}")
+
+    def add_device(self, identifier: str, host: str, vendor: str, password: str | None = None, **values: Any) -> Device:
+        device_id = str(identifier).strip()
+        if device_id in self.devices:
+            raise ManagerError(f"device {device_id!r} already exists")
+        community = values.pop("snmp_community", None)
+        candidate = Device.from_dict(device_id, {**values, "vendor": vendor, "host": host})
+        refs = {}
+        try:
+            if password is not None:
+                refs["password_ref"] = self._store_secret(device_id, "password", password)
+            if community is not None:
+                refs["snmp_community_ref"] = self._store_secret(device_id, "snmp-community", community)
+            device = Device.from_dict(device_id, {**candidate.to_config(), **refs})
+            with self._lock:
+                self.devices[device_id] = device
+            self.save_config()
+            return device
+        except Exception:
+            for reference in refs.values():
+                self.secrets.delete(reference)
+            raise
+
+    def update_device(self, identifier: str, **values: Any) -> Device:
+        with self._lock:
+            current = self.devices.get(identifier)
+            if current is None:
+                raise ManagerError(f"device {identifier!r} does not exist")
+            config = current.to_config()
+        password = values.pop("password", None)
+        community = values.pop("snmp_community", None)
+        config.update(values)
+        device = Device.from_dict(identifier, config)
+        with self._lock:
+            self.devices[identifier] = device
+        if password is not None:
+            self._store_secret(identifier, "password", password)
+        if community is not None:
+            self._store_secret(identifier, "snmp-community", community)
+        self.save_config()
+        return self.devices[identifier]
+
+    def remove_device(self, identifier: str) -> None:
+        with self._lock:
+            device = self.devices.pop(identifier, None)
+            if device is None:
+                raise ManagerError(f"device {identifier!r} does not exist")
+            remaining_refs = {item.password_ref for item in self.devices.values()}
+            remaining_refs.update(item.snmp_community_ref for item in self.devices.values())
+        self.save_config()
+        if device.password_ref not in remaining_refs:
+            self.secrets.delete(device.password_ref)
+        if device.snmp_community_ref not in remaining_refs:
+            self.secrets.delete(device.snmp_community_ref)
+
+    def get_device(self, identifier: str) -> Device:
+        with self._lock:
+            device = self.devices.get(identifier)
+        if device is not None:
+            return device
+        with self._lock:
+            for candidate in self.devices.values():
+                if candidate.host == identifier:
+                    return candidate
+        raise ManagerError(f"device {identifier!r} does not exist")
+
+    def get_all_devices(self) -> list[Device]:
+        with self._lock:
+            return list(self.devices.values())
+
+    def credentials(self, device: Device) -> str:
+        if not device.password_ref:
+            raise AdapterError(f"device {device.identifier!r} has no password secret")
+        try:
+            return self.secrets.get(device.password_ref)
+        except SecretStoreError as exc:
+            raise AdapterError(str(exc)) from exc
+
+    def adapter_for(self, device: Device):
+        password = self.credentials(device)
+        if device.vendor == "tenda":
+            return TendaAdapter(device, password)
+        if device.transport == "ssh":
+            return OpenWrtAdapter(device, password)
+        return CudyAdapter(device, password)
+
+    def get_status(self, identifier: str) -> dict[str, Any]:
+        device = self.get_device(identifier)
+        checked_at = datetime.now(UTC).isoformat()
+        try:
+            status = self.adapter_for(device).status()
+            status.setdefault("online", False)
+            status["checked_at"] = checked_at
+        except (AdapterError, SecretStoreError, ValidationError, OSError, RuntimeError) as exc:
+            logger.debug("status check failed for %s: %s", device.identifier, exc)
+            status = {"online": False, "error": str(exc)[:200], "checked_at": checked_at}
+        device.status = status
+        device.last_seen = checked_at
+        return status
+
+    def get_all_statuses(self) -> dict[str, dict[str, Any]]:
+        devices = self.get_all_devices()
+        results: dict[str, dict[str, Any]] = {}
+        if not devices:
+            return results
+        with ThreadPoolExecutor(max_workers=min(8, len(devices))) as pool:
+            futures = {pool.submit(self.get_status, device.identifier): device.identifier for device in devices}
+            for future in as_completed(futures):
+                identifier = futures[future]
+                try:
+                    results[identifier] = future.result()
+                except (AdapterError, SecretStoreError, ValidationError, OSError, RuntimeError) as exc:
+                    results[identifier] = {"online": False, "error": str(exc)[:200]}
+        return results
+
+    def reboot_device(self, identifier: str) -> bool:
+        device = self.get_device(identifier)
+        adapter = self.adapter_for(device)
+        return adapter.reboot()
+
+    def get_connected_clients(self, identifier: str) -> list[dict[str, Any]]:
+        adapter = self.adapter_for(self.get_device(identifier))
+        return adapter.clients()
+
+    def set_wifi_ssid(self, identifier: str, ssid: str, radio: str | None = None) -> bool:
+        if not isinstance(ssid, str) or not ssid.strip() or len(ssid) > 32:
+            raise ValidationError("SSID must be between 1 and 32 characters")
+        return self.adapter_for(self.get_device(identifier)).set_ssid(ssid.strip(), radio)
+
+    def get_mesh_status(self, identifier: str) -> dict[str, Any]:
+        return self.adapter_for(self.get_device(identifier)).mesh_status()
+
+    def discover_network(self, subnet: str = "192.168.1.0/24") -> list[DiscoveredDevice]:
+        return CudyDiscovery(subnet).discover()
+
+    def dashboard(self, include_status: bool = True) -> dict[str, Any]:
+        devices = self.get_all_devices()
+        statuses = self.get_all_statuses() if include_status else {}
+        public = []
+        for device in devices:
+            item = device.to_public()
+            if include_status:
+                item["status"] = statuses.get(device.identifier, {"online": False})
+            public.append(item)
+        online = sum(1 for item in public if item.get("status", {}).get("online"))
+        return {
+            "devices": public,
+            "summary": {
+                "total_devices": len(public),
+                "online": online,
+                "offline": len(public) - online,
+            },
+        }
+
+    def get_dashboard_data(self) -> dict[str, Any]:
+        return self.dashboard()
+
+
+CudyManager = DeviceManager
+CudyDevice = Device
