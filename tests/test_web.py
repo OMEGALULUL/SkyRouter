@@ -9,6 +9,10 @@ from cudy_manager.web import Settings, create_app
 PASSWORD = "correct horse battery staple"
 
 
+def rejected():
+    return {"ok": False, "error": "authentication failed"}
+
+
 def build_client(tmp_path: Path, password: str = PASSWORD) -> TestClient:
     return TestClient(build_app(tmp_path, password))
 
@@ -300,3 +304,105 @@ class TestDeviceApi:
         assert response.headers["X-Content-Type-Options"] == "nosniff"
         assert response.headers["X-Frame-Options"] == "DENY"
         assert response.headers["Cache-Control"] == "no-store"
+
+
+class TestPasswordReset:
+    def _add(self, client: TestClient, token: str, password: str = "old"):
+        return client.post(
+            "/api/devices",
+            json={"id": "r1", "host": "192.168.1.1", "vendor": "cudy", "password": password},
+            headers={"X-CSRF-Token": token},
+        )
+
+    def test_requires_authentication(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            assert client.post("/api/devices/r1/password", json={"password": "new"}).status_code == 401
+
+    def test_requires_csrf(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            token = login(client)
+            self._add(client, token)
+            assert client.post("/api/devices/r1/password", json={"password": "new"}).status_code == 403
+
+    def test_rotates_password_without_leaking_it(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            token = login(client)
+            self._add(client, token)
+            response = client.post(
+                "/api/devices/r1/password",
+                json={"password": "brand-new-secret", "verify": False},
+                headers={"X-CSRF-Token": token},
+            )
+            assert response.status_code == 200
+            body = response.text
+            assert "brand-new-secret" not in body
+            assert "password_ref" not in body
+            assert response.json()["password_updated"] is True
+
+            assert "brand-new-secret" not in (tmp_path / "devices.yaml").read_text()
+            assert "brand-new-secret" not in (tmp_path / "data" / "secrets.json").read_text()
+
+    def test_missing_password_rejected(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            token = login(client)
+            self._add(client, token)
+            for payload in ({}, {"password": ""}, {"password": None}, {"password": 5}, {"password": ["a"]}):
+                response = client.post("/api/devices/r1/password", json=payload, headers={"X-CSRF-Token": token})
+                assert response.status_code == 400, payload
+
+    def test_non_boolean_verify_rejected(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            token = login(client)
+            self._add(client, token)
+            response = client.post(
+                "/api/devices/r1/password",
+                json={"password": "new", "verify": "yes"},
+                headers={"X-CSRF-Token": token},
+            )
+            assert response.status_code == 400
+
+    def test_secret_reference_injection_rejected(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            token = login(client)
+            self._add(client, token)
+            response = client.post(
+                "/api/devices/r1/password",
+                json={"password": "new", "password_ref": "device-r1-password"},
+                headers={"X-CSRF-Token": token},
+            )
+            assert response.status_code == 400
+            assert "password_ref" in response.json()["detail"]
+
+    def test_unknown_device_rejected(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            token = login(client)
+            response = client.post(
+                "/api/devices/ghost/password",
+                json={"password": "new", "verify": False},
+                headers={"X-CSRF-Token": token},
+            )
+            assert response.status_code == 400
+
+    def test_verification_failure_is_reported_but_password_saved(self, tmp_path: Path, monkeypatch):
+        with TestClient(build_app(tmp_path)) as client:
+            token = login(client)
+            self._add(client, token)
+
+            monkeypatch.setattr(client.app.state.manager, "verify_credentials", lambda identifier: rejected())
+            response = client.post(
+                "/api/devices/r1/password",
+                json={"password": "typo", "verify": True},
+                headers={"X-CSRF-Token": token},
+            )
+            assert response.status_code == 200
+            assert response.json()["verified"]["ok"] is False
+            assert "typo" not in response.text
+            monkeypatch.undo()
+
+    def test_dashboard_exposes_a_password_control(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            login(client)
+            page = client.get("/").text
+            assert "/password" in page
+            assert "showPassword" in page
+            assert "Confirm password" in page

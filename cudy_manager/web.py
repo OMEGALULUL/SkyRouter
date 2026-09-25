@@ -374,6 +374,22 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
             raise HTTPException(status_code=400, detail=_error_detail(exc)) from exc
         return {"device": device.to_public()}
 
+    @app.post("/api/devices/{identifier}/password")
+    async def set_password(identifier: str, request: Request):
+        body = await _body(request)
+        _reject_plaintext_credentials(body)
+        password = body.get("password")
+        if not isinstance(password, str) or not password:
+            raise HTTPException(status_code=400, detail="password is required and must be a non-empty string")
+        verify = body.get("verify", True)
+        if not isinstance(verify, bool):
+            raise HTTPException(status_code=400, detail="verify must be a boolean")
+        try:
+            result = manager.set_password(identifier, password, verify=verify)
+        except (ValidationError, ManagerError, SecretStoreError) as exc:
+            raise HTTPException(status_code=400, detail=_error_detail(exc)) from exc
+        return result
+
     @app.delete("/api/devices/{identifier}")
     async def delete_device(identifier: str):
         try:

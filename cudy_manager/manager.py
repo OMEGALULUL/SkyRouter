@@ -127,14 +127,37 @@ class DeviceManager:
         community = values.pop("snmp_community", None)
         config.update(values)
         device = Device.from_dict(identifier, config)
-        with self._lock:
-            self.devices[identifier] = device
         if password is not None:
             self._store_secret(identifier, "password", password)
         if community is not None:
             self._store_secret(identifier, "snmp-community", community)
+        with self._lock:
+            self.devices[identifier] = device
         self.save_config()
         return self.devices[identifier]
+
+    def set_password(self, identifier: str, password: str, verify: bool = True) -> dict[str, Any]:
+        self.get_device(identifier)
+        if not isinstance(password, str) or not password:
+            raise ValidationError("password must be a non-empty string")
+        reference = self._store_secret(identifier, "password", password)
+        if self.devices[identifier].password_ref != reference:
+            self.update_device(identifier, password_ref=reference)
+        result: dict[str, Any] = {"device": identifier, "password_updated": True}
+        if verify:
+            result["verified"] = self.verify_credentials(identifier)
+            if not result["verified"]["ok"]:
+                logger.warning("password for %s did not authenticate", identifier)
+        return result
+
+    def verify_credentials(self, identifier: str) -> dict[str, Any]:
+        device = self.get_device(identifier)
+        checked_at = datetime.now(UTC).isoformat()
+        try:
+            self.adapter_for(device).status()
+        except (AdapterError, SecretStoreError, ValidationError, OSError, RuntimeError) as exc:
+            return {"ok": False, "error": str(exc)[:200], "checked_at": checked_at}
+        return {"ok": True, "checked_at": checked_at}
 
     def remove_device(self, identifier: str) -> None:
         with self._lock:

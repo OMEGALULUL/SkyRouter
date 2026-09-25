@@ -58,6 +58,7 @@ plain HTTP, so set `ROUTER_MANAGER_SECURE_COOKIE=1` when you terminate TLS in fr
 
 ```bash
 router-manager add <id> <host> --vendor cudy|tenda [--username admin] [--model X]
+router-manager set-password <id> [--no-verify]
 router-manager list
 router-manager status <id>
 router-manager reboot <id>
@@ -87,6 +88,70 @@ printf '%s' "$ROUTER_PASSWORD" | router-manager add cudy1 192.168.1.1 --vendor c
 | `ROUTER_MANAGER_DATA_DIR` | `~/.local/state/skybre-router-manager` | Key, vault, scheduler state. |
 | `ROUTER_MANAGER_SCHEDULER_INTERVAL` | `30` | Scheduler tick in seconds, minimum `15`. |
 | `ROUTER_MANAGER_SECURE_COOKIE` | `0` | Set to `1` when served over HTTPS. |
+| `ROUTER_MANAGER_DEVICE_PASSWORD` | none | Password used by `set-password` with `ROUTER_MANAGER_ASSUME_YES=1`. |
+| `ROUTER_MANAGER_ASSUME_YES` | unset | Set to `1` to skip the interactive confirmation. Unattended use only. |
+
+## Resetting a password
+
+If a router password is wrong, mistyped, or changed on the device itself, replace the
+stored copy. From the dashboard, use the **Password** button on the device card: enter
+it twice, then save. The result tells you whether the router accepted it.
+
+From the command line:
+
+```bash
+router-manager set-password cudy1
+```
+
+It asks twice and refuses to change anything if the entries differ, so a typo cannot
+leave you locked out. The password is never accepted as a command-line argument, which
+would put it in your shell history and in `ps` output.
+
+By default it then tests the new password by authenticating against the router, which
+is worth keeping. It reports the difference between the two outcomes:
+
+- **Saved and verified** means the router accepted it. Exit status `0`.
+- **Saved but rejected** means the password was stored but the router refused it, so
+  the value is still wrong. Exit status `1` so a script or a test run notices.
+
+A rejected password is deliberately still saved, so a transient failure such as the
+router being mid-reboot does not throw away what you just typed. Fix the cause and run
+the command again. Use `--no-verify` to skip the round trip when you are certain, or
+when the router is offline.
+
+For unattended use, set both variables. This skips the confirmation prompt, so use it
+only where the value is already held in a secret store:
+
+```bash
+ROUTER_MANAGER_DEVICE_PASSWORD="$NEW" ROUTER_MANAGER_ASSUME_YES=1 \
+  router-manager set-password cudy1
+```
+
+`ROUTER_MANAGER_DEVICE_PASSWORD` is deliberately separate from
+`ROUTER_MANAGER_PASSWORD`, which is the dashboard login. Mixing them up would store
+your dashboard password as a router password, so the two are never interchangeable.
+
+Rotating a password preserves the device's existing reference; no orphaned secret is
+left behind. Resetting also works on a device that was added without one.
+
+### The dashboard login password
+
+`ROUTER_MANAGER_PASSWORD` is read from the environment at startup, so rotate it by
+changing the variable and restarting. It is never written to disk. Sessions live in
+memory, so a restart signs everyone out.
+
+### If the vault key is lost
+
+`master.key` cannot be recovered. Every stored password becomes unreadable, and each
+device then fails to load until its reference is repaired. Reset each one with
+`set-password`, or re-add the device, and the config loads again. Back the key up
+before the test day:
+
+```bash
+systemctl stop router-manager 2>/dev/null || pkill -f 'router-manager serve'
+cp ~/.local/state/skybre-router-manager/master.key ~/master.key.bak
+chmod 600 ~/master.key.bak
+```
 
 ## Device config
 
@@ -204,7 +269,7 @@ cudy_manager/
   web.py            FastAPI service, sessions, CSRF
   cli.py            command line entry point
   dashboard.html    dashboard
-tests/              118 tests, all mocked
+tests/              148 tests, all mocked
 ```
 
 ## Licence
