@@ -1,5 +1,6 @@
 import ipaddress
 import re
+import ssl
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +47,12 @@ class CudyDiscovery:
         self.subnet = self.validate_subnet(subnet)
         self.timeout = timeout
         self.discovered: list[DiscoveredDevice] = []
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context),
+        )
 
     @staticmethod
     def validate_subnet(subnet: str) -> str:
@@ -62,19 +69,27 @@ class CudyDiscovery:
     @staticmethod
     def _url(host: str, port: int, path: str) -> str:
         rendered = f"[{host}]" if ":" in host else host
-        return f"http://{rendered}:{port}{path}"
+        # Port 443 is HTTPS. Probing it over plain HTTP means an HTTPS-only router
+        # never answers, so the device is silently missed.
+        scheme = "https" if port == 443 else "http"
+        return f"{scheme}://{rendered}:{port}{path}"
 
     def _read(self, host: str, port: int, path: str) -> tuple[int, str] | None:
+        url = self._url(host, port, path)
         request = urllib.request.Request(  # noqa: S310
-            self._url(host, port, path),
+            url,
             headers={"User-Agent": "SkybreRouterManager/1.0", "Connection": "close"},
         )
+        # Router admin pages almost always use a self-signed certificate, and
+        # discovery only reads unauthenticated identity files on the operator's own
+        # LAN, so certificate verification is skipped for the HTTPS probe.
+        opener = self._opener if url.startswith("https://") else urllib.request.build_opener()
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
+            with opener.open(request, timeout=self.timeout) as response:  # noqa: S310
                 return response.status, response.read(262144).decode(errors="replace")
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read(262144).decode(errors="replace")
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError):
             return None
 
     def _probe(self, host: str) -> DiscoveredDevice | None:

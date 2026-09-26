@@ -304,7 +304,7 @@ cudy_manager/
   web.py            FastAPI service, sessions, CSRF
   cli.py            command line entry point
   dashboard.html    dashboard
-tests/              221 tests, all mocked
+tests/              237 tests, all mocked
 ```
 
 ## Licence

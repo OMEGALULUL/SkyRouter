@@ -5,6 +5,44 @@ from .adapters import AdapterError, RouterAdapter
 from .models import Device
 
 
+def _parse_stations(output: str) -> list[dict[str, Any]]:
+    """Parse `iw dev <radio> station dump` output.
+
+    Field names contain spaces ("rx bytes", "signal avg") and values contain
+    colons, so each field is split on its first colon only. Splitting on
+    whitespace instead would truncate every multi-word key and collide
+    "rx bytes" with "tx bytes".
+    """
+    clients: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("Station "):
+            if current:
+                clients.append(current)
+            parts = line.split(None, 2)
+            current = {"mac": parts[1] if len(parts) > 1 else ""}
+            if len(parts) > 2:
+                # The trailing group is "(on br-lan)".
+                interface = parts[2].strip().strip("()")
+                if interface.lower().startswith("on "):
+                    interface = interface[3:].strip()
+                if interface:
+                    current["interface"] = interface
+            continue
+        if current is None:
+            continue
+        key, separator, value = line.partition(":")
+        if not separator or not key.strip():
+            continue
+        current[key.strip()] = value.strip()
+    if current:
+        clients.append(current)
+    return clients
+
+
 class OpenWrtAdapter(RouterAdapter):
     def __init__(self, device: Device, password: str):
         super().__init__(device, password)
@@ -78,25 +116,7 @@ class OpenWrtAdapter(RouterAdapter):
         code, output, error = self.execute(f"iw dev {shlex.quote(radio)} station dump")
         if code != 0:
             raise AdapterError(error or "could not read wireless stations")
-        clients = []
-        current: dict[str, Any] = {}
-        for line in output.splitlines():
-            parts = line.strip().split(None, 1)
-            if len(parts) != 2:
-                if current:
-                    clients.append(current)
-                    current = {}
-                continue
-            key, value = parts
-            if key == "Station":
-                if current:
-                    clients.append(current)
-                current = {"mac": value}
-            else:
-                current[key] = value
-        if current:
-            clients.append(current)
-        return clients
+        return _parse_stations(output)
 
     def set_ssid(self, ssid: str, radio: str | None = None) -> bool:
         section = str(self.device.metadata.get("uci_section", ""))
