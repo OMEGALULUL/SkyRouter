@@ -143,11 +143,16 @@ leave you locked out. The password is never accepted as a command-line argument,
 would put it in your shell history and in `ps` output.
 
 By default it then tests the new password by authenticating against the router, which
-is worth keeping. It reports the difference between the two outcomes:
+is worth keeping. It reports which of three outcomes occurred:
 
 - **Saved and verified** means the router accepted it. Exit status `0`.
-- **Saved but rejected** means the password was stored but the router refused it, so
-  the value is still wrong. Exit status `1` so a script or a test run notices.
+- **Saved but rejected** means the password was stored but the router answered and
+  refused it, so the value is still wrong. Exit status `1` so a script or a test run
+  notices.
+- **Saved but unverifiable** means the router could not be reached at all, so nothing
+  was actually tested. Exit status `1` as well. This is deliberately not reported as a
+  rejection: if the device is asleep or on another subnet, chasing the password is the
+  wrong response, so the message names the connectivity problem instead.
 
 A rejected password is deliberately still saved, so a transient failure such as the
 router being mid-reboot does not throw away what you just typed. Fix the cause and run
@@ -304,7 +309,7 @@ cudy_manager/
   web.py            FastAPI service, sessions, CSRF
   cli.py            command line entry point
   dashboard.html    dashboard
-tests/              237 tests, all mocked
+tests/              261 tests, all mocked
 ```
 
 ## Licence
