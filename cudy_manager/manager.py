@@ -1,3 +1,5 @@
+import contextlib
+import fcntl
 import logging
 import os
 import threading
@@ -9,6 +11,7 @@ from typing import Any
 import yaml
 
 from .adapters import AdapterError, CudyAdapter, TendaAdapter
+from .diagnose import diagnose_device
 from .discovery import CudyDiscovery, DiscoveredDevice
 from .models import Device, ValidationError
 from .openwrt import OpenWrtAdapter
@@ -40,6 +43,7 @@ class DeviceManager:
         self.secrets = secret_store or SecretStore(self.data_dir)
         self.devices: dict[str, Device] = {}
         self._lock = threading.RLock()
+        self._transaction_state = threading.local()
         self._load_config()
 
     def _load_config(self) -> None:
@@ -95,60 +99,118 @@ class DeviceManager:
             raise ValidationError(f"{kind} must be a non-empty string")
         return self.secrets.put(value, f"device-{identifier}-{kind}")
 
+    @contextlib.contextmanager
+    def _transaction(self):
+        # The depth must be per thread. The dashboard runs these mutations in a
+        # thread pool, so a shared counter would let a second thread see a non-zero
+        # depth and skip both the file lock and the mutex entirely.
+        depth = getattr(self._transaction_state, "depth", 0)
+        if depth:
+            self._transaction_state.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._transaction_state.depth = depth
+            return
+        lock_path = self.config_path.with_suffix(self.config_path.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        self._transaction_state.depth = 1
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            self._lock.acquire()
+            try:
+                self._load_config()
+                yield
+                self.save_config()
+            finally:
+                self._lock.release()
+        finally:
+            self._transaction_state.depth = 0
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            os.close(handle)
+
     def add_device(self, identifier: str, host: str, vendor: str, password: str | None = None, **values: Any) -> Device:
         device_id = str(identifier).strip()
-        if device_id in self.devices:
-            raise ManagerError(f"device {device_id!r} already exists")
         community = values.pop("snmp_community", None)
         candidate = Device.from_dict(device_id, {**values, "vendor": vendor, "host": host})
-        refs = {}
+        refs: dict[str, str] = {}
         try:
-            if password is not None:
-                refs["password_ref"] = self._store_secret(device_id, "password", password)
-            if community is not None:
-                refs["snmp_community_ref"] = self._store_secret(device_id, "snmp-community", community)
-            device = Device.from_dict(device_id, {**candidate.to_config(), **refs})
-            with self._lock:
-                self.devices[device_id] = device
-            self.save_config()
-            return device
+            with self._transaction():
+                if device_id in self.devices:
+                    raise ManagerError(f"device {device_id!r} already exists")
+                if password is not None:
+                    refs["password_ref"] = self._store_secret(device_id, "password", password)
+                if community is not None:
+                    refs["snmp_community_ref"] = self._store_secret(device_id, "snmp-community", community)
+                self.devices[device_id] = Device.from_dict(device_id, {**candidate.to_config(), **refs})
+                device = self.devices[device_id]
         except Exception:
             for reference in refs.values():
                 self.secrets.delete(reference)
             raise
+        return device
 
     def update_device(self, identifier: str, **values: Any) -> Device:
+        password = values.pop("password", None)
+        community = values.pop("snmp_community", None)
         with self._lock:
             current = self.devices.get(identifier)
             if current is None:
                 raise ManagerError(f"device {identifier!r} does not exist")
-            config = current.to_config()
-        password = values.pop("password", None)
-        community = values.pop("snmp_community", None)
-        config.update(values)
-        device = Device.from_dict(identifier, config)
-        if password is not None:
-            self._store_secret(identifier, "password", password)
-        if community is not None:
-            self._store_secret(identifier, "snmp-community", community)
-        with self._lock:
-            self.devices[identifier] = device
-        self.save_config()
-        return self.devices[identifier]
+            # Validate against the current snapshot first so a bad value is
+            # rejected before any secret is written.
+            Device.from_dict(identifier, {**current.to_config(), **values})
+        with self._transaction():
+            if identifier not in self.devices:
+                raise ManagerError(f"device {identifier!r} does not exist")
+            if password is not None:
+                self._store_secret(identifier, "password", password)
+            if community is not None:
+                self._store_secret(identifier, "snmp-community", community)
+            # Rebuild from the state reloaded inside the transaction, not the
+            # pre-transaction snapshot, so a concurrent edit is not overwritten.
+            self.devices[identifier] = Device.from_dict(
+                identifier, {**self.devices[identifier].to_config(), **values}
+            )
+            device = self.devices[identifier]
+        return device
 
     def set_password(self, identifier: str, password: str, verify: bool = True) -> dict[str, Any]:
         self.get_device(identifier)
         if not isinstance(password, str) or not password:
             raise ValidationError("password must be a non-empty string")
-        reference = self._store_secret(identifier, "password", password)
-        if self.devices[identifier].password_ref != reference:
-            self.update_device(identifier, password_ref=reference)
+        with self._transaction():
+            if identifier not in self.devices:
+                raise ManagerError(f"device {identifier!r} does not exist")
+            reference = self._store_secret(identifier, "password", password)
+            if self.devices[identifier].password_ref != reference:
+                self.devices[identifier] = Device.from_dict(
+                    identifier, {**self.devices[identifier].to_config(), "password_ref": reference}
+                )
         result: dict[str, Any] = {"device": identifier, "password_updated": True}
         if verify:
             result["verified"] = self.verify_credentials(identifier)
             if not result["verified"]["ok"]:
                 logger.warning("password for %s did not authenticate", identifier)
         return result
+
+    def diagnose(self, identifier: str) -> dict[str, Any]:
+        device = self.get_device(identifier)
+        if device.transport == "ssh":
+            return diagnose_device(device, "")
+        try:
+            password = self.credentials(device)
+        except (SecretStoreError, AdapterError) as exc:
+            return {
+                "vendor": device.vendor,
+                "base_url": f"{'https' if device.https else 'http'}://{device.host}:{device.http_port}",
+                "reachable": None,
+                "steps": [{"step": "read stored password", "error": str(exc)}],
+                "verdict": "no stored password, so run set-password first",
+            }
+        return diagnose_device(device, password)
 
     def verify_credentials(self, identifier: str) -> dict[str, Any]:
         device = self.get_device(identifier)
@@ -160,13 +222,12 @@ class DeviceManager:
         return {"ok": True, "checked_at": checked_at}
 
     def remove_device(self, identifier: str) -> None:
-        with self._lock:
+        with self._transaction():
             device = self.devices.pop(identifier, None)
             if device is None:
                 raise ManagerError(f"device {identifier!r} does not exist")
             remaining_refs = {item.password_ref for item in self.devices.values()}
             remaining_refs.update(item.snmp_community_ref for item in self.devices.values())
-        self.save_config()
         if device.password_ref not in remaining_refs:
             self.secrets.delete(device.password_ref)
         if device.snmp_community_ref not in remaining_refs:

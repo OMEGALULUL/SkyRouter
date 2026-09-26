@@ -157,3 +157,51 @@ class TestRebootScheduler:
         scheduler = RebootScheduler(FakeManager([device]), tmp_path / "summer.json")
         assert scheduler.run_once(datetime(2026, 7, 10, 3, 5, tzinfo=UTC)) != []
         assert scheduler.run_once(datetime(2026, 7, 10, 3, 45, tzinfo=UTC)) == []
+
+
+class TestBadPolicyIsolation:
+    def test_invalid_timezone_does_not_stop_other_devices(self, tmp_path):
+        from cudy_manager.manager import DeviceManager
+        from cudy_manager.secrets import SecretStore
+
+        store = SecretStore(tmp_path / "data")
+        manager = DeviceManager(config_path=tmp_path / "d.yaml", data_dir=tmp_path / "data", secret_store=store)
+        manager.add_device("healthy", "192.0.2.1", "cudy", password="p")
+        manager.add_device("broken", "192.0.2.2", "cudy", password="p")
+        manager.update_device("broken", reboot={"enabled": True, "at": "04:00", "timezone": "Not/AZone"})
+        scheduler = RebootScheduler(manager, tmp_path / "state.json")
+
+        results = scheduler.run_once()
+
+        assert [item["device"] for item in results] == ["broken"]
+        assert results[0]["status"] == "failed"
+        assert "timezone" in results[0]["reason"]
+
+    def test_malformed_at_value_is_isolated(self, tmp_path):
+        from cudy_manager.manager import DeviceManager
+        from cudy_manager.secrets import SecretStore
+
+        store = SecretStore(tmp_path / "data")
+        manager = DeviceManager(config_path=tmp_path / "d.yaml", data_dir=tmp_path / "data", secret_store=store)
+        manager.add_device("ok", "192.0.2.1", "cudy", password="p")
+        manager.add_device("bad", "192.0.2.2", "cudy", password="p")
+        with manager._lock:
+            manager.devices["bad"].reboot.enabled = True
+            manager.devices["bad"].reboot.at = "not-a-time"
+        scheduler = RebootScheduler(manager, tmp_path / "state.json")
+
+        results = scheduler.run_once()
+
+        assert any(item["device"] == "bad" and item["status"] == "failed" for item in results)
+
+    def test_disabled_device_is_not_evaluated(self, tmp_path):
+        from cudy_manager.manager import DeviceManager
+        from cudy_manager.secrets import SecretStore
+
+        store = SecretStore(tmp_path / "data")
+        manager = DeviceManager(config_path=tmp_path / "d.yaml", data_dir=tmp_path / "data", secret_store=store)
+        manager.add_device("off", "192.0.2.1", "cudy", password="p")
+        manager.update_device("off", enabled=False, reboot={"enabled": True, "at": "04:00", "timezone": "Not/AZone"})
+        scheduler = RebootScheduler(manager, tmp_path / "state.json")
+
+        assert scheduler.run_once() == []

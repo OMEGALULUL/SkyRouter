@@ -31,6 +31,14 @@ class DiscoveryError(ValueError):
     pass
 
 
+def _address_key(host: str):
+    """Sort numerically for IPv4 and IPv6, falling back to text if unparsable."""
+    try:
+        return (0, ipaddress.ip_address(host))
+    except ValueError:
+        return (1, host)
+
+
 class CudyDiscovery:
     ports = (80, 443, 8080, 3000)
 
@@ -120,7 +128,7 @@ class CudyDiscovery:
                     device = None
                 if device is not None:
                     self.discovered.append(device)
-        self.discovered.sort(key=lambda item: tuple(int(part) for part in item.host.split(".")))
+        self.discovered.sort(key=lambda item: _address_key(item.host))
         return self.discovered
 
     def arp_scan(self) -> list[dict[str, str]]:

@@ -21,6 +21,16 @@ class UnsupportedOperation(AdapterError):
     pass
 
 
+class AuthenticationRejected(AdapterError):
+    def __init__(self, message: str, response: Any | None = None):
+        super().__init__(message)
+        self.response = response
+
+
+class ProtocolMismatch(AdapterError):
+    pass
+
+
 class RouterAdapter(ABC):
     def __init__(self, device: Device, password: str):
         self.device = device
@@ -181,6 +191,12 @@ class CudyAdapter(RouterAdapter):
         self.salt = parser.inputs.get("salt", "")
         if response.status >= 400:
             raise AdapterError(f"Cudy login page returned HTTP {response.status}")
+        if not self.salt and not self.csrf_token and not self.device.allow_legacy_login:
+            raise ProtocolMismatch(
+                "Cudy login page exposed no salt and no token, so the expected challenge/response handshake "
+                "is not present; this firmware likely uses a different login flow. Check the raw exchange with "
+                "'router-manager diagnose'."
+            )
         if not self.salt and not self.device.allow_legacy_login:
             raise UnsupportedOperation("Cudy login did not provide a salt; enable legacy_login only on a trusted LAN")
         password = self.password
@@ -197,10 +213,15 @@ class CudyAdapter(RouterAdapter):
             "zonename": "UTC",
         }
         result = self._post("/cgi-bin/luci/", form)
-        if result.status in {301, 302, 303} or result.status == 200 and not _looks_like_login(result.text):
+        if result.status >= 400:
+            raise AdapterError(f"Cudy login POST returned HTTP {result.status}")
+        if result.status in {301, 302, 303} or (result.status == 200 and not _looks_like_login(result.text)):
             self.authenticated = True
         else:
-            raise AdapterError("Cudy authentication failed")
+            raise AuthenticationRejected(
+                "Cudy rejected the credentials: the login form was returned after submitting",
+                response=result,
+            )
         for cookie in self.http.cookie_jar:
             if cookie.name in {"sysauth", "sysauth_https"}:
                 self.session_id = cookie.value or ""
@@ -287,8 +308,9 @@ class CudyAdapter(RouterAdapter):
 class TendaAdapter(RouterAdapter):
     def __init__(self, device: Device, password: str):
         super().__init__(device, password)
-        self.base_url = f"http://{_host_for_url(device.host)}:{device.http_port}"
-        self.http = HttpSession(self.base_url)
+        scheme = "https" if device.https else "http"
+        self.base_url = f"{scheme}://{_host_for_url(device.host)}:{device.http_port}"
+        self.http = HttpSession(self.base_url, verify_tls=device.verify_tls)
         self.cookie = ""
 
     def _post(self, path: str, payload: dict[str, Any]):
@@ -327,7 +349,11 @@ class TendaAdapter(RouterAdapter):
         except HttpError as exc:
             raise AdapterError("Tenda login returned invalid JSON") from exc
         if not data.get("sysLogin", {}).get("Login"):
-            raise AdapterError("Tenda authentication failed")
+            detail = data.get("sysLogin", {}).get("errMsg") or data.get("errMsg") or ""
+            raise AuthenticationRejected(
+                f"Tenda rejected the credentials{' (' + str(detail) + ')' if detail else ''}",
+                response=result,
+            )
         for cookie in self.http.cookie_jar:
             self.cookie = f"{cookie.name}={cookie.value}"
             break

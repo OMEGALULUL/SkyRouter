@@ -78,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     add.add_argument("--username", default="root")
     add.add_argument("--model", default="")
     add.add_argument("--transport", choices=["web", "ssh"], default="web")
+    add.add_argument("--no-verify", action="store_true", help="skip the authentication check against the router")
     sub.add_parser("list")
     discover = sub.add_parser("discover")
     discover.add_argument("--subnet", default="192.168.1.0/24")
@@ -85,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     status.add_argument("device")
     reboot = sub.add_parser("reboot")
     reboot.add_argument("device")
+    diag = sub.add_parser("diagnose", help="show the raw login exchange for a device")
+    diag.add_argument("device")
     reset = sub.add_parser("set-password", help="replace a device's stored password")
     reset.add_argument("device")
     reset.add_argument("--no-verify", action="store_true", help="skip the authentication check against the router")
@@ -108,6 +111,19 @@ def main(argv: list[str] | None = None) -> int:
                 transport=args.transport,
             )
             _print({"device": device.to_public()})
+            if not args.no_verify:
+                checked = manager.verify_credentials(args.id)
+                if not checked["ok"]:
+                    print(
+                        f"error: {args.id} was added but the router rejected the password: {checked['error']}\n"
+                        f"       run 'router-manager diagnose {args.id}' for the full exchange, "
+                        f"or 'router-manager set-password {args.id}' to try again",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(f"{args.id} added and the password was accepted by the router", file=sys.stderr)
+        elif args.command == "diagnose":
+            _print(manager.diagnose(args.device))
         elif args.command == "set-password":
             return _set_password(manager, args)
         elif args.command == "list":

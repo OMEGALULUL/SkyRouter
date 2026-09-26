@@ -25,10 +25,13 @@ logger = logging.getLogger(__name__)
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = PACKAGE_DIR / "dashboard.html"
+# Write-only credential inputs such as "password" and "snmp_community" are accepted
+# and converted to vault references before anything is written to disk. These names
+# are rejected because they either name a secret directly, or are legacy aliases
+# that would let a caller store or repoint a reference.
 PLAINTEXT_CREDENTIAL_FIELDS = {
     "ssh_password",
     "luci_password",
-    "snmp_community",
     "password_ref",
     "snmp_community_ref",
 }
@@ -169,8 +172,18 @@ async def _body(request: Request) -> dict[str, Any]:
 
 
 def _client_key(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    return forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    """Identify the caller for login throttling.
+
+    X-Forwarded-For is attacker-controlled unless a trusted proxy sets it, so it is
+    only honoured when ROUTER_MANAGER_TRUST_PROXY is set explicitly. Otherwise
+    everyone who can reach the service would share the loopback bucket and a single
+    client could lock everyone else out, or rotate headers to bypass the limit.
+    """
+    if os.environ.get("ROUTER_MANAGER_TRUST_PROXY", "").strip().lower() in {"1", "true", "yes"}:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded.split(",")[0].strip():
+            return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def _error_detail(exc: Exception) -> str:
@@ -228,6 +241,18 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
     app.state.sessions = sessions
     app.state.scheduler = scheduler
 
+    def _harden(response):
+        """Apply the security headers to every response, including early returns.
+
+        Authentication failures, CSRF rejections, and redirects are the responses an
+        attacker most wants to embed or cache, so they must be covered too.
+        """
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.middleware("http")
     async def authentication(request: Request, call_next):
         path = request.url.path
@@ -235,24 +260,23 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
         if not public:
             if not settings.password:
                 if path.startswith("/api/"):
-                    return JSONResponse({"detail": "ROUTER_MANAGER_PASSWORD is not configured"}, status_code=503)
-                return HTMLResponse(_login_page("Server authentication is not configured"), status_code=503)
+                    return _harden(
+                        JSONResponse({"detail": "ROUTER_MANAGER_PASSWORD is not configured"}, status_code=503)
+                    )
+                return _harden(
+                    HTMLResponse(_login_page("Server authentication is not configured"), status_code=503)
+                )
             session = sessions.get(request.cookies.get("router_session"))
             if session is None:
                 if path.startswith("/api/"):
-                    return JSONResponse({"detail": "authentication required"}, status_code=401)
-                return RedirectResponse("/login", status_code=303)
+                    return _harden(JSONResponse({"detail": "authentication required"}, status_code=401))
+                return _harden(RedirectResponse("/login", status_code=303))
             if request.method in {"POST", "PUT", "PATCH", "DELETE"} and path != "/login":
                 supplied = request.headers.get("x-csrf-token", "")
                 if not hmac.compare_digest(supplied, str(session["csrf"])):
-                    return JSONResponse({"detail": "CSRF validation failed"}, status_code=403)
+                    return _harden(JSONResponse({"detail": "CSRF validation failed"}, status_code=403))
             request.state.session = session
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Cache-Control"] = "no-store"
-        return response
+        return _harden(await call_next(request))
 
     @app.exception_handler(AdapterError)
     async def adapter_error_handler(_, exc: AdapterError):

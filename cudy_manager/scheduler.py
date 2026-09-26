@@ -105,9 +105,15 @@ class RebootScheduler:
         current = self._utc_now(now or self.clock())
         results = []
         for device in self.manager.get_all_devices():
-            if not device.enabled or not self._due(device, current):
-                continue
             result: dict[str, Any] = {"device": device.identifier, "action": "reboot", "status": "skipped"}
+            try:
+                if not device.enabled or not self._due(device, current):
+                    continue
+            except (ValidationError, ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+                result["status"] = "failed"
+                result["reason"] = f"reboot policy is invalid: {exc}"[:160]
+                results.append(result)
+                continue
             try:
                 status = self.manager.get_status(device.identifier)
                 uptime = status.get("uptime_seconds")

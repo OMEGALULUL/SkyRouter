@@ -57,8 +57,9 @@ plain HTTP, so set `ROUTER_MANAGER_SECURE_COOKIE=1` when you terminate TLS in fr
 ## Command line
 
 ```bash
-router-manager add <id> <host> --vendor cudy|tenda [--username admin] [--model X]
+router-manager add <id> <host> --vendor cudy|tenda [--username admin] [--model X] [--no-verify]
 router-manager set-password <id> [--no-verify]
+router-manager diagnose <id>
 router-manager list
 router-manager status <id>
 router-manager reboot <id>
@@ -74,7 +75,36 @@ so you can pipe the password instead:
 printf '%s' "$ROUTER_PASSWORD" | router-manager add cudy1 192.168.1.1 --vendor cudy
 ```
 
+`add` then attempts a real login so a wrong password is reported immediately. The
+device is still saved when the login fails, because a router that is temporarily busy
+should not cost you the configuration. The command exits `1` on a failed login, so
+`set -e` scripts notice. Pass `--no-verify` to skip the login entirely.
+
 `discover` is bounded to one subnet and never runs automatically.
+
+## Diagnosing a router that will not log in
+
+`diagnose` replays the login by hand and prints every step, so you can see whether the
+problem is the port, the firmware, or the password:
+
+```bash
+router-manager diagnose cudy1
+```
+
+Each step reports the HTTP status, the fields found on the page, and any cookie names.
+Values are never printed: form fields appear as `<24 chars>` and the login body is
+redacted. A verdict at the end names the most likely cause, for example:
+
+| Verdict | Meaning |
+| --- | --- |
+| `the router did not answer on this address` | Wrong port, wrong scheme, or the device is offline. |
+| `no LuCI login page at ...` | Something is answering, but it is not a Cudy login page. Check the port and `https`. |
+| `login page has no salt` | The firmware does not use the expected challenge/response handshake. Not a password problem. |
+| `credentials rejected; the login form came back` | The password is wrong. The port, path, and handshake are all correct. |
+| `login accepted; the router issued a session cookie` | The password is good. |
+
+`diagnose` performs only reads and one login attempt, so it is safe to run against
+production hardware.
 
 ## Configuration
 
@@ -89,6 +119,7 @@ printf '%s' "$ROUTER_PASSWORD" | router-manager add cudy1 192.168.1.1 --vendor c
 | `ROUTER_MANAGER_SCHEDULER_INTERVAL` | `30` | Scheduler tick in seconds, minimum `15`. |
 | `ROUTER_MANAGER_SECURE_COOKIE` | `0` | Set to `1` when served over HTTPS. |
 | `ROUTER_MANAGER_DEVICE_PASSWORD` | none | Password used by `set-password` with `ROUTER_MANAGER_ASSUME_YES=1`. |
+| `ROUTER_MANAGER_TRUST_PROXY` | unset | Honour `X-Forwarded-For` for login throttling. Only enable behind a proxy that overwrites the header. |
 | `ROUTER_MANAGER_ASSUME_YES` | unset | Set to `1` to skip the interactive confirmation. Unattended use only. |
 
 ## Resetting a password
@@ -269,7 +300,7 @@ cudy_manager/
   web.py            FastAPI service, sessions, CSRF
   cli.py            command line entry point
   dashboard.html    dashboard
-tests/              148 tests, all mocked
+tests/              190 tests, all mocked
 ```
 
 ## Licence

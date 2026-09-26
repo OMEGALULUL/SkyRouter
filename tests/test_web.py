@@ -406,3 +406,121 @@ class TestPasswordReset:
             assert "/password" in page
             assert "showPassword" in page
             assert "Confirm password" in page
+
+
+class TestCredentialFieldHandling:
+    def test_snmp_community_is_stored_as_a_reference_not_plaintext(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        auth = {"x-csrf-token": login(client)}
+        response = client.post(
+            "/api/devices",
+            headers=auth,
+            json={
+                "id": "snmp1",
+                "host": "192.168.1.5",
+                "vendor": "cudy",
+                "password": "pw",
+                "snmp_community": "publicsecret",
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()["device"]
+        assert "snmp_community" not in body
+        assert "publicsecret" not in response.text
+
+        from cudy_manager.manager import DeviceManager
+
+        reloaded = DeviceManager(
+            config_path=tmp_path / "devices.yaml",
+            data_dir=tmp_path / "data",
+            secret_store=SecretStore(tmp_path / "data"),
+        ).get_device("snmp1")
+        assert reloaded.snmp_community_ref
+        assert "publicsecret" not in reloaded.to_config()["snmp_community_ref"]
+
+    def test_secret_reference_cannot_be_injected(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        auth = {"x-csrf-token": login(client)}
+        response = client.post(
+            "/api/devices",
+            headers=auth,
+            json={
+                "id": "ref1",
+                "host": "192.168.1.6",
+                "vendor": "cudy",
+                "password": "pw",
+                "password_ref": "device-other-password",
+            },
+        )
+        assert response.status_code == 400
+        assert "ref" in response.json()["detail"].lower()
+
+    def test_legacy_plaintext_aliases_are_rejected(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        auth = {"x-csrf-token": login(client)}
+        for field in ("ssh_password", "luci_password"):
+            response = client.post(
+                "/api/devices",
+                headers=auth,
+                json={
+                    "id": f"legacy-{field}",
+                    "host": "192.168.1.7",
+                    "vendor": "cudy",
+                    "password": "pw",
+                    field: "x",
+                },
+            )
+            assert response.status_code == 400, field
+
+
+class TestLoginRateLimitKeying:
+    def test_forwarded_header_is_used_when_proxy_is_trusted(self, monkeypatch):
+        monkeypatch.setenv("ROUTER_MANAGER_TRUST_PROXY", "1")
+        from cudy_manager.web import _client_key
+
+        class FakeRequest:
+            client = type("C", (), {"host": "127.0.0.1"})()
+            headers = {"x-forwarded-for": "5.6.7.8, 9.9.9.9"}
+
+        assert _client_key(FakeRequest()) == "5.6.7.8"
+
+    def test_socket_peer_is_used_when_not_trusted(self, monkeypatch):
+        monkeypatch.delenv("ROUTER_MANAGER_TRUST_PROXY", raising=False)
+        from cudy_manager.web import _client_key
+
+        class FakeRequest:
+            client = type("C", (), {"host": "127.0.0.1"})()
+            headers = {"x-forwarded-for": "1.2.3.4"}
+
+        assert _client_key(FakeRequest()) == "127.0.0.1"
+
+
+class TestSecurityHeadersOnEveryResponse:
+    def _assert_hardened(self, response):
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["X-Frame-Options"] == "DENY"
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["Cache-Control"] == "no-store"
+
+    def test_unauthenticated_api_is_hardened(self, tmp_path: Path):
+        self._assert_hardened(TestClient(build_app(tmp_path)).get("/api/devices"))
+
+    def test_redirect_to_login_is_hardened(self, tmp_path: Path):
+        self._assert_hardened(TestClient(build_app(tmp_path)).get("/"))
+
+    def test_unconfigured_server_is_hardened(self, tmp_path: Path):
+        app = build_app(tmp_path)
+        app.state.settings.password = ""
+        self._assert_hardened(TestClient(app).get("/api/devices"))
+
+    def test_csrf_rejection_is_hardened(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            token = login(client)
+            response = client.post("/api/devices", json={"id": "a", "host": "h", "vendor": "cudy", "password": "p"})
+            assert response.status_code == 403
+            self._assert_hardened(response)
+            assert token
+
+    def test_successful_response_is_hardened(self, tmp_path: Path):
+        with TestClient(build_app(tmp_path)) as client:
+            self._assert_hardened(client.get("/login"))

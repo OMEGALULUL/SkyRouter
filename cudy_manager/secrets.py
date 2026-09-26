@@ -1,4 +1,5 @@
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -73,6 +74,9 @@ class SecretStore:
             raise SecretStoreError("secret vault has an invalid format")
         return data
 
+    def _refresh_values(self) -> dict[str, str]:
+        return self._load_values() if self.vault_path.exists() else {}
+
     def _save_values(self) -> None:
         payload = json.dumps(self._values, indent=2, sort_keys=True).encode()
         fd, temporary = tempfile.mkstemp(prefix="secrets.", dir=self.directory)
@@ -88,6 +92,21 @@ class SecretStore:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary)
 
+    @contextlib.contextmanager
+    def _exclusive(self):
+        with self._lock:
+            lock_path = self.directory / "vault.lock"
+            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._values = self._refresh_values()
+                yield
+                self._save_values()
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
     @staticmethod
     def _valid_ref(reference: str) -> bool:
         return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", reference))
@@ -98,14 +117,14 @@ class SecretStore:
         reference = name or f"secret-{secrets.token_urlsafe(12)}"
         if not self._valid_ref(reference):
             raise SecretStoreError("secret reference contains unsupported characters")
-        with self._lock:
+        with self._exclusive():
             self._values[reference] = self._fernet.encrypt(value.encode()).decode()
-            self._save_values()
         return reference
 
     def get(self, reference: str) -> str:
         if not reference:
             raise SecretStoreError("secret reference is missing")
+        self._values = self._refresh_values()
         with self._lock:
             ciphertext = self._values.get(reference)
         if ciphertext is None:
@@ -118,17 +137,19 @@ class SecretStore:
     def delete(self, reference: str) -> bool:
         if not reference:
             return False
-        with self._lock:
-            existed = reference in self._values
-            if existed:
+        existed = False
+        with self._exclusive():
+            if reference in self._values:
                 del self._values[reference]
-                self._save_values()
+                existed = True
         return existed
 
     def has(self, reference: str) -> bool:
+        self._values = self._refresh_values()
         with self._lock:
             return reference in self._values
 
     def references(self) -> list[str]:
+        self._values = self._refresh_values()
         with self._lock:
             return sorted(self._values)

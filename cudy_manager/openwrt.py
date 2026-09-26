@@ -56,7 +56,12 @@ class OpenWrtAdapter(RouterAdapter):
         code, uptime, error = self.execute("cat /proc/uptime")
         if code != 0:
             raise AdapterError(error or "could not read uptime")
-        uptime_seconds = int(float(uptime.split()[0]))
+        try:
+            uptime_seconds = int(float(uptime.split()[0]))
+        except (IndexError, ValueError) as exc:
+            # Malformed output must surface as an adapter failure, otherwise the
+            # dashboard reports an internal error instead of a device problem.
+            raise AdapterError(f"could not parse uptime from {uptime[:40]!r}") from exc
         _, release, _ = self.execute("cat /etc/openwrt_release 2>/dev/null || cat /etc/os-release")
         _, load, _ = self.execute("cat /proc/loadavg")
         _, memory, _ = self.execute("free -m")
