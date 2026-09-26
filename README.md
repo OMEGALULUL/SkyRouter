@@ -82,6 +82,10 @@ should not cost you the configuration. The command exits `1` on a failed login, 
 
 `discover` is bounded to one subnet and never runs automatically.
 
+Exit codes are meant for scripting: `status` exits `1` when the device is offline,
+`reboot` exits `1` when the router does not confirm, and `add` exits `1` when the
+password was rejected. Failures print a single `error:` line, never a traceback.
+
 ## Diagnosing a router that will not log in
 
 `diagnose` replays the login by hand and prints every step, so you can see whether the
@@ -300,7 +304,7 @@ cudy_manager/
   web.py            FastAPI service, sessions, CSRF
   cli.py            command line entry point
   dashboard.html    dashboard
-tests/              190 tests, all mocked
+tests/              221 tests, all mocked
 ```
 
 ## Licence

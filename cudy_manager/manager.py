@@ -24,6 +24,19 @@ class ManagerError(RuntimeError):
     pass
 
 
+def _rebuild(identifier: str, existing: Device, **values: Any) -> Device:
+    """Rebuild a device from its stored config while keeping runtime state.
+
+    ``Device.to_config`` deliberately omits the cached status and last_seen, so
+    naively rebuilding from it would blank the dashboard's status every time a
+    device is edited or its password is rotated.
+    """
+    replacement = Device.from_dict(identifier, {**existing.to_config(), **values})
+    replacement.status = existing.status
+    replacement.last_seen = existing.last_seen
+    return replacement
+
+
 class DeviceManager:
     def __init__(
         self,
@@ -70,6 +83,11 @@ class DeviceManager:
             except (ValidationError, TypeError, ValueError) as exc:
                 raise ManagerError(f"invalid device {identifier!r}: {exc}") from exc
         with self._lock:
+            for identifier, device in loaded.items():
+                previous = self.devices.get(identifier)
+                if previous is not None:
+                    device.status = previous.status
+                    device.last_seen = previous.last_seen
             self.devices = loaded
         self._validate_references()
 
@@ -171,9 +189,7 @@ class DeviceManager:
                 self._store_secret(identifier, "snmp-community", community)
             # Rebuild from the state reloaded inside the transaction, not the
             # pre-transaction snapshot, so a concurrent edit is not overwritten.
-            self.devices[identifier] = Device.from_dict(
-                identifier, {**self.devices[identifier].to_config(), **values}
-            )
+            self.devices[identifier] = _rebuild(identifier, self.devices[identifier], **values)
             device = self.devices[identifier]
         return device
 
@@ -186,8 +202,8 @@ class DeviceManager:
                 raise ManagerError(f"device {identifier!r} does not exist")
             reference = self._store_secret(identifier, "password", password)
             if self.devices[identifier].password_ref != reference:
-                self.devices[identifier] = Device.from_dict(
-                    identifier, {**self.devices[identifier].to_config(), "password_ref": reference}
+                self.devices[identifier] = _rebuild(
+                    identifier, self.devices[identifier], password_ref=reference
                 )
         result: dict[str, Any] = {"device": identifier, "password_updated": True}
         if verify:

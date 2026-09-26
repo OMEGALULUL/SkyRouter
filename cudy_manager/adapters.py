@@ -116,6 +116,8 @@ def _uptime_seconds(value: Any) -> int | None:
     text = str(value or "").strip()
     if not text:
         return None
+    if text.isdigit():
+        return int(text)
     day_clock = re.match(r"^(\d+)\s+(\d+):(\d{2}):(\d{2})$", text)
     if day_clock:
         return (
@@ -254,10 +256,18 @@ class CudyAdapter(RouterAdapter):
             "title": " ".join("".join(parser.title).split()),
             "source": "cudy-luci",
         }
-        uptime = re.search(r"(?:uptime|activity time)[^0-9]{0,40}(\d+)\s*(?:days?|d)?", text, re.IGNORECASE)
+        # Capture the whole duration expression. Matching only the leading number
+        # would drop the H:MM:SS part, and would fail outright on pages that label
+        # the field "Activity Time", leaving the scheduler unable to read uptime.
+        uptime = re.search(
+            r"(?:uptime|activity time)[^0-9]{0,40}"
+            r"(\d+\s*(?:days?)?\s*\d{1,2}:\d{2}:\d{2}|\d{1,2}:\d{2}:\d{2}|\d+)",
+            text,
+            re.IGNORECASE,
+        )
         if uptime:
             result["uptime_text"] = uptime.group(0)
-            result["uptime_seconds"] = _uptime_seconds(uptime.group(0))
+            result["uptime_seconds"] = _uptime_seconds(uptime.group(1))
         return result
 
     def clients(self) -> list[dict[str, Any]]:

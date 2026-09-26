@@ -4,6 +4,8 @@ import json
 import os
 import sys
 
+from .adapters import AdapterError
+from .discovery import DiscoveryError
 from .manager import DeviceManager, ManagerError
 from .models import ValidationError
 from .secrets import SecretStoreError
@@ -131,14 +133,21 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "discover":
             _print([device.to_dict() for device in manager.discover_network(args.subnet)])
         elif args.command == "status":
-            _print(manager.get_status(args.device))
+            reading = manager.get_status(args.device)
+            _print(reading)
+            if not reading.get("online"):
+                print(
+                    f"error: {args.device} is offline: {reading.get('error', 'no response from the router')}",
+                    file=sys.stderr,
+                )
+                return 1
         elif args.command == "reboot":
             if not manager.reboot_device(args.device):
                 raise ManagerError("router did not confirm reboot")
             _print({"device": args.device, "status": "initiated"})
         else:
             parser.print_help()
-    except (ManagerError, ValidationError, SecretStoreError, ValueError) as exc:
+    except (ManagerError, ValidationError, SecretStoreError, AdapterError, DiscoveryError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0

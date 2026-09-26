@@ -124,9 +124,10 @@ class SecretStore:
     def get(self, reference: str) -> str:
         if not reference:
             raise SecretStoreError("secret reference is missing")
-        self._values = self._refresh_values()
         with self._lock:
-            ciphertext = self._values.get(reference)
+            # Read into a local name. Reassigning self._values here would discard a
+            # write that another thread has staged but not yet flushed to disk.
+            ciphertext = self._refresh_values().get(reference)
         if ciphertext is None:
             raise SecretStoreError(f"secret reference {reference!r} does not exist")
         try:
@@ -145,11 +146,9 @@ class SecretStore:
         return existed
 
     def has(self, reference: str) -> bool:
-        self._values = self._refresh_values()
         with self._lock:
-            return reference in self._values
+            return reference in self._refresh_values()
 
     def references(self) -> list[str]:
-        self._values = self._refresh_values()
         with self._lock:
-            return sorted(self._values)
+            return sorted(self._refresh_values())

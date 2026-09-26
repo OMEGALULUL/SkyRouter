@@ -232,3 +232,69 @@ class TestUptimeParsing:
     )
     def test_uptime_seconds(self, value, expected):
         assert adapters._uptime_seconds(value) == expected
+
+
+class TestUptimeParsingExtended:
+    def test_bare_integer_is_seconds(self):
+        from cudy_manager.adapters import _uptime_seconds
+
+        assert _uptime_seconds("3650") == 3650
+
+    def test_sysinfo_style_days_and_clock(self):
+        from cudy_manager.adapters import _uptime_seconds
+
+        assert _uptime_seconds("5 06:00:00") == 5 * 86400 + 6 * 3600
+
+    def test_day_and_clock_combined(self):
+        from cudy_manager.adapters import _uptime_seconds
+
+        assert _uptime_seconds("1 day 2:03:04") == 86400 + 2 * 3600 + 3 * 60 + 4
+
+    def test_empty_and_junk_return_none(self):
+        from cudy_manager.adapters import _uptime_seconds
+
+        assert _uptime_seconds("") is None
+        assert _uptime_seconds(None) is None
+        assert _uptime_seconds("unknown") is None
+
+
+class TestCudyStatusUptime:
+    def _status(self, page: str) -> dict:
+        from unittest.mock import patch
+
+        from cudy_manager.adapters import CudyAdapter
+        from cudy_manager.http_client import HttpResponse
+        from cudy_manager.models import Device
+
+        device = Device.from_dict("c1", {"vendor": "cudy", "host": "192.168.1.1"})
+        adapter = CudyAdapter(device, "pw")
+        adapter.authenticated = True
+        response = HttpResponse(
+            status=200,
+            headers={"Content-Type": "text/html"},
+            body=page.encode(),
+            url="http://192.168.1.1/status",
+        )
+        with patch.object(adapter, "_session_get", return_value=response):
+            return adapter.status()
+
+    def test_day_and_clock_are_both_counted(self):
+        status = self._status("<html><body>Uptime: 1 day 2:03:04</body></html>")
+        assert status["uptime_seconds"] == 86400 + 2 * 3600 + 3 * 60 + 4
+
+    def test_activity_time_label_is_understood(self):
+        status = self._status("<html><body>Activity Time 00:45:12</body></html>")
+        assert status["uptime_seconds"] == 45 * 60 + 12
+
+    def test_activity_time_is_not_lost_entirely(self):
+        # A None here makes the scheduler skip automatic reboots forever.
+        status = self._status("<html><body>Activity Time 00:45:12</body></html>")
+        assert status["uptime_seconds"] is not None
+
+    def test_seconds_only_uptime(self):
+        status = self._status("<html><body>Uptime: 900</body></html>")
+        assert status["uptime_seconds"] == 900
+
+    def test_page_without_uptime_reports_none(self):
+        status = self._status("<html><body>no timing here</body></html>")
+        assert "uptime_seconds" not in status

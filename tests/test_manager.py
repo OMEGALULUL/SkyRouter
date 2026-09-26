@@ -140,3 +140,71 @@ class TestDeviceManager:
         )
         manager = DeviceManager(config_path=config, data_dir=tmp_path / "data")
         assert manager.get_device("router-1").vendor == "tenda"
+
+
+class TestRuntimeStateSurvivesConfigWrites:
+    """The config file holds configuration only; cached status must not be lost."""
+
+    def _manager(self, tmp_path: Path) -> DeviceManager:
+        return DeviceManager(
+            config_path=tmp_path / "c.yaml",
+            data_dir=tmp_path / "data",
+            secret_store=SecretStore(tmp_path / "data"),
+        )
+
+    def _mark(self, manager: DeviceManager, identifier: str, uptime: int) -> None:
+        device = manager.devices[identifier]
+        device.status = {"online": True, "uptime_seconds": uptime}
+        device.last_seen = f"2026-09-26T10:00:{uptime % 60:02d}"
+
+    def test_updating_one_device_keeps_every_device_status(self, tmp_path: Path):
+        manager = self._manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+        manager.add_device("r2", "192.168.1.2", "cudy", password="pw")
+        self._mark(manager, "r1", 1001)
+        self._mark(manager, "r2", 1002)
+
+        manager.update_device("r1", model="Cudy-X1")
+
+        assert manager.devices["r1"].status["uptime_seconds"] == 1001
+        assert manager.devices["r2"].status["uptime_seconds"] == 1002, "unrelated device lost its status"
+
+    def test_edited_device_keeps_its_own_status(self, tmp_path: Path):
+        manager = self._manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+        self._mark(manager, "r1", 1001)
+
+        manager.update_device("r1", model="Cudy-X1")
+
+        assert manager.devices["r1"].status["uptime_seconds"] == 1001
+        assert manager.devices["r1"].last_seen
+        assert manager.devices["r1"].model == "Cudy-X1"
+
+    def test_password_rotation_keeps_status(self, tmp_path: Path):
+        manager = self._manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+        self._mark(manager, "r1", 1001)
+
+        manager.set_password("r1", "rotated", verify=False)
+
+        assert manager.devices["r1"].status["uptime_seconds"] == 1001
+        assert manager.devices["r1"].last_seen
+
+    def test_adding_a_device_keeps_existing_status(self, tmp_path: Path):
+        manager = self._manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+        self._mark(manager, "r1", 1001)
+
+        manager.add_device("r2", "192.168.1.2", "cudy", password="pw")
+
+        assert manager.devices["r1"].status["uptime_seconds"] == 1001
+
+    def test_status_is_still_dropped_for_a_removed_device(self, tmp_path: Path):
+        manager = self._manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+        self._mark(manager, "r1", 1001)
+
+        manager.remove_device("r1")
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+
+        assert manager.devices["r1"].status == {}
