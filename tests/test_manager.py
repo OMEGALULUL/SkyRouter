@@ -208,3 +208,80 @@ class TestRuntimeStateSurvivesConfigWrites:
         manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
 
         assert manager.devices["r1"].status == {}
+
+
+class TestStatusFanOut:
+    """Concurrent dashboard reads must share one sweep.
+
+    Each sweep opens its own bounded thread pool. Without single-flight, a slow
+    fleet plus the dashboard's periodic poll starts a second pool and re-queries
+    every device, so both thread count and router load grow without bound.
+    """
+
+    def test_concurrent_dashboards_share_one_sweep(self, tmp_path: Path):
+        import threading
+        import time
+
+        manager = build_manager(tmp_path)
+        for index in range(30):
+            manager.add_device(f"d{index}", f"192.0.2.{index}", "cudy", password="pw")
+
+        counter = {"current": 0, "peak": 0, "calls": 0}
+        guard = threading.Lock()
+
+        def tracked(identifier):
+            with guard:
+                counter["current"] += 1
+                counter["calls"] += 1
+                counter["peak"] = max(counter["peak"], counter["current"])
+            time.sleep(0.3)
+            with guard:
+                counter["current"] -= 1
+            return {"online": False}
+
+        manager.get_status = tracked
+
+        workers = [threading.Thread(target=manager.dashboard, kwargs={"include_status": True}) for _ in range(5)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        assert counter["calls"] == 30, f"expected 30 status calls, issued {counter['calls']}"
+        assert counter["peak"] <= 8, f"thread pool grew to {counter['peak']} concurrent calls"
+
+    def test_a_later_poll_starts_a_fresh_sweep(self, tmp_path: Path):
+        manager = build_manager(tmp_path)
+        manager.add_device("d1", "192.0.2.1", "cudy", password="pw")
+        calls: list[str] = []
+
+        def tracked(identifier):
+            calls.append(identifier)
+            return {"online": True}
+
+        manager.get_status = tracked
+        manager.dashboard(include_status=True)
+        manager.dashboard(include_status=True)
+
+        assert calls == ["d1", "d1"], "a completed sweep must not be cached as a permanent result"
+
+    def test_sweep_survives_a_failing_device(self, tmp_path: Path):
+        manager = build_manager(tmp_path)
+        manager.add_device("good", "192.0.2.1", "cudy", password="pw")
+        manager.add_device("bad", "192.0.2.2", "cudy", password="pw")
+
+        def tracked(identifier):
+            if identifier == "bad":
+                raise AdapterError("unreachable")
+            return {"online": True}
+
+        manager.get_status = tracked
+        statuses = manager.get_all_statuses()
+
+        assert statuses["good"] == {"online": True}
+        assert statuses["bad"]["online"] is False
+        assert "unreachable" in statuses["bad"]["error"]
+
+    def test_no_devices_is_cheap(self, tmp_path: Path):
+        manager = build_manager(tmp_path)
+        assert manager.get_all_statuses() == {}

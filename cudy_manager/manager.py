@@ -10,7 +10,7 @@ from typing import Any
 
 import yaml
 
-from .adapters import AdapterError, CudyAdapter, TendaAdapter
+from .adapters import AdapterError, AuthenticationRejected, CudyAdapter, TendaAdapter
 from .diagnose import diagnose_device
 from .discovery import CudyDiscovery, DiscoveredDevice
 from .models import Device, ValidationError
@@ -37,6 +37,47 @@ def _rebuild(identifier: str, existing: Device, **values: Any) -> Device:
     return replacement
 
 
+class _StatusSweep:
+    """One status sweep, shared by every caller that asks while it is running.
+
+    Each sweep opens its own bounded thread pool, so starting a second sweep while
+    the first is still talking to slow or offline routers would double the thread
+    count and re-query every device. Callers therefore join the in-flight sweep
+    instead of launching their own.
+    """
+
+    def __init__(self, devices: list[Device], fetch: Any) -> None:
+        self._devices = devices
+        self._fetch = fetch
+        self._done = threading.Event()
+        self._result: dict[str, dict[str, Any]] = {}
+        self._thread = threading.Thread(target=self._run, name="status-sweep", daemon=True)
+        self._thread.start()
+
+    @property
+    def finished(self) -> bool:
+        return self._done.is_set()
+
+    def _run(self) -> None:
+        results: dict[str, dict[str, Any]] = {}
+        try:
+            with ThreadPoolExecutor(max_workers=min(8, len(self._devices))) as pool:
+                futures = {pool.submit(self._fetch, device.identifier): device.identifier for device in self._devices}
+                for future in as_completed(futures):
+                    identifier = futures[future]
+                    try:
+                        results[identifier] = future.result()
+                    except (AdapterError, SecretStoreError, ValidationError, OSError, RuntimeError) as exc:
+                        results[identifier] = {"online": False, "error": str(exc)[:200]}
+        finally:
+            self._result = results
+            self._done.set()
+
+    def join(self) -> dict[str, dict[str, Any]]:
+        self._done.wait()
+        return dict(self._result)
+
+
 class DeviceManager:
     def __init__(
         self,
@@ -57,6 +98,8 @@ class DeviceManager:
         self.devices: dict[str, Device] = {}
         self._lock = threading.RLock()
         self._transaction_state = threading.local()
+        self._status_lock = threading.Lock()
+        self._status_flight: _StatusSweep | None = None
         self._load_config()
 
     def _load_config(self) -> None:
@@ -209,7 +252,12 @@ class DeviceManager:
         if verify:
             result["verified"] = self.verify_credentials(identifier)
             if not result["verified"]["ok"]:
-                logger.warning("password for %s did not authenticate", identifier)
+                if result["verified"].get("reason") == "rejected":
+                    logger.warning("password for %s was rejected by the router", identifier)
+                else:
+                    logger.warning(
+                        "could not verify the password for %s: %s", identifier, result["verified"].get("error")
+                    )
         return result
 
     def diagnose(self, identifier: str) -> dict[str, Any]:
@@ -233,9 +281,15 @@ class DeviceManager:
         checked_at = datetime.now(UTC).isoformat()
         try:
             self.adapter_for(device).status()
+        except AuthenticationRejected as exc:
+            # The router answered and refused the credentials.
+            return {"ok": False, "reason": "rejected", "error": str(exc)[:200], "checked_at": checked_at}
         except (AdapterError, SecretStoreError, ValidationError, OSError, RuntimeError) as exc:
-            return {"ok": False, "error": str(exc)[:200], "checked_at": checked_at}
-        return {"ok": True, "checked_at": checked_at}
+            # The router could not be checked at all. Saying "rejected" here would
+            # send the operator after the password when the real problem is that the
+            # device is asleep, unreachable, or on another subnet.
+            return {"ok": False, "reason": "unreachable", "error": str(exc)[:200], "checked_at": checked_at}
+        return {"ok": True, "reason": "ok", "checked_at": checked_at}
 
     def remove_device(self, identifier: str) -> None:
         with self._transaction():
@@ -296,18 +350,14 @@ class DeviceManager:
 
     def get_all_statuses(self) -> dict[str, dict[str, Any]]:
         devices = self.get_all_devices()
-        results: dict[str, dict[str, Any]] = {}
         if not devices:
-            return results
-        with ThreadPoolExecutor(max_workers=min(8, len(devices))) as pool:
-            futures = {pool.submit(self.get_status, device.identifier): device.identifier for device in devices}
-            for future in as_completed(futures):
-                identifier = futures[future]
-                try:
-                    results[identifier] = future.result()
-                except (AdapterError, SecretStoreError, ValidationError, OSError, RuntimeError) as exc:
-                    results[identifier] = {"online": False, "error": str(exc)[:200]}
-        return results
+            return {}
+        with self._status_lock:
+            flight = self._status_flight
+            if flight is None or flight.finished:
+                flight = _StatusSweep(devices, self.get_status)
+                self._status_flight = flight
+        return flight.join()
 
     def reboot_device(self, identifier: str) -> bool:
         device = self.get_device(identifier)

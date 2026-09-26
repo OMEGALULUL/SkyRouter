@@ -10,7 +10,7 @@ PASSWORD = "correct horse battery staple"
 
 
 def rejected():
-    return {"ok": False, "error": "authentication failed"}
+    return {"ok": False, "reason": "rejected", "error": "authentication failed"}
 
 
 def build_client(tmp_path: Path, password: str = PASSWORD) -> TestClient:
@@ -524,3 +524,239 @@ class TestSecurityHeadersOnEveryResponse:
     def test_successful_response_is_hardened(self, tmp_path: Path):
         with TestClient(build_app(tmp_path)) as client:
             self._assert_hardened(client.get("/login"))
+
+
+class TestEventLoopResponsiveness:
+    """Router calls must never block the event loop.
+
+    Every endpoint that can touch a router runs in a worker thread. A synchronous
+    call inside an ``async def`` route stalls the whole server, including the cheap
+    endpoints the dashboard polls.
+    """
+
+    def test_password_reset_does_not_block_other_requests(self, tmp_path: Path):
+        import threading
+        import time
+
+        app = build_app(tmp_path)
+        manager = app.state.manager
+        manager.add_device("r1", "192.0.2.1", "cudy", password="pw")
+
+        def slow_verify(identifier):
+            time.sleep(1.0)
+            return {"ok": True}
+
+        manager.verify_credentials = slow_verify
+
+        with TestClient(app) as client:
+            token = login(client)
+            headers = {"x-csrf-token": token}
+            elapsed: dict[str, float] = {}
+
+            def reset() -> None:
+                started = time.time()
+                client.post("/api/devices/r1/password", headers=headers, json={"password": "new", "verify": True})
+                elapsed["reset"] = time.time() - started
+
+            worker = threading.Thread(target=reset)
+            worker.start()
+            time.sleep(0.3)
+
+            started = time.time()
+            response = client.get("/api/csrf", headers=headers)
+            elapsed["other"] = time.time() - started
+            worker.join()
+
+        assert response.status_code == 200
+        assert elapsed["reset"] >= 1.0
+        # A trivial endpoint must stay responsive while the router call is in flight.
+        assert elapsed["other"] < 0.5, f"event loop was blocked for {elapsed['other']:.2f}s"
+
+    def test_add_device_does_not_block_other_requests(self, tmp_path: Path):
+        import threading
+        import time
+
+        app = build_app(tmp_path)
+        manager = app.state.manager
+        original = manager.add_device
+
+        def slow_add(*args, **kwargs):
+            time.sleep(1.0)
+            return original(*args, **kwargs)
+
+        manager.add_device = slow_add
+
+        with TestClient(app) as client:
+            token = login(client)
+            headers = {"x-csrf-token": token}
+            elapsed: dict[str, float] = {}
+
+            def add() -> None:
+                started = time.time()
+                client.post(
+                    "/api/devices",
+                    headers=headers,
+                    json={"id": "r9", "host": "192.0.2.9", "vendor": "cudy", "password": "pw"},
+                )
+                elapsed["add"] = time.time() - started
+
+            worker = threading.Thread(target=add)
+            worker.start()
+            time.sleep(0.3)
+
+            started = time.time()
+            client.get("/api/csrf", headers=headers)
+            elapsed["other"] = time.time() - started
+            worker.join()
+
+        assert elapsed["add"] >= 1.0
+        assert elapsed["other"] < 0.5, f"event loop was blocked for {elapsed['other']:.2f}s"
+
+
+class TestLoginLimiter:
+    def test_expired_keys_are_reclaimed(self):
+        import time
+
+        from cudy_manager.web import LoginLimiter
+
+        limiter = LoginLimiter(window_seconds=1)
+        for index in range(200):
+            limiter.fail(f"10.0.0.{index}")
+        assert len(limiter._values) == 200
+        time.sleep(1.1)
+        for index in range(50):
+            limiter.blocked(f"10.0.0.{index}")
+        assert len(limiter._values) == 0
+
+    def test_key_count_is_capped(self):
+        from cudy_manager.web import LoginLimiter
+
+        limiter = LoginLimiter(max_keys=100)
+        for index in range(5000):
+            limiter.fail(f"10.{(index // 256) % 256}.{index % 256}.{index // 65536}")
+        assert len(limiter._values) <= 100
+
+    def test_throttling_still_works(self):
+        from cudy_manager.web import LoginLimiter
+
+        limiter = LoginLimiter(maximum=3, window_seconds=60)
+        for _ in range(3):
+            limiter.fail("1.2.3.4")
+        assert limiter.blocked("1.2.3.4")
+        assert not limiter.blocked("5.6.7.8")
+        limiter.success("1.2.3.4")
+        assert not limiter.blocked("1.2.3.4")
+
+
+class TestLoginTiming:
+    def test_username_is_always_compared(self, tmp_path: Path, monkeypatch):
+        """A wrong username must still run the password comparison."""
+        import hmac
+
+        app = build_app(tmp_path)
+        calls: list[bytes] = []
+        original = hmac.compare_digest
+
+        def counting(a, b):
+            calls.append(a)
+            return original(a, b)
+
+        monkeypatch.setattr("cudy_manager.web.hmac.compare_digest", counting)
+        with TestClient(app) as client:
+            client.post("/login", json={"username": "wrong", "password": PASSWORD})
+
+        assert len(calls) == 2, "password comparison was skipped for a bad username"
+
+
+class TestSettingsFromEnv:
+    def test_invalid_interval_falls_back(self, monkeypatch):
+        from cudy_manager.web import Settings
+
+        monkeypatch.setenv("ROUTER_MANAGER_SCHEDULER_INTERVAL", "abc")
+        assert Settings.from_env().scheduler_interval == 30
+
+    def test_interval_below_minimum_is_raised(self, monkeypatch):
+        from cudy_manager.web import Settings
+
+        monkeypatch.setenv("ROUTER_MANAGER_SCHEDULER_INTERVAL", "5")
+        assert Settings.from_env().scheduler_interval == 15
+
+    def test_valid_interval_is_used(self, monkeypatch):
+        from cudy_manager.web import Settings
+
+        monkeypatch.setenv("ROUTER_MANAGER_SCHEDULER_INTERVAL", "90")
+        assert Settings.from_env().scheduler_interval == 90
+
+
+class TestContentSecurityPolicy:
+    """The dashboard must work under a strict policy.
+
+    There is no XSS sink in the dashboard today, so the policy is defence in depth.
+    It still has to be correct, or the page silently stops working.
+    """
+
+    @staticmethod
+    def _nonce_from(response) -> str:
+        header = response.headers["Content-Security-Policy"]
+        assert "'nonce-" in header, header
+        start = header.index("'nonce-") + len("'nonce-")
+        return header[start : header.index("'", start)]
+
+    def test_policy_is_present_on_json_responses(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        policy = client.get("/api/csrf").headers["Content-Security-Policy"]
+        assert "default-src 'none'" in policy
+        assert "frame-ancestors 'none'" in policy
+        assert "form-action 'self'" in policy
+
+    def test_dashboard_nonce_matches_the_header(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        response = client.get("/")
+        assert response.status_code == 200
+        nonce = self._nonce_from(response)
+        assert f'<script nonce="{nonce}">' in response.text
+        assert "__CSP_NONCE__" not in response.text
+
+    def test_login_nonce_matches_the_header(self, tmp_path: Path):
+        response = build_client(tmp_path).get("/login")
+        nonce = self._nonce_from(response)
+        assert f'<script nonce="{nonce}">' in response.text
+        assert "{nonce}" not in response.text
+
+    def test_nonce_changes_per_request(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        first = self._nonce_from(client.get("/"))
+        second = self._nonce_from(client.get("/"))
+        assert first != second
+
+    def test_dashboard_has_no_inline_event_handlers(self, tmp_path: Path):
+        import re
+
+        client = build_client(tmp_path)
+        login(client)
+        body = client.get("/").text
+        # Inline handler attributes need 'unsafe-inline' in script-src, which this
+        # policy omits. Assigning element.onclick from script is unaffected, so match
+        # only the attribute form: a quoted value after whitespace.
+        assert not re.search(r"""\son[a-z]+\s*=\s*["']""", body), "inline event handler would be blocked"
+        # Every control must therefore be wired up from script instead.
+        controls = (
+            "refresh-button",
+            "add-button",
+            "discover-button",
+            "logout-button",
+            "add-cancel",
+            "password-cancel",
+        )
+        for control in controls:
+            assert f'id="{control}"' in body
+            assert f"'{control}'" in body
+
+    def test_policy_is_also_set_on_error_responses(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        response = client.get("/api/devices")
+        assert response.status_code == 401
+        assert "Content-Security-Policy" in response.headers

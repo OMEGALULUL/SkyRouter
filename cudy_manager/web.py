@@ -37,6 +37,18 @@ PLAINTEXT_CREDENTIAL_FIELDS = {
 }
 
 
+def _positive_int(name: str, default: int, minimum: int = 1) -> int:
+    """Read an integer from the environment without failing startup on junk."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r; using %d", name, raw, default)
+        return default
+
+
 @dataclass
 class Settings:
     username: str
@@ -54,7 +66,7 @@ class Settings:
             username=os.environ.get("ROUTER_MANAGER_USERNAME", os.environ.get("AUTH_USERNAME", "admin")),
             password=password,
             secure_cookie=os.environ.get("ROUTER_MANAGER_SECURE_COOKIE", "0") == "1",
-            scheduler_interval=max(15, int(os.environ.get("ROUTER_MANAGER_SCHEDULER_INTERVAL", "30"))),
+            scheduler_interval=_positive_int("ROUTER_MANAGER_SCHEDULER_INTERVAL", 30, minimum=15),
             config_path=Path(os.environ.get("ROUTER_MANAGER_CONFIG", PACKAGE_DIR / "cudy_devices.yaml")),
             data_dir=Path(os.environ.get("ROUTER_MANAGER_DATA_DIR", default_data)),
         )
@@ -94,22 +106,53 @@ class SessionStore:
 
 
 class LoginLimiter:
-    def __init__(self, maximum: int = 5, window_seconds: int = 900):
+    def __init__(self, maximum: int = 5, window_seconds: int = 900, max_keys: int = 4096):
         self.maximum = maximum
         self.window_seconds = window_seconds
+        self.max_keys = max_keys
         self._values: dict[str, list[float]] = {}
         self._lock = threading.Lock()
+        self._sweeps = 0
+
+    def _prune(self, now: float) -> None:
+        for key, values in list(self._values.items()):
+            kept = [value for value in values if now - value < self.window_seconds]
+            if kept:
+                self._values[key] = kept
+            else:
+                del self._values[key]
+
+    def _remember(self, key: str, values: list[float], now: float) -> None:
+        if values:
+            self._values[key] = values
+        else:
+            self._values.pop(key, None)
+        # Bound memory even inside one window: a flood of unique source addresses
+        # must not be able to grow the table without limit. The least recently
+        # active keys are dropped first.
+        while len(self._values) > self.max_keys:
+            oldest = min(self._values, key=lambda item: self._values[item][-1])
+            del self._values[oldest]
 
     def blocked(self, key: str) -> bool:
         now = time.time()
         with self._lock:
+            # Sweep periodically so addresses that are never queried again (rotating
+            # sources, IPv6 privacy addresses) do not accumulate forever.
+            self._sweeps += 1
+            if self._sweeps % 50 == 0:
+                self._prune(now)
             values = [value for value in self._values.get(key, []) if now - value < self.window_seconds]
-            self._values[key] = values
+            self._remember(key, values, now)
             return len(values) >= self.maximum
 
     def fail(self, key: str) -> None:
+        now = time.time()
         with self._lock:
-            self._values.setdefault(key, []).append(time.time())
+            self._values.setdefault(key, []).append(now)
+            while len(self._values) > self.max_keys:
+                oldest = min(self._values, key=lambda item: self._values[item][-1])
+                del self._values[oldest]
 
     def success(self, key: str) -> None:
         with self._lock:
@@ -137,7 +180,7 @@ button{margin-top:22px;width:100%;padding:11px;border:0;border-radius:7px;backgr
 <button>Sign in</button>
 </form>
 <p id=message></p></main>
-<script>
+<script nonce="{nonce}">
 document.getElementById('login').addEventListener('submit', async event => {
   event.preventDefault();
   const form = new FormData(event.target);
@@ -152,13 +195,17 @@ document.getElementById('login').addEventListener('submit', async event => {
 </script></body></html>"""
 
 
-def _login_page(message: str = "") -> str:
+def _login_page(message: str = "", nonce: str = "") -> str:
     notice = f"<p class=error>{html.escape(message)}</p>" if message else ""
-    return LOGIN_PAGE_TEMPLATE.replace("{notice}", notice)
+    return LOGIN_PAGE_TEMPLATE.replace("{notice}", notice).replace("{nonce}", nonce)
 
 
-def _dashboard_page() -> str:
-    return TEMPLATE_PATH.read_text(encoding="utf-8")
+def _nonce() -> str:
+    return secrets.token_urlsafe(18)
+
+
+def _dashboard_page(nonce: str) -> str:
+    return TEMPLATE_PATH.read_text(encoding="utf-8").replace("__CSP_NONCE__", nonce)
 
 
 async def _body(request: Request) -> dict[str, Any]:
@@ -241,7 +288,7 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
     app.state.sessions = sessions
     app.state.scheduler = scheduler
 
-    def _harden(response):
+    def _harden(response, nonce=None):
         """Apply the security headers to every response, including early returns.
 
         Authentication failures, CSRF rejections, and redirects are the responses an
@@ -251,32 +298,60 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
+        # The dashboard has no third-party assets and no inline event handlers, so a
+        # strict policy applies. The script nonce is injected per request in
+        # _dashboard_page; 'strict-dynamic' lets that one script load nothing else.
+        script_src = "'strict-dynamic'" if nonce is None else f"'nonce-{nonce}' 'strict-dynamic'"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            f"script-src {script_src}; "
+            "style-src 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'none'"
+        )
         return response
 
     @app.middleware("http")
     async def authentication(request: Request, call_next):
+        # One nonce per request, shared by the template body and the CSP header.
+        request.state.csp_nonce = _nonce()
         path = request.url.path
         public = path in {"/login", "/healthz", "/favicon.ico"}
         if not public:
             if not settings.password:
                 if path.startswith("/api/"):
                     return _harden(
-                        JSONResponse({"detail": "ROUTER_MANAGER_PASSWORD is not configured"}, status_code=503)
+                        JSONResponse({"detail": "ROUTER_MANAGER_PASSWORD is not configured"}, status_code=503),
+                        request.state.csp_nonce,
                     )
                 return _harden(
-                    HTMLResponse(_login_page("Server authentication is not configured"), status_code=503)
+                    HTMLResponse(
+                        _login_page("Server authentication is not configured", request.state.csp_nonce),
+                        status_code=503,
+                    ),
+                    request.state.csp_nonce,
                 )
             session = sessions.get(request.cookies.get("router_session"))
             if session is None:
                 if path.startswith("/api/"):
-                    return _harden(JSONResponse({"detail": "authentication required"}, status_code=401))
-                return _harden(RedirectResponse("/login", status_code=303))
+                    return _harden(
+                    JSONResponse({"detail": "authentication required"}, status_code=401),
+                    request.state.csp_nonce,
+                )
+                return _harden(
+                    RedirectResponse("/login", status_code=303), request.state.csp_nonce
+                )
             if request.method in {"POST", "PUT", "PATCH", "DELETE"} and path != "/login":
                 supplied = request.headers.get("x-csrf-token", "")
                 if not hmac.compare_digest(supplied, str(session["csrf"])):
-                    return _harden(JSONResponse({"detail": "CSRF validation failed"}, status_code=403))
+                    return _harden(
+                        JSONResponse({"detail": "CSRF validation failed"}, status_code=403),
+                        request.state.csp_nonce,
+                    )
             request.state.session = session
-        return _harden(await call_next(request))
+        return _harden(await call_next(request), request.state.csp_nonce)
 
     @app.exception_handler(AdapterError)
     async def adapter_error_handler(_, exc: AdapterError):
@@ -295,8 +370,8 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
         return {"status": "ok", "authentication_configured": bool(settings.password)}
 
     @app.get("/login", response_class=HTMLResponse)
-    async def login_page():
-        return HTMLResponse(_login_page())
+    async def login_page(request: Request):
+        return HTMLResponse(_login_page(nonce=request.state.csp_nonce))
 
     @app.post("/login")
     async def login(request: Request):
@@ -308,9 +383,12 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
         body = await _body(request)
         username = str(body.get("username", ""))
         password = str(body.get("password", ""))
-        if not hmac.compare_digest(username.encode(), settings.username.encode()) or not hmac.compare_digest(
-            password.encode(), settings.password.encode()
-        ):
+        # Both comparisons always run. Short-circuiting on the username would make a
+        # wrong username measurably faster than a wrong password, which is enough to
+        # enumerate the configured username.
+        username_ok = hmac.compare_digest(username.encode(), settings.username.encode())
+        password_ok = hmac.compare_digest(password.encode(), settings.password.encode())
+        if not (username_ok and password_ok):
             limiter.fail(key)
             raise HTTPException(status_code=401, detail="invalid credentials")
         limiter.success(key)
@@ -335,8 +413,8 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
         return response
 
     @app.get("/", response_class=HTMLResponse)
-    async def dashboard_page():
-        return HTMLResponse(_dashboard_page())
+    async def dashboard_page(request: Request):
+        return HTMLResponse(_dashboard_page(request.state.csp_nonce))
 
     @app.get("/api/csrf")
     async def csrf(request: Request):
@@ -376,7 +454,8 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
             if key in body
         }
         try:
-            device = manager.add_device(
+            device = await asyncio.to_thread(
+                manager.add_device,
                 body["id"],
                 body["host"],
                 body["vendor"],
@@ -393,7 +472,7 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
         _reject_plaintext_credentials(body)
         body.pop("id", None)
         try:
-            device = manager.update_device(identifier, **body)
+            device = await asyncio.to_thread(manager.update_device, identifier, **body)
         except (ValidationError, ManagerError, SecretStoreError) as exc:
             raise HTTPException(status_code=400, detail=_error_detail(exc)) from exc
         return {"device": device.to_public()}
@@ -409,7 +488,7 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
         if not isinstance(verify, bool):
             raise HTTPException(status_code=400, detail="verify must be a boolean")
         try:
-            result = manager.set_password(identifier, password, verify=verify)
+            result = await asyncio.to_thread(manager.set_password, identifier, password, verify=verify)
         except (ValidationError, ManagerError, SecretStoreError) as exc:
             raise HTTPException(status_code=400, detail=_error_detail(exc)) from exc
         return result
@@ -417,7 +496,7 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
     @app.delete("/api/devices/{identifier}")
     async def delete_device(identifier: str):
         try:
-            manager.remove_device(identifier)
+            await asyncio.to_thread(manager.remove_device, identifier)
         except ManagerError as exc:
             raise HTTPException(status_code=404, detail=_error_detail(exc)) from exc
         return {"deleted": identifier}

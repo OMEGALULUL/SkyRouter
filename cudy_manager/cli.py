@@ -56,11 +56,18 @@ def _set_password(manager: DeviceManager, args: argparse.Namespace) -> int:
     _print(result)
     verified = result.get("verified")
     if verified is not None and not verified.get("ok"):
-        print(
-            f"error: password saved for {args.device} but the router rejected it: "
-            f"{verified.get('error', 'authentication failed')}",
-            file=sys.stderr,
-        )
+        if verified.get("reason") == "rejected":
+            print(
+                f"error: password saved for {args.device} but the router rejected it: "
+                f"{verified.get('error', 'authentication failed')}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"error: password saved for {args.device} but the router could not be checked: "
+                f"{verified.get('error', 'no response')}",
+                file=sys.stderr,
+            )
         return 1
     if verified is not None:
         print(f"password for {args.device} saved and verified against the router", file=sys.stderr)

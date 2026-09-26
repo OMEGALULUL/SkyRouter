@@ -11,7 +11,11 @@ PASSWORD = "typed-twice-secret"
 
 
 def rejected():
-    return {"ok": False, "error": "authentication failed"}
+    return {"ok": False, "reason": "rejected", "error": "authentication failed"}
+
+
+def unreachable():
+    return {"ok": False, "reason": "unreachable", "error": "Network is unreachable"}
 
 
 @pytest.fixture
@@ -141,6 +145,20 @@ class TestSetPasswordCommand:
         assert cli.main(["set-password", "r1"]) == 1
         err = capsys.readouterr().err
         assert "rejected it" in err
+        assert stored_password(config, data) == PASSWORD
+
+    def test_unreachable_router_is_not_reported_as_rejection(self, env, monkeypatch, capsys):
+        config, data = env
+        add_device(config, data)
+        monkeypatch.setenv("ROUTER_MANAGER_DEVICE_PASSWORD", PASSWORD)
+        monkeypatch.setenv("ROUTER_MANAGER_ASSUME_YES", "1")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        monkeypatch.setattr(DeviceManager, "verify_credentials", lambda self, identifier: unreachable())
+
+        assert cli.main(["set-password", "r1"]) == 1
+        err = capsys.readouterr().err
+        assert "could not be checked" in err
+        assert "rejected it" not in err
         assert stored_password(config, data) == PASSWORD
 
     def test_unknown_device_reports_clean_error(self, env, monkeypatch, capsys):

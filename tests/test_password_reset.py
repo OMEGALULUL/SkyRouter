@@ -112,3 +112,63 @@ class TestVerifyCredentials:
         RecordingAdapter.accepted = "different"
         monkeypatch.setattr(manager, "adapter_for", lambda device: adapter(manager, device))
         assert manager.verify_credentials("router-1")["ok"] is False
+
+
+class TestVerifyReason:
+    """A refused password and an unreachable router must not look the same.
+
+    Reporting "the router rejected the password" when the device is simply
+    unreachable sends the operator after the password instead of the network.
+    """
+
+    @staticmethod
+    def _adapter_raising(exc):
+        class Adapter:
+            def status(self):
+                raise exc
+
+        return Adapter()
+
+    def test_rejected_credentials_are_labelled_rejected(self, tmp_path: Path):
+        from cudy_manager.adapters import AuthenticationRejected
+
+        manager = build_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+        manager.adapter_for = lambda device: self._adapter_raising(AuthenticationRejected("password rejected"))
+
+        result = manager.verify_credentials("r1")
+        assert result["ok"] is False
+        assert result["reason"] == "rejected"
+
+    def test_unreachable_router_is_labelled_unreachable(self, tmp_path: Path):
+        manager = build_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+        manager.adapter_for = lambda device: self._adapter_raising(OSError("Network is unreachable"))
+
+        result = manager.verify_credentials("r1")
+        assert result["ok"] is False
+        assert result["reason"] == "unreachable"
+        assert "unreachable" in result["error"]
+
+    def test_protocol_error_is_not_reported_as_rejection(self, tmp_path: Path):
+        from cudy_manager.adapters import ProtocolMismatch
+
+        manager = build_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+        manager.adapter_for = lambda device: self._adapter_raising(ProtocolMismatch("unknown firmware"))
+
+        assert manager.verify_credentials("r1")["reason"] == "unreachable"
+
+    def test_success_is_labelled_ok(self, tmp_path: Path):
+        manager = build_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
+
+        class Adapter:
+            def status(self):
+                return {"online": True}
+
+        manager.adapter_for = lambda device: Adapter()
+        result = manager.verify_credentials("r1")
+        assert result["ok"] is True
+        assert result["reason"] == "ok"
+        assert result["checked_at"]
