@@ -107,8 +107,8 @@ class Device:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", self.identifier):
             raise ValidationError("device identifier contains unsupported characters")
         self.vendor = str(self.vendor).strip().lower()
-        if self.vendor not in {"cudy", "tenda"}:
-            raise ValidationError("vendor must be cudy or tenda")
+        if self.vendor not in {"cudy", "tenda", "tplink"}:
+            raise ValidationError("vendor must be cudy, tenda, or tplink")
         self.host = str(self.host).strip()
         if not self.host or any(char.isspace() for char in self.host):
             raise ValidationError("host is required")

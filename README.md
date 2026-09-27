@@ -1,6 +1,6 @@
 # Router Manager
 
-Standalone manager for Cudy and Tenda consumer routers. Encrypted credential storage,
+Standalone manager for Cudy, Tenda, and TP-Link consumer routers. Encrypted credential storage,
 a local-only web dashboard, guarded scheduled reboots, and opt-in network discovery.
 
 This is a self-contained project. It shares no code, dependencies, configuration, or
@@ -57,7 +57,7 @@ plain HTTP, so set `ROUTER_MANAGER_SECURE_COOKIE=1` when you terminate TLS in fr
 ## Command line
 
 ```bash
-router-manager add <id> <host> --vendor cudy|tenda [--username admin] [--model X] [--no-verify]
+router-manager add <id> <host> --vendor cudy|tenda|tplink [--username admin] [--model X] [--no-verify]
 router-manager set-password <id> [--no-verify]
 router-manager diagnose <id>
 router-manager list
@@ -278,6 +278,27 @@ Changing a Wi-Fi SSID over SSH needs `metadata.uci_section`; the CLI can only cr
 web-transport Cudy and Tenda devices, so SSH devices are added by editing the config
 by hand.
 
+### TP-Link
+
+The older TP-Link web UI (WR840N and similar) authenticates with HTTP Basic, but
+only through a cookie rather than an `Authorization` header. The login page
+builds the credential in JavaScript and stores it:
+
+```js
+auth = "Basic " + base64(username + ":" + password)
+document.cookie = "Authorization=" + auth
+```
+
+**This firmware locks the web UI for two hours after ten failed logins.** The
+adapter therefore authenticates once per session and never retries, and it
+reports the router's own `authTimes` counter so a wrong password is
+distinguishable from an existing lockout. If a password is rejected, fix it in
+the dashboard rather than re-running the command in a loop.
+
+Supported: status (model, firmware, uptime), connected clients, and reboot.
+Changing the SSID is deliberately not supported on this family, because a bad
+write can drop you off the router mid-change.
+
 The adapters are written against the vendors' documented request shapes and every
 test runs against mocked transports. **This has not been verified against real Cudy or
 Tenda hardware.** Confirm status and reboot behaviour on a device you can reach before
@@ -301,7 +322,7 @@ cudy_manager/
   models.py         device and reboot policy, validation
   secrets.py        Fernet key and encrypted vault
   http_client.py    cookie-aware HTTP, charset and URL scheme handling
-  adapters.py       Cudy and Tenda adapters
+  adapters.py       Cudy, Tenda, and TP-Link adapters
   openwrt.py        SSH/UCI adapter
   manager.py        inventory, secrets, adapters, status
   scheduler.py      guarded scheduled reboots
@@ -309,7 +330,7 @@ cudy_manager/
   web.py            FastAPI service, sessions, CSRF
   cli.py            command line entry point
   dashboard.html    dashboard
-tests/              261 tests, all mocked
+tests/              285 tests, all mocked
 ```
 
 ## Licence

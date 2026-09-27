@@ -10,7 +10,7 @@ from typing import Any
 
 import yaml
 
-from .adapters import AdapterError, AuthenticationRejected, CudyAdapter, TendaAdapter
+from .adapters import AdapterError, AuthenticationRejected, CudyAdapter, TendaAdapter, TpLinkAdapter
 from .diagnose import diagnose_device
 from .discovery import CudyDiscovery, DiscoveredDevice
 from .models import Device, ValidationError
@@ -330,6 +330,8 @@ class DeviceManager:
         password = self.credentials(device)
         if device.vendor == "tenda":
             return TendaAdapter(device, password)
+        if device.vendor == "tplink":
+            return TpLinkAdapter(device, password)
         if device.transport == "ssh":
             return OpenWrtAdapter(device, password)
         return CudyAdapter(device, password)

@@ -456,3 +456,251 @@ class TendaAdapter(RouterAdapter):
     def reboot(self) -> bool:
         self.request({"sysReboot": {}})
         return True
+
+
+# Old TP-Link firmware (WR840N and siblings) locks the web UI for two hours after
+# ten failed logins, so the adapter must never retry. Every failure mode below
+# reports the router's own authTimes counter so the operator can tell a wrong
+# password apart from a lockout.
+_TPLINK_MAX_ATTEMPTS = 10
+_TPLINK_LOCKOUT_SECONDS = 7200
+
+# Pages used by the 11N-era web UI. Confirmed present on the WR840N: without valid
+# auth each returns 403 rather than 404.
+_TPLINK_STATUS_PATH = "/userRpm/StatusRpm.htm"
+_TPLINK_CLIENTS_PATH = "/userRpm/DhcpTableRpm.htm"
+_TPLINK_REBOOT_PATH = "/userRpm/SysRebootRpm.htm"
+
+
+def _cell_after(pattern: str, text: str, flags: int = re.IGNORECASE) -> str:
+    """Return the contents of the first table cell following a label.
+
+    Reading the value out of its own cell avoids the earlier mistake of taking
+    the next word after the label, which on this firmware picks up the word
+    "Version" from "Firmware Version" instead of the value beside it.
+    """
+    match = re.search(pattern, text, flags)
+    if not match:
+        return ""
+    window = text[match.end() : match.end() + 300]
+    cell = re.search(r"<t[dh][^>]*>(.*?)</t[dh]>", window, re.IGNORECASE | re.DOTALL)
+    if not cell:
+        return ""
+    value = html.unescape(re.sub(r"<[^>]+>", " ", cell.group(1)))
+    return " ".join(value.split())
+
+
+class TpLinkAdapter(RouterAdapter):
+    """TP-Link consumer routers using the older 192.168.1.x web UI.
+
+    Authentication is HTTP Basic, but this firmware does not read an
+    ``Authorization`` header. The login page builds the credential in JavaScript
+    and stores it in a cookie of the same name::
+
+        auth = "Basic " + base64(user + ":" + password)
+        document.cookie = "Authorization=" + auth
+
+    Everything after login is a plain page fetch using that cookie.
+    """
+
+    def __init__(self, device: Device, password: str):
+        super().__init__(device, password)
+        scheme = "https" if device.https else "http"
+        self.base_url = f"{scheme}://{_host_for_url(device.host)}:{device.http_port}"
+        self.http = HttpSession(self.base_url, verify_tls=device.verify_tls)
+        self.username = device.username or "admin"
+        self.authenticated = False
+        self.auth_cookie = ""
+
+    def _cookie_header(self) -> str:
+        if not self.auth_cookie:
+            return ""
+        return f"Authorization={self.auth_cookie}"
+
+    def _get(self, path: str):
+        headers = {"Referer": f"{self.base_url}/"}
+        cookie = self._cookie_header()
+        if cookie:
+            headers["Cookie"] = cookie
+        try:
+            return self.http.request("GET", path, headers=headers)
+        except HttpError as exc:
+            raise AdapterError(str(exc)) from exc
+
+    @staticmethod
+    def _auth_times(text: str) -> int:
+        match = re.search(r"authTimes\s*=\s*(\d+)", text)
+        return int(match.group(1)) if match else 0
+
+    def _rejection(self, text: str) -> AuthenticationRejected:
+        """Describe a failed login precisely, including an active lockout."""
+        attempts = self._auth_times(text)
+        message = "TP-Link login rejected"
+        if attempts >= _TPLINK_MAX_ATTEMPTS:
+            message = (
+                f"TP-Link login rejected and the web UI is now locked after {attempts} failed attempts; "
+                f"it stays locked for about {_TPLINK_LOCKOUT_SECONDS // 3600} hours"
+            )
+        elif attempts:
+            message = f"TP-Link login rejected ({attempts} of {_TPLINK_MAX_ATTEMPTS} attempts used before lockout)"
+        return AuthenticationRejected(message)
+
+    def _login_state(self) -> str:
+        """Read the router's authTimes counter.
+
+        Requested without the credential cookie, so it does not count as another
+        login attempt. This is what distinguishes a wrong password from a router
+        that is already locked out.
+        """
+        try:
+            response = self.http.request("GET", "/", headers={"Referer": f"{self.base_url}/"})
+            return response.text
+        except HttpError:
+            return ""
+
+    def login(self) -> bool:
+        """Authenticate once. Never retried, because the router counts attempts."""
+        if self.authenticated:
+            return True
+        raw = f"{self.username}:{self.password}".encode()
+        self.auth_cookie = "Basic " + base64.b64encode(raw).decode()
+        # Confirm the cookie works. This is the only request that presents
+        # credentials, so a wrong password costs a single one of the router's ten.
+        response = self._get(_TPLINK_STATUS_PATH)
+        if response.status == 403 or self._auth_times(response.text) > 0:
+            self.authenticated = False
+            self.auth_cookie = ""
+            raise self._rejection(self._login_state())
+        self.authenticated = True
+        return True
+
+    def _session_get(self, path: str):
+        if not self.authenticated:
+            self.login()
+        response = self._get(path)
+        if response.status == 403:
+            # The session expired, or the cookie was never accepted.
+            self.authenticated = False
+            raise self._rejection("TP-Link session was refused")
+        return response
+
+    def status(self) -> dict[str, Any]:
+        response = self._session_get(_TPLINK_STATUS_PATH)
+        text = response.text
+        result: dict[str, Any] = {"online": True, "source": "tplink-11n"}
+        # The page carries the model twice: a JavaScript variable and a table row.
+        # The variable is the value itself, so read it directly rather than
+        # looking for a neighbouring cell, which would return the row's label.
+        declared = re.search(r"modelName\s*=\s*\"([^\"]+)\"", text)
+        if declared:
+            result["model"] = html.unescape(declared.group(1)).strip()
+        else:
+            model = _cell_after(r"Model\s*No\.?", text)
+            if model:
+                result["model"] = model
+        firmware = _cell_after(r"(?:firmware|software)[^0-9]{0,20}version", text)
+        if firmware:
+            result["firmware"] = firmware.split()[0]
+        uptime = _cell_after(r"uptime", text)
+        if uptime:
+            seconds = _uptime_seconds(uptime)
+            if seconds is not None:
+                result["uptime_text"] = uptime
+                result["uptime_seconds"] = seconds
+        if "model" not in result and "firmware" not in result and "uptime_seconds" not in result:
+            # Nothing recognisable came back. Say so instead of reporting a healthy
+            # router with no data, which would hide a broken parser.
+            raise ProtocolMismatch(
+                "TP-Link status page did not contain model, firmware, or uptime; "
+                f"page began: {text[:120]!r}"
+            )
+        return result
+
+    def clients(self) -> list[dict[str, Any]]:
+        response = self._session_get(_TPLINK_CLIENTS_PATH)
+        return _tplink_clients(response.text)
+
+    def reboot(self) -> bool:
+        response = self._session_get(_TPLINK_REBOOT_PATH)
+        parser = _FormParser()
+        parser.feed(response.text)
+        form = next((item for item in parser.forms if "reboot" in item["action"].lower()), None)
+        if form is None and parser.forms:
+            form = parser.forms[0]
+        if form is None:
+            # Some builds post straight back to the same page with no form.
+            form = {"action": _TPLINK_REBOOT_PATH, "inputs": {}}
+        action = form["action"] or _TPLINK_REBOOT_PATH
+        if not action.startswith("/"):
+            action = _TPLINK_REBOOT_PATH
+        fields = {key: str(value) for key, value in form["inputs"].items()}
+        fields.setdefault("reboot", "Reboot")
+        headers = {"Referer": f"{self.base_url}{_TPLINK_REBOOT_PATH}"}
+        cookie = self._cookie_header()
+        if cookie:
+            headers["Cookie"] = cookie
+        try:
+            result = self.http.request("POST", action, urlencode(fields).encode(), headers)
+        except HttpError as exc:
+            raise AdapterError(str(exc)) from exc
+        if result.status == 403:
+            self.authenticated = False
+            raise self._rejection("TP-Link refused the reboot request")
+        return result.status in {200, 202, 204, 301, 302, 303}
+
+
+_MAC_PATTERN = re.compile(r"\b([0-9A-F]{2}(?:[:-][0-9A-F]{2}){5})\b", re.IGNORECASE)
+_IP_PATTERN = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+def _quoted_values(text: str) -> list[str]:
+    """Every double- or single-quoted string in order, correctly paired.
+
+    Matching a quote with a lazy ``.*?`` in one regex lets the closing quote of
+    one value serve as the opening quote of the next, which silently shifts every
+    field by one. Splitting the two quote styles keeps the pairing correct.
+    """
+    values = [item for item in re.findall(r'"([^"\n]*)"', text)]
+    values += [item for item in re.findall(r"'([^'\n]*)'", text)]
+    return [item.strip() for item in values]
+
+
+def _tplink_clients(text: str) -> list[dict[str, Any]]:
+    """Pull MAC, IP, and hostname out of the TP-Link host table.
+
+    This firmware has emitted the table in several shapes across model years
+    (JavaScript object constructors, plain rows, and definition lists), so match
+    on each MAC and read only its own record. The record runs up to the next MAC:
+    scanning a fixed window ahead bleeds into the following row and picks up
+    fragments of the next entry as if they were this one's hostname.
+    """
+    matches = list(_MAC_PATTERN.finditer(text))
+    clients: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, match in enumerate(matches):
+        mac = match.group(1).upper().replace("-", ":")
+        if mac in seen or mac == "00:00:00:00:00:00":
+            continue
+        seen.add(mac)
+        # Start one character early so the record includes the quote that opens the
+        # MAC. Without it the quoted values in the row are paired off by one and
+        # every real field is skipped.
+        start = max(0, match.start() - 1)
+        end = matches[index + 1].start() - 1 if index + 1 < len(matches) else len(text)
+        record = text[start : max(start + 1, end)][:400]
+        address = next((item for item in _IP_PATTERN.findall(record) if not item.startswith("255.")), "")
+        hostname = ""
+        for candidate in _quoted_values(record):
+            if not re.search(r"[A-Za-z0-9]", candidate):
+                continue
+            if candidate.lower() in {"null", "none", "unknown", "true", "false"}:
+                continue
+            if _IP_PATTERN.fullmatch(candidate) or _MAC_PATTERN.fullmatch(candidate):
+                continue
+            # A hostname is a single word; a fragment of the next statement is not.
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", candidate):
+                continue
+            hostname = candidate
+            break
+        clients.append({"name": hostname or mac, "mac": mac, "ip": address, "cells": [mac, address, hostname]})
+    return clients

@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     add = sub.add_parser("add")
     add.add_argument("id")
     add.add_argument("host")
-    add.add_argument("--vendor", choices=["cudy", "tenda"], default="cudy")
+    add.add_argument("--vendor", choices=["cudy", "tenda", "tplink"], default="cudy")
     add.add_argument("--username", default="root")
     add.add_argument("--model", default="")
     add.add_argument("--transport", choices=["web", "ssh"], default="web")
