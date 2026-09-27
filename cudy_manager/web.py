@@ -61,14 +61,16 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         password = os.environ.get("ROUTER_MANAGER_PASSWORD", os.environ.get("AUTH_PASSWORD", ""))
-        default_data = Path.home() / ".local/state/skybre-router-manager"
+        data_override = os.environ.get("ROUTER_MANAGER_DATA_DIR", "").strip()
+        # Guard the empty string explicitly: Path("") is truthy and means ".".
+        default_data = Path(data_override) if data_override else Path.home() / ".local/state/skybre-router-manager"
         return cls(
             username=os.environ.get("ROUTER_MANAGER_USERNAME", os.environ.get("AUTH_USERNAME", "admin")),
             password=password,
             secure_cookie=os.environ.get("ROUTER_MANAGER_SECURE_COOKIE", "0") == "1",
             scheduler_interval=_positive_int("ROUTER_MANAGER_SCHEDULER_INTERVAL", 30, minimum=15),
-            config_path=Path(os.environ.get("ROUTER_MANAGER_CONFIG", PACKAGE_DIR / "cudy_devices.yaml")),
-            data_dir=Path(os.environ.get("ROUTER_MANAGER_DATA_DIR", default_data)),
+            config_path=Path(os.environ.get("ROUTER_MANAGER_CONFIG", default_data / "cudy_devices.yaml")),
+            data_dir=Path(data_override) if data_override else default_data,
         )
 
 
@@ -576,4 +578,16 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
     return app
 
 
-app = create_app()
+def __getattr__(name: str) -> Any:
+    """Build the default application on first access.
+
+    ``uvicorn cudy_manager.web:app`` needs a module-level attribute, but
+    constructing it eagerly meant that merely importing this module read the
+    device config and opened the credential vault. Under test that wrote a real
+    config file into the working directory and made collection order-dependent.
+    """
+    if name == "app":
+        application = create_app()
+        globals()["app"] = application
+        return application
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

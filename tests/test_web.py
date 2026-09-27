@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cudy_manager.manager import DeviceManager
@@ -800,3 +801,127 @@ class TestPolicyAllowsWhatTheAppDoes:
             # The pages ship a <style> block, which needs style-src.
             assert "style-src" in directives
             assert directives["form-action"] == "'self'"
+
+
+class TestRemoveDevice:
+    """The Remove button deletes config and the stored password together.
+
+    Leaving an orphaned password in the vault after a device is removed would be
+    a quiet way to accumulate credentials nobody is tracking.
+    """
+
+    def _token(self, client) -> str:
+        return client.post("/login", json={"username": "admin", "password": PASSWORD}).json()["csrf_token"]
+
+    def _add(self, client, identifier: str = "r1", password: str = "hunter2") -> None:
+        response = client.post(
+            "/api/devices",
+            json={"id": identifier, "host": "192.168.1.1", "vendor": "cudy", "password": password},
+            headers={"X-CSRF-Token": self._token(client)},
+        )
+        assert response.status_code == 200, response.text
+
+    def _delete(self, client, identifier: str):
+        return client.request("DELETE", f"/api/devices/{identifier}", headers={"X-CSRF-Token": self._token(client)})
+
+    def test_delete_removes_the_device_from_the_dashboard(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        self._add(client)
+        assert client.get("/api/devices").json()["devices"]
+        response = self._delete(client, "r1")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"deleted": "r1"}
+        assert client.get("/api/devices").json()["devices"] == []
+
+    def test_delete_also_destroys_the_stored_password(self, tmp_path: Path):
+        app = build_app(tmp_path)
+        manager = app.state.manager
+        with TestClient(app) as client:
+            login(client)
+            self._add(client, password="super-secret-value")
+            reference = manager.get_device("r1").password_ref
+            assert manager.secrets.has(reference)
+            self._delete(client, "r1")
+            assert not manager.secrets.has(reference), "the password outlived the device"
+
+    def test_delete_is_covered_by_csrf_protection(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        self._add(client)
+        response = client.request("DELETE", "/api/devices/r1")  # no CSRF header
+        assert response.status_code == 403, response.text
+        assert client.get("/api/devices").json()["devices"], "device was removed despite a failed CSRF check"
+
+    def test_deleting_an_unknown_device_reports_not_found(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        assert self._delete(client, "nope").status_code == 404
+
+    def test_delete_requires_authentication(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        assert client.request("DELETE", "/api/devices/r1").status_code == 401
+
+    def test_a_shared_password_is_kept_for_the_remaining_device(self, tmp_path: Path):
+        """Two devices may point at one stored password; do not delete it early."""
+        app = build_app(tmp_path)
+        manager = app.state.manager
+        with TestClient(app) as client:
+            login(client)
+            self._add(client, identifier="r1", password="shared-secret")
+            reference = manager.get_device("r1").password_ref
+            # Point a second device at the same stored password.
+            manager.add_device("r2", "192.168.1.2", "cudy", password_ref=reference)
+            self._delete(client, "r1")
+            assert manager.secrets.has(reference), "a password still in use was deleted"
+
+    def test_dashboard_offers_a_remove_control(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        body = client.get("/").text
+        assert "removeDevice" in body
+        assert "method:'DELETE'" in body
+
+
+class TestConfigLocation:
+    """The device config must not default to a path inside the package.
+
+    A tracked file inside the repo meant every device the operator added landed
+    in a git-visible location, one ``git add -A`` away from being published.
+    """
+
+    def test_default_config_sits_beside_the_vault(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        state = tmp_path / "state"
+        monkeypatch.delenv("ROUTER_MANAGER_CONFIG", raising=False)
+        monkeypatch.setenv("ROUTER_MANAGER_DATA_DIR", str(state))
+        assert Settings.from_env().config_path == state / "cudy_devices.yaml"
+
+    def test_the_package_directory_is_not_the_default_config_location(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("ROUTER_MANAGER_CONFIG", raising=False)
+        settings = Settings.from_env()
+        package_dir = Path(__file__).resolve().parents[1] / "cudy_manager"
+        assert package_dir not in settings.config_path.parents, "config would be written inside the repo"
+
+    def test_an_explicit_override_still_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        custom = tmp_path / "custom.yaml"
+        monkeypatch.setenv("ROUTER_MANAGER_CONFIG", str(custom))
+        assert Settings.from_env().config_path == custom
+
+    def test_an_empty_data_dir_does_not_mean_the_working_directory(self, monkeypatch: pytest.MonkeyPatch):
+        """An unset-but-present env var used to resolve to Path(""), i.e. "."."""
+        monkeypatch.setenv("ROUTER_MANAGER_DATA_DIR", "")
+        monkeypatch.delenv("ROUTER_MANAGER_CONFIG", raising=False)
+        settings = Settings.from_env()
+        assert settings.data_dir != Path(".")
+        assert settings.config_path.is_absolute()
+
+    def test_importing_web_writes_nothing_to_the_working_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import importlib
+        import sys
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delitem(sys.modules, "cudy_manager.web", raising=False)
+        importlib.import_module("cudy_manager.web")
+        assert list(tmp_path.iterdir()) == [], "importing the module touched the filesystem"

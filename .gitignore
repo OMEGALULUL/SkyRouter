@@ -16,3 +16,5 @@ secrets.json
 scheduler_state.json
 cudy_devices.local.yaml
 *.log
+cudy_manager/cudy_devices.yaml
+cudy_manager/cudy_devices.yaml.lock
