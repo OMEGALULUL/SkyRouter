@@ -305,6 +305,10 @@ def create_app(manager: DeviceManager | None = None, settings: Settings | None =
         response.headers["Content-Security-Policy"] = (
             "default-src 'none'; "
             f"script-src {script_src}; "
+            # The dashboard and the login form both talk to this origin with fetch().
+            # Without connect-src they fall back to default-src 'none' and every
+            # request is blocked while the page still looks fine.
+            "connect-src 'self'; "
             "style-src 'unsafe-inline'; "
             "img-src 'self' data:; "
             "form-action 'self'; "

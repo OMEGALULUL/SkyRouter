@@ -760,3 +760,43 @@ class TestContentSecurityPolicy:
         response = client.get("/api/devices")
         assert response.status_code == 401
         assert "Content-Security-Policy" in response.headers
+
+
+class TestPolicyAllowsWhatTheAppDoes:
+    """The policy must permit the requests the pages actually make.
+
+    A policy that is present and syntactically valid can still be functionally
+    broken: fetch() falls back to default-src, so omitting connect-src blocks
+    every API call while the page still renders and looks healthy.
+    """
+
+    @staticmethod
+    def _directives(response) -> dict[str, str]:
+        header = response.headers["Content-Security-Policy"]
+        parsed: dict[str, str] = {}
+        for part in header.split(";"):
+            tokens = part.split()
+            if tokens:
+                parsed[tokens[0]] = " ".join(tokens[1:])
+        return parsed
+
+    def test_connect_src_permits_same_origin_fetch(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        directives = self._directives(client.get("/"))
+        assert directives.get("connect-src") == "'self'", "fetch() to the API would be blocked"
+
+    def test_login_page_permits_same_origin_fetch(self, tmp_path: Path):
+        response = build_client(tmp_path).get("/login")
+        assert self._directives(response).get("connect-src") == "'self'"
+
+    def test_policy_permits_the_scripts_and_styles_the_pages_use(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        login(client)
+        for page in (client.get("/"), build_client(tmp_path).get("/login")):
+            directives = self._directives(page)
+            # An inline <script> needs a nonce, which the header must carry.
+            assert "'nonce-" in directives["script-src"]
+            # The pages ship a <style> block, which needs style-src.
+            assert "style-src" in directives
+            assert directives["form-action"] == "'self'"
