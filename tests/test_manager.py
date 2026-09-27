@@ -285,3 +285,55 @@ class TestStatusFanOut:
     def test_no_devices_is_cheap(self, tmp_path: Path):
         manager = build_manager(tmp_path)
         assert manager.get_all_statuses() == {}
+
+
+class TestSilentWipeGuard:
+    """A mutation must not persist an empty inventory over a full one.
+
+    The mutation path re-reads the config from disk and writes it back, so an
+    emptied file would otherwise take every device and stored password with it.
+    """
+
+    def test_adding_a_device_keeps_the_others(self, tmp_path):
+        manager = build_manager(tmp_path)
+        manager.add_device("a", "192.168.1.1", "cudy", password="x")
+        manager.add_device("b", "192.168.1.2", "cudy", password="y")
+        manager.add_device("c", "192.168.1.3", "cudy", password="z")
+        assert set(manager.devices) == {"a", "b", "c"}
+
+    def test_a_file_truncated_behind_our_back_is_refused(self, tmp_path):
+        manager = build_manager(tmp_path)
+        manager.add_device("a", "192.168.1.1", "cudy", password="x")
+        manager.add_device("b", "192.168.1.2", "cudy", password="y")
+        # Something outside the manager empties the file.
+        manager.config_path.write_text("devices: {}\n", encoding="utf-8")
+        with pytest.raises(ManagerError, match="credentials are still stored"):
+            manager.add_device("c", "192.168.1.3", "cudy", password="z")
+        # The refusal must leave the file exactly as it was found, so an
+        # operator can restore it and no further loss is written on top.
+        assert manager.config_path.read_text() == "devices: {}\n"
+        assert set(manager.devices) == {"a", "b"}, "in-memory inventory was replaced"
+
+    def test_a_removal_made_by_another_process_is_still_honoured(self, tmp_path):
+        """A real remove_device also drops the secret, so it must not be refused."""
+        first = build_manager(tmp_path)
+        first.add_device("r1", "192.168.1.1", "cudy", password="x")
+        first.add_device("r2", "192.168.1.2", "cudy", password="y")
+        second = build_manager(tmp_path)
+        first.remove_device("r2")
+        second.add_device("r3", "192.168.1.3", "cudy", password="z")
+        assert set(second.devices) == {"r1", "r3"}
+
+    def test_removing_the_last_device_still_works(self, tmp_path):
+        manager = build_manager(tmp_path)
+        manager.add_device("only", "192.168.1.1", "cudy", password="x")
+        manager.remove_device("only")
+        assert manager.devices == {}
+        assert "devices: {}" in manager.config_path.read_text()
+
+    def test_removing_one_of_several_keeps_the_rest(self, tmp_path):
+        manager = build_manager(tmp_path)
+        for name in ("a", "b", "c"):
+            manager.add_device(name, f"192.168.1.{len(name)}", "cudy", password="x")
+        manager.remove_device("b")
+        assert set(manager.devices) == {"a", "c"}

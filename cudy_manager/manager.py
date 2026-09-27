@@ -119,6 +119,22 @@ class DeviceManager:
             entries = converted
         if not isinstance(entries, dict):
             raise ManagerError("device config must contain a devices mapping")
+        with self._lock:
+            gone = {name: self.devices[name] for name in set(self.devices) - set(entries)}
+        # A removal through this class also destroys the stored password, so a
+        # device that vanished from the file while its secret still exists means
+        # the file was truncated behind the manager's back. Every mutation
+        # re-reads the config and writes it straight back, so adopting that file
+        # would persist the loss on the next add, remove, or password change.
+        stranded = sorted(
+            name for name, device in gone.items() if device.password_ref and self.secrets.has(device.password_ref)
+        )
+        if stranded:
+            raise ManagerError(
+                f"{self.config_path} no longer lists {', '.join(stranded)} but their "
+                "credentials are still stored; refusing to continue from a shrunken "
+                "device list"
+            )
         loaded = {}
         for identifier, raw in entries.items():
             try:
