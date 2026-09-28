@@ -1,0 +1,58 @@
+# Optional: run SkyRouter (router-manager serve) as a system service beside
+# GenieACS. Setup is in deploy/genieacs/README.md, "Run SkyRouter as a service".
+# Running it by hand from a checkout keeps working exactly as before.
+
+[Unit]
+Description=SkyRouter router manager dashboard
+# After= only: SkyRouter runs without GenieACS (the ACS tab then reports it
+# unreachable), so it must not pull the NBI in or fail with it.
+After=network-online.target genieacs-nbi.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skyrouter
+Group=skyrouter
+EnvironmentFile=/etc/skyrouter/router-manager.env
+# The vault key, secrets and device config live here, created 0700 for skyrouter.
+# HOME matters too: SSH-managed routers are checked against ~/.ssh/known_hosts.
+StateDirectory=skyrouter
+StateDirectoryMode=0700
+Environment=ROUTER_MANAGER_DATA_DIR=/var/lib/skyrouter HOME=/var/lib/skyrouter PYTHONDONTWRITEBYTECODE=1
+# --host is pinned here so the env file cannot move the dashboard off loopback;
+# reach it over the VPN or through an authenticating reverse proxy.
+ExecStart=/opt/skyrouter/venv/bin/router-manager serve --host 127.0.0.1 --port 8091
+Restart=on-failure
+RestartSec=5
+
+# Hardening. MemoryDenyWriteExecute= is left out: old-style cffi callbacks need
+# writable-then-executable memory, and this stack's C extensions (cffi, uvloop,
+# httptools) have not been checked against it.
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# Routers are reached over TCP (HTTP, SSH) and UDP (SNMP). AF_NETLINK because
+# glibc's getaddrinfo() uses it to see which address families are configured.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

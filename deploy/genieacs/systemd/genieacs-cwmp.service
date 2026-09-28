@@ -1,0 +1,60 @@
+# GenieACS CWMP: the TR-069 endpoint routers connect to.
+# Installed from deploy/genieacs/systemd by the runbook in deploy/genieacs/README.md.
+# Routers reach this one on port 7547; ufw limits which networks can (README step 7).
+
+[Unit]
+Description=GenieACS CWMP: the TR-069 endpoint routers connect to
+Documentation=https://docs.genieacs.com/en/stable/
+After=network-online.target mongod.service
+Wants=network-online.target mongod.service
+
+[Service]
+Type=simple
+User=genieacs
+Group=genieacs
+# No "-" prefix: without its env file the service must not start on defaults,
+# which bind every service to every address.
+EnvironmentFile=/etc/genieacs/genieacs.env
+# genieacs-cwmp runs extensions through bin/genieacs-ext, whose first line is
+# "#!/usr/bin/env node"; the system has no node of its own on PATH.
+Environment=PATH=/opt/node-v22.23.2/bin:/usr/bin:/bin
+ExecStart=/opt/genieacs/node_modules/genieacs/bin/genieacs-cwmp
+# The primary process exits after repeated worker crashes (for example while
+# MongoDB is down), and upstream's own units have no Restart= at all.
+Restart=on-failure
+RestartSec=5
+
+# Hardening. MemoryDenyWriteExecute= is deliberately absent: V8's JIT needs
+# writable-then-executable memory, and Node aborts without it.
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/genieacs
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# AF_NETLINK: Node lists network interfaces over netlink, and glibc's
+# getaddrinfo() uses it to see which address families are configured.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# A deny-list, not @system-service: Node probes optional syscalls (io_uring,
+# memory protection keys) and copes with EPERM, but an allow-list that kills on
+# anything unlisted would turn a new Node release into a crash loop.
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,3 +1,6 @@
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -262,7 +265,8 @@ class TestDeviceApi:
             headers={"X-CSRF-Token": token},
         )
         response = client.get("/api/devices/r1/mesh")
-        assert response.status_code == 502
+        # 501, not 502: no router was contacted, so a retry-on-502 client must not retry.
+        assert response.status_code == 501
         assert "not supported" in response.text
 
     def test_plaintext_fields_rejected_on_update(self, tmp_path: Path):
@@ -476,22 +480,28 @@ class TestCredentialFieldHandling:
 
 class TestLoginRateLimitKeying:
     def test_forwarded_header_is_used_when_proxy_is_trusted(self, monkeypatch):
+        from starlette.datastructures import Headers
+
         monkeypatch.setenv("ROUTER_MANAGER_TRUST_PROXY", "1")
         from cudy_manager.web import _client_key
 
         class FakeRequest:
             client = type("C", (), {"host": "127.0.0.1"})()
-            headers = {"x-forwarded-for": "5.6.7.8, 9.9.9.9"}
+            headers = Headers({"x-forwarded-for": "5.6.7.8, 9.9.9.9"})
 
-        assert _client_key(FakeRequest()) == "5.6.7.8"
+        # The rightmost entry is the one the trusted proxy appended; the rest came
+        # from the client.
+        assert _client_key(FakeRequest()) == "9.9.9.9"
 
     def test_socket_peer_is_used_when_not_trusted(self, monkeypatch):
+        from starlette.datastructures import Headers
+
         monkeypatch.delenv("ROUTER_MANAGER_TRUST_PROXY", raising=False)
         from cudy_manager.web import _client_key
 
         class FakeRequest:
             client = type("C", (), {"host": "127.0.0.1"})()
-            headers = {"x-forwarded-for": "1.2.3.4"}
+            headers = Headers({"x-forwarded-for": "1.2.3.4"})
 
         assert _client_key(FakeRequest()) == "127.0.0.1"
 
@@ -622,7 +632,7 @@ class TestLoginLimiter:
 
         limiter = LoginLimiter(window_seconds=1)
         for index in range(200):
-            limiter.fail(f"10.0.0.{index}")
+            limiter.attempt(f"10.0.0.{index}")
         assert len(limiter._values) == 200
         time.sleep(1.1)
         for index in range(50):
@@ -634,7 +644,7 @@ class TestLoginLimiter:
 
         limiter = LoginLimiter(max_keys=100)
         for index in range(5000):
-            limiter.fail(f"10.{(index // 256) % 256}.{index % 256}.{index // 65536}")
+            limiter.attempt(f"10.{(index // 256) % 256}.{index % 256}.{index // 65536}")
         assert len(limiter._values) <= 100
 
     def test_throttling_still_works(self):
@@ -642,7 +652,7 @@ class TestLoginLimiter:
 
         limiter = LoginLimiter(maximum=3, window_seconds=60)
         for _ in range(3):
-            limiter.fail("1.2.3.4")
+            limiter.attempt("1.2.3.4")
         assert limiter.blocked("1.2.3.4")
         assert not limiter.blocked("5.6.7.8")
         limiter.success("1.2.3.4")
@@ -751,6 +761,7 @@ class TestContentSecurityPolicy:
             "logout-button",
             "add-cancel",
             "password-cancel",
+            "ssid-cancel",
         )
         for control in controls:
             assert f'id="{control}"' in body
@@ -921,7 +932,939 @@ class TestConfigLocation:
         import importlib
         import sys
 
-        monkeypatch.chdir(tmp_path)
+        work = tmp_path / "work"
+        home = tmp_path / "home"
+        work.mkdir()
+        home.mkdir()
+        monkeypatch.chdir(work)
+        # An eager app would write under the default state dir, which lives in
+        # $HOME rather than the working directory, so point HOME somewhere watched
+        # instead of letting a regression touch the developer's real vault.
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("ROUTER_MANAGER_DATA_DIR", raising=False)
+        monkeypatch.delenv("ROUTER_MANAGER_CONFIG", raising=False)
         monkeypatch.delitem(sys.modules, "cudy_manager.web", raising=False)
-        importlib.import_module("cudy_manager.web")
-        assert list(tmp_path.iterdir()) == [], "importing the module touched the filesystem"
+        module = importlib.import_module("cudy_manager.web")
+        assert "app" not in vars(module), "the app was built at import time"
+        assert list(work.iterdir()) == [], "importing the module touched the working directory"
+        assert list(home.iterdir()) == [], "importing the module touched the default state directory"
+
+
+def _post_guesses(client: TestClient, count: int, **kwargs) -> list[int]:
+    return [
+        client.post("/login", json={"username": "admin", "password": "wrong"}, **kwargs).status_code
+        for _ in range(count)
+    ]
+
+
+class TestLoginLimiterUnderConcurrency:
+    """The limit must hold for guesses sent in parallel, not only one at a time."""
+
+    def test_parallel_guesses_from_one_address_are_limited(self, tmp_path: Path):
+        import asyncio
+
+        import httpx
+
+        app = build_app(tmp_path)
+
+        async def burst() -> list[int]:
+            transport = httpx.ASGITransport(app=app, client=("10.0.0.5", 1234))
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                responses = await asyncio.gather(
+                    *(client.post("/login", json={"username": "admin", "password": "wrong"}) for _ in range(40))
+                )
+            return [response.status_code for response in responses]
+
+        codes = asyncio.run(burst())
+        assert codes.count(401) == 5, codes
+        assert codes.count(429) == 35, codes
+
+    def test_attempt_reserves_a_slot_atomically(self):
+        from cudy_manager.web import LoginLimiter
+
+        limiter = LoginLimiter(maximum=3, window_seconds=60)
+        assert [limiter.attempt("k") for _ in range(5)] == [True, True, True, False, False]
+        assert len(limiter._values["k"]) == 3, "a refused attempt must not grow the list"
+        limiter.success("k")
+        assert limiter.attempt("k")
+
+    def test_a_malformed_body_still_counts_as_an_attempt(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        for _ in range(5):
+            client.post("/login", content=b"{not json", headers={"Content-Type": "application/json"})
+        assert client.post("/login", json={"username": "admin", "password": PASSWORD}).status_code == 429
+
+
+class TestProxyHeaderTrust:
+    """Throttling must key on an address the caller cannot choose."""
+
+    def test_uvicorn_proxy_rewrite_cannot_mint_a_fresh_bucket_per_guess(self, tmp_path: Path, monkeypatch):
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        monkeypatch.delenv("ROUTER_MANAGER_TRUST_PROXY", raising=False)
+        # uvicorn.run() wraps the app like this by default and trusts loopback peers.
+        wrapped = ProxyHeadersMiddleware(build_app(tmp_path), trusted_hosts="127.0.0.1,::1")
+        client = TestClient(wrapped, client=("127.0.0.1", 5555))
+        codes = [
+            client.post(
+                "/login",
+                json={"username": "admin", "password": "wrong"},
+                headers={"X-Forwarded-For": f"198.51.100.{index}"},
+            ).status_code
+            for index in range(25)
+        ]
+        assert codes.count(401) == 5, codes
+        response = client.post(
+            "/login",
+            json={"username": "admin", "password": PASSWORD},
+            headers={"X-Forwarded-For": "198.51.100.200"},
+        )
+        assert response.status_code == 429
+
+    def test_a_direct_peer_keeps_its_own_bucket_despite_a_forged_header(self, monkeypatch):
+        from starlette.datastructures import Headers
+
+        from cudy_manager.web import _client_key
+
+        monkeypatch.delenv("ROUTER_MANAGER_TRUST_PROXY", raising=False)
+
+        class FakeRequest:
+            client = type("C", (), {"host": "192.0.2.10"})()
+            headers = Headers(raw=[(b"x-forwarded-for", b"1.2.3.4")])
+
+        assert _client_key(FakeRequest()) == "192.0.2.10"
+
+    def test_trusted_proxy_uses_the_address_the_proxy_appended(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("ROUTER_MANAGER_TRUST_PROXY", "1")
+        client = build_client(tmp_path)
+        codes = [
+            client.post(
+                "/login",
+                json={"username": "admin", "password": "wrong"},
+                # nginx's $proxy_add_x_forwarded_for keeps what the client sent and
+                # appends the real peer, 192.0.2.77.
+                headers={"X-Forwarded-For": f"203.0.113.{index}, 192.0.2.77"},
+            ).status_code
+            for index in range(25)
+        ]
+        assert codes.count(401) == 5, codes
+        assert codes.count(429) == 20, codes
+
+    def test_trusted_proxy_reads_every_forwarded_header_line(self, monkeypatch):
+        from starlette.datastructures import Headers
+
+        from cudy_manager.web import _client_key
+
+        monkeypatch.setenv("ROUTER_MANAGER_TRUST_PROXY", "1")
+
+        class FakeRequest:
+            client = type("C", (), {"host": "127.0.0.1"})()
+            # A proxy may add its own header line instead of extending the client's.
+            headers = Headers(raw=[(b"x-forwarded-for", b"6.6.6.6"), (b"x-forwarded-for", b"5.5.5.5")])
+
+        assert _client_key(FakeRequest()) == "5.5.5.5"
+
+    def test_a_peer_is_only_pooled_when_it_is_exactly_a_forwarded_hop(self, monkeypatch):
+        """A substring match put 10.0.0.1 in the shared bucket because of 10.0.0.12."""
+        from starlette.datastructures import Headers
+
+        from cudy_manager.web import _client_key
+
+        monkeypatch.delenv("ROUTER_MANAGER_TRUST_PROXY", raising=False)
+
+        class FakeRequest:
+            client = type("C", (), {"host": "10.0.0.1"})()
+            headers = Headers(raw=[(b"x-forwarded-for", b"10.0.0.12")])
+
+        assert _client_key(FakeRequest()) == "10.0.0.1"
+
+
+class TestHostileRequestBodies:
+    """Bad input from anyone who can reach /login must not produce a 500."""
+
+    def _assert_hardened(self, response):
+        assert "Content-Security-Policy" in response.headers
+        assert response.headers["X-Frame-Options"] == "DENY"
+
+    def test_deeply_nested_json_is_a_client_error(self, tmp_path: Path):
+        client = TestClient(build_app(tmp_path), raise_server_exceptions=False)
+        response = client.post("/login", content=b"[" * 50000, headers={"Content-Type": "application/json"})
+        assert response.status_code == 400, response.text
+        self._assert_hardened(response)
+
+    def test_an_oversized_body_is_refused(self, tmp_path: Path):
+        client = TestClient(build_app(tmp_path), raise_server_exceptions=False)
+        response = client.post("/login", content=b" " * (1024 * 1024), headers={"Content-Type": "application/json"})
+        assert response.status_code == 413, response.text
+        self._assert_hardened(response)
+
+    def test_an_oversized_chunked_body_is_refused(self, tmp_path: Path):
+        client = TestClient(build_app(tmp_path), raise_server_exceptions=False)
+
+        # No Content-Length, so only counting while reading can catch it.
+        def chunks():
+            for _ in range(64):
+                yield b" " * 16384
+
+        response = client.post("/login", content=chunks(), headers={"Content-Type": "application/json"})
+        assert response.status_code == 413, response.text
+
+    def test_lone_surrogates_in_credentials_are_rejected_not_crashed(self, tmp_path: Path):
+        client = TestClient(build_app(tmp_path), raise_server_exceptions=False)
+        for body in (b'{"username":"\\ud800","password":"x"}', b'{"username":"admin","password":"\\ud800"}'):
+            response = client.post("/login", content=body, headers={"Content-Type": "application/json"})
+            assert response.status_code == 401, response.text
+            self._assert_hardened(response)
+
+    def test_non_ascii_csrf_header_is_a_csrf_failure(self, tmp_path: Path):
+        client = TestClient(build_app(tmp_path), raise_server_exceptions=False)
+        login(client)
+        for path in ("/logout", "/api/devices/x/reboot"):
+            response = client.post(path, json={"confirm": True}, headers={"X-CSRF-Token": b"\xe9t\xe9"})
+            assert response.status_code == 403, response.text
+            self._assert_hardened(response)
+        assert client.get("/api/devices").status_code == 200, "the session must survive a refused logout"
+
+    def test_an_unexpected_error_still_gets_the_security_headers(self, tmp_path: Path, monkeypatch):
+        app = build_app(tmp_path)
+
+        def explode(include_status):
+            raise RuntimeError("secret internal detail")
+
+        monkeypatch.setattr(app.state.manager, "dashboard", explode)
+        client = TestClient(app, raise_server_exceptions=False)
+        login(client)
+        response = client.get("/api/devices")
+        assert response.status_code == 500
+        assert "secret internal detail" not in response.text
+        self._assert_hardened(response)
+
+
+class TestLoginPageWithoutJavaScript:
+    def test_form_never_submits_the_password_in_the_url(self, tmp_path: Path):
+        page = build_client(tmp_path).get("/login").text
+        assert "<form id=login method=post action=/login>" in page
+
+    def test_script_shows_a_message_when_the_reply_is_not_json(self, tmp_path: Path):
+        page = build_client(tmp_path).get("/login").text
+        assert "response.json().catch(" in page
+
+
+class TestSsidRoute:
+    def _add(self, client: TestClient, token: str, vendor: str = "tenda") -> None:
+        response = client.post(
+            "/api/devices",
+            json={"id": "r1", "host": "192.0.2.1", "vendor": vendor, "password": "p"},
+            headers={"X-CSRF-Token": token},
+        )
+        assert response.status_code == 200, response.text
+
+    def test_invalid_radio_values_are_rejected_before_the_router_is_contacted(self, tmp_path: Path, monkeypatch):
+        app = build_app(tmp_path)
+        calls = []
+        monkeypatch.setattr(app.state.manager, "set_wifi_ssid", lambda *args: calls.append(args) or True)
+        client = TestClient(app, raise_server_exceptions=False)
+        token = login(client)
+        self._add(client, token)
+        for radio in (["5G"], {"band": "5G"}, 5, "6G", "", True):
+            response = client.post(
+                "/api/devices/r1/ssid", json={"ssid": "x", "radio": radio}, headers={"X-CSRF-Token": token}
+            )
+            assert response.status_code == 400, (radio, response.text)
+            assert "radio" in response.json()["detail"]
+        assert calls == []
+
+    def test_valid_radio_values_reach_the_manager(self, tmp_path: Path, monkeypatch):
+        app = build_app(tmp_path)
+        calls = []
+        monkeypatch.setattr(app.state.manager, "set_wifi_ssid", lambda *args: calls.append(args) or True)
+        client = TestClient(app)
+        token = login(client)
+        self._add(client, token)
+        for radio in ("2.4G", "5G", None):
+            body = {"ssid": "Home"} if radio is None else {"ssid": "Home", "radio": radio}
+            response = client.post("/api/devices/r1/ssid", json=body, headers={"X-CSRF-Token": token})
+            assert response.status_code == 200, response.text
+        assert calls == [("r1", "Home", "2.4G"), ("r1", "Home", "5G"), ("r1", "Home", None)]
+
+    def test_an_ssid_with_no_utf8_form_is_a_bad_request_not_a_server_error(self, tmp_path: Path, monkeypatch):
+        app = build_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        token = login(client)
+        self._add(client, token, vendor="cudy")
+        monkeypatch.setattr(app.state.manager, "adapter_for", lambda device: pytest.fail("the router was contacted"))
+        response = client.post(
+            "/api/devices/r1/ssid",
+            content=b'{"ssid": "ab\\ud800cd"}',
+            headers={"X-CSRF-Token": token, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 400, response.text
+        assert "Unicode" in response.json()["detail"]
+
+    def test_an_unsupported_operation_is_not_a_gateway_error(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        token = login(client)
+        # TP-Link SSID writes stay excluded on purpose; Cudy web gained them from real firmware.
+        self._add(client, token, vendor="tplink")
+        response = client.post("/api/devices/r1/ssid", json={"ssid": "x"}, headers={"X-CSRF-Token": token})
+        assert response.status_code == 501, response.text
+        assert "not supported" in response.json()["detail"]
+
+
+class TestDiscoverRoute:
+    def test_subnet_validation_messages_reach_the_operator(self, tmp_path: Path):
+        client = build_client(tmp_path)
+        token = login(client)
+        for subnet, expected in (("10.0.0.0/16", "too large"), ("not-a-subnet", "valid CIDR")):
+            response = client.post("/api/discover", json={"subnet": subnet}, headers={"X-CSRF-Token": token})
+            assert response.status_code == 400
+            assert expected in response.json()["detail"], response.text
+
+    def test_only_one_scan_runs_at_a_time(self, tmp_path: Path, monkeypatch):
+        import threading
+
+        app = build_app(tmp_path)
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_scan(subnet):
+            started.set()
+            release.wait(5)
+            return []
+
+        monkeypatch.setattr(app.state.manager, "discover_network", slow_scan)
+        with TestClient(app) as client:
+            token = login(client)
+            headers = {"X-CSRF-Token": token}
+            first: dict[str, int] = {}
+
+            def scan() -> None:
+                response = client.post("/api/discover", json={"subnet": "192.0.2.0/24"}, headers=headers)
+                first["status"] = response.status_code
+
+            worker = threading.Thread(target=scan)
+            worker.start()
+            assert started.wait(5)
+            timer = threading.Timer(2.0, release.set)
+            timer.start()
+            try:
+                second = client.post("/api/discover", json={"subnet": "192.0.2.0/24"}, headers=headers)
+            finally:
+                release.set()
+                timer.cancel()
+                worker.join()
+            assert second.status_code == 409, second.text
+            assert first["status"] == 200
+            # The guard is released once the scan finishes.
+            assert client.post("/api/discover", json={"subnet": "192.0.2.0/24"}, headers=headers).status_code == 200
+
+
+# The dashboard's behaviour lives in its script, so these tests run that script
+# under Node against a small fake DOM built from the page's own markup.
+DASHBOARD_HARNESS = r"""
+const vm = require('vm');
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+
+function simple(selector) {
+  const match = selector.match(/^([a-zA-Z0-9]+)?(.*)$/);
+  const tag = match[1] ? match[1].toUpperCase() : null;
+  const parts = match[2].match(/#[\w-]+|\.[\w-]+|\[[^\]]+\]/g) || [];
+  return el => {
+    if (tag && el.tagName !== tag) return false;
+    return parts.every(part => {
+      if (part[0] === '#') return el.id === part.slice(1);
+      if (part[0] === '.') return String(el.className).split(/\s+/).includes(part.slice(1));
+      const inner = part.slice(1, -1);
+      const eq = inner.indexOf('=');
+      if (eq < 0) return inner in el.attrs;
+      const key = inner.slice(0, eq);
+      const wanted = inner.slice(eq + 1).replace(/^["']|["']$/g, '');
+      const actual = key === 'name' ? el.name : key === 'type' ? el.type : el.attrs[key];
+      return actual === wanted;
+    });
+  };
+}
+
+class El {
+  constructor(tag, attrs = {}) {
+    this.tagName = tag.toUpperCase();
+    this.attrs = Object.assign({}, attrs);
+    this.childNodes = [];
+    this.parent = null;
+    this.listeners = {};
+    this.style = {};
+    this.id = this.attrs.id || '';
+    this.className = this.attrs.class || '';
+    this.name = this.attrs.name || '';
+    this.type = this.attrs.type || '';
+    this.disabled = 'disabled' in this.attrs;
+    this.defaultValue = this.attrs.value !== undefined ? this.attrs.value : '';
+    this._value = this.defaultValue;
+    this.defaultChecked = 'checked' in this.attrs;
+    this.checked = this.defaultChecked;
+    this.open = false;
+  }
+  get value() {
+    if (this.tagName === 'SELECT') {
+      const options = this.options;
+      const hit = options.find(option => option.value === this._value);
+      return hit ? hit.value : (options[0] ? options[0].value : '');
+    }
+    if (this.tagName === 'OPTION' && this.attrs.value === undefined && !this._valueSet) return this.textContent;
+    return this._value;
+  }
+  set value(value) { this._value = String(value); this._valueSet = true; }
+  get options() { return this.descendants().filter(node => node.tagName === 'OPTION'); }
+  get children() { return this.childNodes.filter(node => node instanceof El); }
+  get textContent() { return this.childNodes.map(node => typeof node === 'string' ? node : node.textContent).join(''); }
+  set textContent(value) { this.childNodes = [String(value)]; }
+  append(...nodes) {
+    for (const node of nodes) {
+      if (node instanceof El) { node.parent = this; this.childNodes.push(node); }
+      else { this.childNodes.push(String(node)); }
+    }
+  }
+  replaceChildren(...nodes) { this.childNodes = []; this.append(...nodes); }
+  setAttribute(key, value) { this.attrs[key] = String(value); }
+  getAttribute(key) { return key in this.attrs ? this.attrs[key] : null; }
+  addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); }
+  fire(type) {
+    const event = {
+      type, target: this, currentTarget: this, defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+    };
+    const results = [];
+    for (const fn of (this.listeners[type] || []).slice()) results.push(fn(event));
+    if (typeof this['on' + type] === 'function') results.push(this['on' + type](event));
+    return { event, results };
+  }
+  descendants() {
+    const out = [];
+    const walk = node => { for (const child of node.children) { out.push(child); walk(child); } };
+    walk(this);
+    return out;
+  }
+  closest(tag) { let node = this; while (node && node.tagName !== tag.toUpperCase()) node = node.parent; return node; }
+  querySelectorAll(selector) {
+    return selector.split(',').flatMap(group => {
+      const steps = group.trim().split(/\s+/).map(simple);
+      return this.descendants().filter(el => {
+        if (!steps[steps.length - 1](el)) return false;
+        let index = steps.length - 2;
+        for (let node = el.parent; index >= 0 && node; node = node.parent) if (steps[index](node)) index--;
+        return index < 0;
+      });
+    });
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  get elements() {
+    const form = this;
+    return new Proxy({}, { get: (_, name) => form.descendants().find(node => node.name === name) });
+  }
+  reset() {
+    for (const node of this.descendants()) {
+      if (!['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)) continue;
+      node._value = node.defaultValue;
+      node.checked = node.defaultChecked;
+    }
+  }
+  showModal() { if (this.open) throw new Error('InvalidStateError: the dialog is already open'); this.open = true; }
+  close() { if (this.open) { this.open = false; this.fire('close'); } }
+  focus() { document.activeElement = this; }
+  click() {
+    if (this.disabled) return [];
+    const { results } = this.fire('click');
+    const form = this.closest('form');
+    if (this.tagName === 'BUTTON' && form && (this.type || 'submit') === 'submit') results.push(harness.submit(form));
+    return results;
+  }
+}
+
+function build(node) {
+  const el = new El(node.tag, node.attrs);
+  for (const child of node.children) el.append(typeof child === 'string' ? child : build(child));
+  return el;
+}
+
+const body = build(input.tree);
+const document = {
+  body,
+  activeElement: null,
+  getElementById: id => body.descendants().find(node => node.id === id) || null,
+  querySelector: selector => body.querySelector(selector),
+  querySelectorAll: selector => body.querySelectorAll(selector),
+  createElement: tag => new El(tag),
+};
+
+class FormData {
+  constructor(form) {
+    this.entries = [];
+    for (const node of form.descendants()) {
+      if (!node.name || node.disabled) continue;
+      if (node.tagName === 'INPUT' && node.type === 'checkbox') {
+        if (node.checked) this.entries.push([node.name, node.attrs.value || 'on']);
+      } else if (['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)) this.entries.push([node.name, node.value]);
+    }
+  }
+  get(name) { const entry = this.entries.find(item => item[0] === name); return entry ? entry[1] : null; }
+  has(name) { return this.entries.some(item => item[0] === name); }
+  [Symbol.iterator]() { return this.entries[Symbol.iterator](); }
+}
+
+let now = 0;
+let timerSeq = 0;
+const timers = new Map();
+const flush = async () => { for (let i = 0; i < 30; i++) await new Promise(resolve => setImmediate(resolve)); };
+const requests = [];
+const errors = [];
+const location = { href: '/' };
+process.on('unhandledRejection', error => errors.push(String(error && error.stack || error)));
+
+const harness = {
+  state: { csrf: 't1', devices: [] },
+  answers: { confirm: [], prompt: [] },
+  handler: () => undefined,
+  requests,
+  errors,
+  flush,
+  deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; },
+  async advance(ms) {
+    const target = now + ms;
+    for (;;) {
+      let next = null;
+      for (const [id, timer] of timers) if (timer.at <= target && (!next || timer.at < next[1].at)) next = [id, timer];
+      if (!next) break;
+      timers.delete(next[0]);
+      now = next[1].at;
+      next[1].fn();
+      await flush();
+    }
+    now = target;
+  },
+  submit(form) {
+    const { event, results } = form.fire('submit');
+    const dialog = form.closest('dialog');
+    if (!event.defaultPrevented && form.attrs.method === 'dialog' && dialog) dialog.close();
+    return Promise.all(results);
+  },
+  escape(dialog) {
+    const { event } = dialog.fire('cancel');
+    if (!event.defaultPrevented) dialog.close();
+  },
+  buttons: node => node.querySelectorAll('button').map(button => button.textContent),
+  button: (node, label) => node.querySelectorAll('button').find(button => button.textContent === label),
+};
+
+function defaultReply(path) {
+  if (path === '/api/csrf') return { status: 200, body: { csrf_token: harness.state.csrf } };
+  if (path.startsWith('/api/devices?')) {
+    const devices = harness.state.devices;
+    return { status: 200, body: { devices, summary: { online: 0, offline: devices.length } } };
+  }
+  return { status: 200, body: {} };
+}
+
+async function fetch(path, options = {}) {
+  const record = {
+    path,
+    method: options.method || 'GET',
+    headers: options.headers || {},
+    body: options.body ? JSON.parse(options.body) : null,
+  };
+  requests.push(record);
+  const reply = (await harness.handler(path, options, record)) || defaultReply(path);
+  const status = reply.status || 200;
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    json: async () => { if (reply.body === undefined) throw new SyntaxError('not JSON'); return reply.body; },
+  };
+}
+
+const context = vm.createContext({
+  document, fetch, location, FormData, harness, console,
+  setTimeout: (fn, ms = 0) => { const id = ++timerSeq; timers.set(id, { at: now + ms, fn }); return id; },
+  clearTimeout: id => { timers.delete(id); },
+  confirm: () => (harness.answers.confirm.length ? harness.answers.confirm.shift() : true),
+  prompt: () => (harness.answers.prompt.length ? harness.answers.prompt.shift() : null),
+});
+
+(async () => {
+  if (input.setup) vm.runInContext(input.setup, context);
+  vm.runInContext(input.script, context);
+  await flush();
+  const result = await vm.runInContext('(async () => {' + input.scenario + '\n})()', context);
+  await flush();
+  const outcome = { result: result === undefined ? null : result, requests, errors, href: location.href };
+  process.stdout.write(JSON.stringify(outcome));
+})().catch(error => { process.stderr.write(String(error && error.stack || error)); process.exit(1); });
+"""
+
+NODE = shutil.which("node")
+needs_node = pytest.mark.skipif(NODE is None, reason="node is needed to run the dashboard script")
+
+
+def _dashboard_markup() -> tuple[dict, str]:
+    """Parse dashboard.html's body into a plain tree, and pull out its script."""
+    from html.parser import HTMLParser
+
+    void = {"input", "meta", "br", "img", "link", "hr"}
+
+    class Builder(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.root: dict = {"tag": "body", "attrs": {}, "children": []}
+            self.stack = [self.root]
+            self.in_body = False
+            self.in_script = False
+            self.script: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "body":
+                self.in_body = True
+            elif tag == "script":
+                self.in_script = True
+            elif self.in_body:
+                node = {"tag": tag, "attrs": {key: value or "" for key, value in attrs}, "children": []}
+                self.stack[-1]["children"].append(node)
+                if tag not in void:
+                    self.stack.append(node)
+
+        def handle_endtag(self, tag):
+            if tag == "script":
+                self.in_script = False
+            elif self.in_body and tag not in void and tag != "body":
+                while len(self.stack) > 1 and self.stack.pop()["tag"] != tag:
+                    pass
+
+        def handle_data(self, data):
+            if self.in_script:
+                self.script.append(data)
+            elif self.in_body:
+                self.stack[-1]["children"].append(data)
+
+    builder = Builder()
+    builder.feed((Path(__file__).resolve().parents[1] / "cudy_manager" / "dashboard.html").read_text(encoding="utf-8"))
+    return builder.root, "".join(builder.script)
+
+
+def run_dashboard(tmp_path: Path, scenario: str, setup: str = "") -> dict:
+    tree, script = _dashboard_markup()
+    harness = tmp_path / "dashboard_harness.js"
+    harness.write_text(DASHBOARD_HARNESS, encoding="utf-8")
+    payload = json.dumps({"tree": tree, "script": script, "setup": setup, "scenario": scenario})
+    assert NODE is not None
+    completed = subprocess.run(
+        [NODE, str(harness)], input=payload, capture_output=True, text=True, timeout=60, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    outcome = json.loads(completed.stdout)
+    assert outcome["errors"] == [], outcome["errors"]
+    return outcome
+
+
+@needs_node
+class TestDashboardBehaviour:
+    def test_harness_renders_devices(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            "return document.getElementById('devices').textContent",
+            setup="harness.state.devices = [{id: 'r1', vendor: 'cudy', host: '192.0.2.1', transport: 'web'}]",
+        )
+        assert "192.0.2.1" in outcome["result"]
+
+    def test_a_new_notice_is_not_wiped_by_an_older_timer(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const node = document.getElementById('notice');
+            notice('first');
+            await harness.advance(2000);
+            notice('second');
+            await harness.advance(3500);
+            const shown = node.textContent;
+            await harness.advance(2000);
+            return [shown, node.textContent];
+            """,
+        )
+        assert outcome["result"] == ["second", ""]
+
+    def test_null_uptime_falls_back_to_the_text_form(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const status = {online: true, uptime_seconds: null, uptime_text: '3h 20m'};
+            return card({id: 'r1', vendor: 'tenda', host: 'h', transport: 'web', status}).textContent;
+            """,
+        )
+        assert "3h 20m" in outcome["result"]
+        assert "null" not in outcome["result"]
+
+    def test_change_ssid_is_offered_only_where_it_can_work(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const offered = {};
+            const pairs = [['cudy', 'web'], ['tplink', 'web'], ['tplink', 'ssh'], ['tenda', 'web'], ['cudy', 'ssh']];
+            for (const [vendor, transport] of pairs) {
+              const node = card({id: 'r1', vendor, host: 'h', transport, status: {}});
+              offered[vendor + '/' + transport] = harness.buttons(node).includes('Change SSID');
+            }
+            return offered;
+            """,
+        )
+        assert outcome["result"] == {
+            # CudyAdapter.set_ssid posts the router's own Wi-Fi form, as the Wi-Fi password button does.
+            "cudy/web": True,
+            "tplink/web": False,
+            # Transport first, as in DeviceManager.adapter_for: an OpenWrt-flashed TP-Link is an SSH device.
+            "tplink/ssh": True,
+            "tenda/web": True,
+            "cudy/ssh": True,
+        }
+
+    def test_the_operator_picks_the_radio_for_a_tenda(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const node = card({id: 'r1', vendor: 'tenda', host: 'h', transport: 'web', status: {}, metadata: {}});
+            harness.button(node, 'Change SSID').click();
+            const dialog = document.getElementById('ssid-dialog');
+            const form = document.getElementById('ssid-form');
+            const options = form.elements.radio.options.map(option => option.value);
+            const preselected = form.elements.radio.value;
+            form.elements.ssid.value = 'Home';
+            form.elements.radio.value = '5G';
+            await harness.submit(form);
+            await harness.flush();
+            return {open: dialog.open, options, preselected, notice: document.getElementById('notice').textContent};
+            """,
+        )
+        sent = [item for item in outcome["requests"] if item["path"].endswith("/ssid")]
+        assert [(item["path"], item["method"], item["body"]) for item in sent] == [
+            ("/api/devices/r1/ssid", "POST", {"ssid": "Home", "radio": "5G"})
+        ]
+        assert outcome["result"]["options"] == ["2.4G", "5G"]
+        assert outcome["result"]["preselected"] == "2.4G"
+        assert outcome["result"]["open"] is False
+        assert "5G" in outcome["result"]["notice"]
+
+    def test_a_tenda_preselects_its_configured_radio(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const device = {id: 'r1', vendor: 'tenda', host: 'h', transport: 'web', metadata: {radio: '5G'}};
+            const node = card(device);
+            harness.button(node, 'Change SSID').click();
+            return document.getElementById('ssid-form').elements.radio.value;
+            """,
+        )
+        assert outcome["result"] == "5G"
+
+    def test_an_ssh_device_can_keep_its_configured_section(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const node = card({id: 'r2', vendor: 'cudy', host: 'h', transport: 'ssh', status: {}, metadata: {}});
+            harness.button(node, 'Change SSID').click();
+            const form = document.getElementById('ssid-form');
+            const options = form.elements.radio.options.map(option => option.value);
+            form.elements.ssid.value = 'Office';
+            await harness.submit(form);
+            return options;
+            """,
+        )
+        assert outcome["result"] == ["", "2.4G", "5G"]
+        sent = [item["body"] for item in outcome["requests"] if item["path"].endswith("/ssid")]
+        assert sent == [{"ssid": "Office"}]
+
+    def test_a_cudy_on_the_web_ui_renames_every_band_unless_one_is_picked(self, tmp_path: Path):
+        # No radio means both bands to CudyAdapter; it has no uci_section to fall back on.
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const node = card({id: 'r3', vendor: 'cudy', host: 'h', transport: 'web', status: {}, metadata: {}});
+            harness.button(node, 'Change SSID').click();
+            const form = document.getElementById('ssid-form');
+            const options = form.elements.radio.options.map(option => [option.value, option.textContent]);
+            const preselected = form.elements.radio.value;
+            form.elements.ssid.value = 'Shop';
+            await harness.submit(form);
+            return {options, preselected};
+            """,
+        )
+        assert outcome["result"]["options"] == [["", "All bands"], ["2.4G", "2.4 GHz"], ["5G", "5 GHz"]]
+        assert outcome["result"]["preselected"] == ""
+        sent = [item["body"] for item in outcome["requests"] if item["path"].endswith("/ssid")]
+        assert sent == [{"ssid": "Shop"}]
+
+    def test_sign_out_retries_with_a_fresh_csrf_token(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            harness.state.csrf = 't2';
+            harness.handler = (path, options) => {
+              if (path === '/logout' && options.headers['X-CSRF-Token'] !== 't2') {
+                return {status: 403, body: {detail: 'CSRF validation failed'}};
+              }
+            };
+            await logout();
+            """,
+        )
+        tokens = [item["headers"].get("X-CSRF-Token") for item in outcome["requests"] if item["path"] == "/logout"]
+        assert tokens == ["t1", "t2"]
+        assert outcome["href"] == "/login"
+
+    def test_a_failed_sign_out_does_not_pretend_to_succeed(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            harness.handler = path => {
+              if (path === '/logout') return {status: 403, body: {detail: 'CSRF validation failed'}};
+            };
+            await logout();
+            return document.getElementById('notice').textContent;
+            """,
+        )
+        assert outcome["href"] == "/", "the page went to /login although the session is still valid"
+        assert "Sign out failed" in outcome["result"]
+
+    def test_the_password_dialog_is_locked_while_saving(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const reply = harness.deferred();
+            harness.handler = path => (path.endsWith('/password') ? reply.promise : undefined);
+            showPassword('A');
+            const dialog = document.getElementById('password-dialog');
+            const form = document.getElementById('password-form');
+            form.elements.password.value = 'n3w';
+            form.elements.confirm.value = 'n3w';
+            const pending = harness.submit(form);
+            await harness.flush();
+            harness.submit(form);
+            await harness.flush();
+            const save = form.querySelector('button.primary');
+            const during = {saveDisabled: save.disabled};
+            harness.escape(dialog);
+            during.openAfterEscape = dialog.open;
+            reply.resolve({status: 200, body: {password_updated: true, verified: {ok: true}}});
+            await pending;
+            await harness.flush();
+            const notice = document.getElementById('notice').textContent;
+            return {during, open: dialog.open, saveDisabled: save.disabled, notice};
+            """,
+        )
+        posts = [item for item in outcome["requests"] if item["path"].endswith("/password")]
+        assert len(posts) == 1, "a second click sent the password again"
+        assert outcome["result"]["during"] == {"saveDisabled": True, "openAfterEscape": True}
+        assert outcome["result"]["open"] is False
+        assert outcome["result"]["saveDisabled"] is False
+        assert outcome["result"]["notice"] == "Password saved and verified for A"
+
+    def test_a_late_password_result_does_not_touch_another_devices_dialog(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const reply = harness.deferred();
+            harness.handler = path => (path.endsWith('/password') ? reply.promise : undefined);
+            showPassword('A');
+            const dialog = document.getElementById('password-dialog');
+            const form = document.getElementById('password-form');
+            form.elements.password.value = 'n3w';
+            form.elements.confirm.value = 'n3w';
+            const pending = harness.submit(form);
+            await harness.flush();
+            // A browser may still force the dialog shut (a second Escape).
+            dialog.close();
+            showPassword('B');
+            form.elements.password.value = 'typing';
+            reply.resolve({status: 200, body: {password_updated: true, verified: {ok: true}}});
+            await pending;
+            await harness.flush();
+            const notice = document.getElementById('notice').textContent;
+            return {open: dialog.open, typed: form.elements.password.value, notice};
+            """,
+        )
+        assert outcome["result"]["notice"] == "Password saved and verified for A"
+        assert outcome["result"]["open"] is True, "B's dialog was closed by A's result"
+        assert outcome["result"]["typed"] == "typing", "B's form was wiped by A's result"
+
+    def test_scan_button_is_disabled_while_a_scan_runs(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const reply = harness.deferred();
+            harness.handler = path => (path === '/api/discover' ? reply.promise : undefined);
+            harness.answers.prompt.push('192.0.2.0/24');
+            const button = document.getElementById('discover-button');
+            const running = discover();
+            await harness.flush();
+            const during = button.disabled;
+            reply.resolve({status: 200, body: {devices: []}});
+            await running;
+            return [during, button.disabled];
+            """,
+        )
+        assert outcome["result"] == [True, False]
+
+    def test_add_dialog_can_configure_https(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            const form = document.getElementById('add-form');
+            form.elements.id.value = 'r1';
+            form.elements.host.value = '192.0.2.1';
+            form.elements.password.value = 'pw';
+            form.elements.https.checked = true;
+            form.elements.verify_tls.checked = false;
+            await harness.submit(form);
+            """,
+        )
+        sent = [item["body"] for item in outcome["requests"] if item["method"] == "POST"]
+        assert len(sent) == 1
+        assert sent[0]["https"] is True
+        assert sent[0]["verify_tls"] is False
+        assert sent[0]["http_port"] == "443"
+
+    def test_plain_http_to_a_public_address_needs_confirmation(self, tmp_path: Path):
+        outcome = run_dashboard(
+            tmp_path,
+            """
+            harness.answers.confirm.push(false);
+            const form = document.getElementById('add-form');
+            form.elements.id.value = 'r1';
+            form.elements.host.value = '203.0.113.9';
+            form.elements.password.value = 'pw';
+            await harness.submit(form);
+            const refused = harness.requests.filter(item => item.method === 'POST').length;
+            form.elements.host.value = '10.8.0.2';
+            await harness.submit(form);
+            return refused;
+            """,
+        )
+        assert outcome["result"] == 0, "the password went out over plain HTTP without asking"
+        sent = [item["body"] for item in outcome["requests"] if item["method"] == "POST"]
+        assert len(sent) == 1 and sent[0]["host"] == "10.8.0.2"
+        assert "http_port" not in sent[0]
+
+
+class TestSchedulerOutcomesAreLogged:
+    def test_a_failed_scheduled_reboot_is_logged(self, tmp_path: Path, monkeypatch, caplog):
+        """run_once's results were discarded, so a reboot that never happened left no trace."""
+        import logging
+        import time
+
+        from cudy_manager.scheduler import RebootScheduler
+
+        monkeypatch.setattr(
+            RebootScheduler,
+            "run_once",
+            lambda self, now=None: [{"device": "r1", "status": "failed", "reason": "reboot policy is invalid"}],
+        )
+        caplog.set_level(logging.INFO, logger="cudy_manager.web")
+        with TestClient(build_app(tmp_path)):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and "scheduled reboot of r1 failed" not in caplog.text:
+                time.sleep(0.05)
+        assert "scheduled reboot of r1 failed: reboot policy is invalid" in caplog.text

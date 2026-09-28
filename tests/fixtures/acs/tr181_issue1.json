@@ -1,0 +1,44 @@
+{
+  "_fixture": "Constructed, not captured: TR-181 Issue 1 (Device:1.x), which has Device.LAN and no Device.WiFi.",
+  "_id": "001122-AP100-ISSUE1SN0001",
+  "_deviceId": {"_Manufacturer": "Acme Networks", "_OUI": "001122", "_ProductClass": "AP100", "_SerialNumber": "ISSUE1SN0001"},
+  "_registered": "2026-09-01T08:00:00.000Z",
+  "_lastInform": "2026-09-28T09:15:02.311Z",
+  "_lastBootstrap": "2026-09-01T08:00:00.000Z",
+  "Device": {
+    "_object": true,
+    "_writable": false,
+    "_timestamp": "2026-09-28T09:00:00.000Z",
+    "DeviceSummary": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Device:1.4[](Baseline:2, EthernetInterface:1)"},
+    "DeviceInfo": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "Manufacturer": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Acme Networks"},
+      "ManufacturerOUI": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "001122"},
+      "ModelName": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "AP-100", "_writable": false},
+      "ProductClass": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "AP100"},
+      "SerialNumber": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "ISSUE1SN0001"},
+      "SoftwareVersion": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "1.2.3"},
+      "HardwareVersion": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "A"},
+      "UpTime": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 3600, "_writable": false}
+    },
+    "ManagementServer": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "ConnectionRequestURL": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "http://10.10.0.60:7547/"},
+      "PeriodicInformEnable": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:boolean", "_value": true, "_writable": true},
+      "PeriodicInformInterval": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 600, "_writable": true},
+      "ConnectionRequestPassword": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "zz-secret-issue1-cr", "_writable": true}
+    },
+    "LAN": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "AddressingType": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "DHCP", "_writable": true},
+      "IPAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "192.168.1.50", "_writable": true},
+      "MACAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "00:11:22:33:44:55", "_writable": false}
+    }
+  }
+}

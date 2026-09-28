@@ -63,9 +63,14 @@ router-manager diagnose <id>
 router-manager list
 router-manager status <id>
 router-manager reboot <id>
+router-manager wifi-password <id> [--radio 2.4G|5G]
 router-manager discover [--subnet 192.168.1.0/24]
 router-manager serve [--host 127.0.0.1] [--port 8091]
+router-manager acs status|devices|dump|bootstrap|wifi|job ...
 ```
+
+The `acs` commands manage TR-069 routers through GenieACS; see
+[TR-069 through GenieACS](#tr-069-through-genieacs-optional).
 
 `add` prompts for the password with `getpass` so it never appears in shell history or
 in `ps` output. When stdin is not a terminal, `getpass` falls back to reading a line,
@@ -79,6 +84,13 @@ printf '%s' "$ROUTER_PASSWORD" | router-manager add cudy1 192.168.1.1 --vendor c
 device is still saved when the login fails, because a router that is temporarily busy
 should not cost you the configuration. The command exits `1` on a failed login, so
 `set -e` scripts notice. Pass `--no-verify` to skip the login entirely.
+
+`wifi-password` changes the Wi-Fi passphrase of a directly managed router, on every
+band or only the one given with `--radio`. It asks twice with `getpass` and refuses
+anything but 8 to 63 printable ASCII characters. For unattended use set
+`ROUTER_MANAGER_WIFI_PASSPHRASE` together with `ROUTER_MANAGER_ASSUME_YES=1`. It is
+deliberately a different variable from `ROUTER_MANAGER_DEVICE_PASSWORD`, so a router
+admin password exported for `set-password` never becomes a Wi-Fi passphrase.
 
 `discover` is bounded to one subnet and never runs automatically.
 
@@ -123,8 +135,12 @@ production hardware.
 | `ROUTER_MANAGER_SCHEDULER_INTERVAL` | `30` | Scheduler tick in seconds, minimum `15`. |
 | `ROUTER_MANAGER_SECURE_COOKIE` | `0` | Set to `1` when served over HTTPS. |
 | `ROUTER_MANAGER_DEVICE_PASSWORD` | none | Password used by `set-password` with `ROUTER_MANAGER_ASSUME_YES=1`. |
+| `ROUTER_MANAGER_WIFI_PASSPHRASE` | none | Passphrase used by `wifi-password` and `acs wifi` with `ROUTER_MANAGER_ASSUME_YES=1`. |
 | `ROUTER_MANAGER_TRUST_PROXY` | unset | Honour `X-Forwarded-For` for login throttling. Only enable behind a proxy that overwrites the header. |
 | `ROUTER_MANAGER_ASSUME_YES` | unset | Set to `1` to skip the interactive confirmation. Unattended use only. |
+
+The `ROUTER_MANAGER_ACS_*` variables are described under
+[TR-069 through GenieACS](#tr-069-through-genieacs-optional).
 
 ## Resetting a password
 
@@ -265,13 +281,77 @@ The window is `window_minutes` long starting at `at`, so a 15-minute window plus
 uptime is what blocks it. The scheduler runs at `ROUTER_MANAGER_SCHEDULER_INTERVAL`
 seconds and re-checks every device each tick.
 
+## TR-069 through GenieACS (optional)
+
+Routers that speak TR-069 (CWMP) can be managed through GenieACS 1.2.16, which runs
+unmodified as separate services on the same host. SkyRouter talks only to GenieACS's
+northbound API (the NBI), and the browser talks only to SkyRouter. TR-069 routers
+appear when they first check in and live in GenieACS's database, never in the device
+config. Routers added by hand keep working exactly as before.
+
+**The feature is off unless `ROUTER_MANAGER_ACS_URL` is set.** Without it the server
+behaves exactly as it did before: the dashboard's **Managed (TR-069)** tab does not
+appear, and every `/api/acs` route returns `503`.
+
+Installing GenieACS, MongoDB and the firewall rules is covered by the operator
+runbook in [deploy/genieacs/README.md](deploy/genieacs/README.md).
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ROUTER_MANAGER_ACS_URL` | unset | NBI address, for example `http://127.0.0.1:7557`. `http` or `https` only, with no credentials or path. Unset switches the feature off. |
+| `ROUTER_MANAGER_ACS_ALLOW_REMOTE` | `0` | Set to `1` to accept an NBI address that is not loopback. The NBI has no authentication, so do this only when something else protects it. |
+| `ROUTER_MANAGER_ACS_INFORM_INTERVAL` | `300` | Seconds between router check-ins, `60` to `86400`. The bootstrap pushes it to every router. |
+| `ROUTER_MANAGER_ACS_SCRUB_SECRETS` | `1` | After a Wi-Fi passphrase change is acknowledged, read the passphrase back so the plaintext copy GenieACS keeps in MongoDB becomes empty. |
+
+An invalid `ROUTER_MANAGER_ACS_*` value stops the server from starting, with an error
+naming the variable, instead of falling back to a default. The interval is pushed to
+every router, and a mistyped remote URL would expose the unauthenticated NBI. While
+`ROUTER_MANAGER_ACS_URL` is unset the other three are ignored.
+
+From the command line:
+
+```bash
+router-manager acs status
+router-manager acs devices [--q TEXT] [--tag TAG] [--skip N] [--limit N]
+router-manager acs dump <acs_id>
+router-manager acs bootstrap [--remove-seeded]
+router-manager acs wifi <acs_id> --band 2.4GHz|5GHz|6GHz|all [--ssid NAME] [--keep-passphrase] [--wait SECONDS]
+router-manager acs job <job_id> [--wait SECONDS]
+```
+
+- `status` checks that GenieACS answers, its version, and SkyRouter's bootstrap. It
+  exits `1` until the bootstrap is installed and the presets GenieACS's own UI seeds
+  are removed.
+- `bootstrap` installs SkyRouter's provisions and presets, and a second run writes
+  nothing. It refuses while the UI-seeded presets exist; `--remove-seeded` deletes them.
+- `dump` prints a router's cached parameter tree with every secret redacted.
+- `wifi` asks for the passphrase twice, or reads `ROUTER_MANAGER_WIFI_PASSPHRASE` with
+  `ROUTER_MANAGER_ASSUME_YES=1`, then starts a job. TR-069 passphrases are write-only,
+  so a successful change is reported as *acknowledged*: the router accepted it, but it
+  cannot be read back to compare. A band SkyRouter had to infer needs
+  `--confirm-guessed-band`.
+- `--wait SECONDS` follows the job until it has a result or the time runs out. It moves
+  the job along itself while waiting, so the change finishes even when the server is
+  not running.
+
+Run the `acs` commands with the server's environment: the same `ROUTER_MANAGER_ACS_*`
+values, and as the service user with the same `ROUTER_MANAGER_DATA_DIR`, so the CLI and
+the server share the job file (`acs_jobs.json`) and the vault. For the unit in
+`deploy/skyrouter/`:
+
+```bash
+sudo -u skyrouter env ROUTER_MANAGER_DATA_DIR=/var/lib/skyrouter HOME=/var/lib/skyrouter \
+  ROUTER_MANAGER_ACS_URL=http://127.0.0.1:7557 /opt/skyrouter/venv/bin/router-manager acs status
+```
+
 ## Supported hardware
 
 | Vendor | Transport | Notes |
 | --- | --- | --- |
-| Cudy | Web, LuCI | Login, status, reboot, SSID changes. |
+| Cudy | Web, LuCI | Login, status, reboot, SSID and Wi-Fi password changes. |
 | Tenda | Web, `/goform/modules` | Login, status, reboot, SSID changes. |
 | Any | SSH via Paramiko | Selected by `transport: ssh`. |
+| Any with TR-069 | CWMP through GenieACS | Optional; see [TR-069 through GenieACS](#tr-069-through-genieacs-optional). |
 
 Not supported: the Tenda ME3 Pro BE3600, which uses a separate encrypted API.
 Changing a Wi-Fi SSID over SSH needs `metadata.uci_section`; the CLI can only create
@@ -330,7 +410,12 @@ cudy_manager/
   web.py            FastAPI service, sessions, CSRF
   cli.py            command line entry point
   dashboard.html    dashboard
-tests/              285 tests, all mocked
+  acs/              GenieACS: NBI client, parameter map, jobs, bootstrap
+    provisions/     SkyRouter's provisions, installed into GenieACS by the bootstrap
+deploy/
+  genieacs/         GenieACS runbook, units, env template, extension, MongoDB scripts
+  skyrouter/        optional systemd unit for SkyRouter
+tests/              TEST_COUNT tests, all mocked
 ```
 
 ## Licence

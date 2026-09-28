@@ -1,16 +1,44 @@
 import base64
+import html
 import json
 import re
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from .adapters import _FormParser, _host_for_url, derive_cudy_password
+from .adapters import (
+    _TPLINK_LOCKOUT_SECONDS,
+    _TPLINK_MAX_ATTEMPTS,
+    _block,
+    _FormParser,
+    _host_for_url,
+    _looks_like_login,
+    _luci_login_required,
+    cudy_login_form,
+    fetch_cudy_token,
+    parse_cudy_login_page,
+)
 from .http_client import HttpError, HttpSession
 from .models import Device
 
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 MAX_SNIPPET = 400
+_URL_SESSION = re.compile(r";stok=[^/\s\"'&<>]*", re.IGNORECASE)
+
+
+def _secret_forms(secret: str) -> set[str]:
+    # A router echoes a submitted value re-encoded for wherever it lands: escaped
+    # inside a JSON string, or entity-escaped in an HTML page.
+    escaped = json.dumps(secret)[1:-1]
+    forms = {
+        secret,
+        escaped,
+        escaped.replace("/", "\\/"),
+        json.dumps(secret, ensure_ascii=False)[1:-1],
+        html.escape(secret),
+        html.escape(secret, quote=False),
+    }
+    return {" ".join(form.split()) for form in forms} - {""}
 
 
 def _snippet(text: str, *secrets: str) -> str:
@@ -18,12 +46,18 @@ def _snippet(text: str, *secrets: str) -> str:
 
     A router is free to echo the submitted password back in an error page, so the
     known secret values are masked before the text ever reaches a terminal, a log,
-    or the API.
+    or the API. Both sides are compared whitespace-collapsed, so a secret with a
+    double space or a newline is still found after the body is collapsed.
     """
     collapsed = " ".join(text.split())
+    forms: set[str] = set()
     for secret in secrets:
         if secret:
-            collapsed = collapsed.replace(secret, "<redacted>")
+            forms |= _secret_forms(secret)
+    # Longest first, so a secret that contains a shorter one is masked whole.
+    for form in sorted(forms, key=len, reverse=True):
+        collapsed = collapsed.replace(form, "<redacted>")
+    collapsed = _URL_SESSION.sub(";stok=<redacted>", collapsed)
     if len(collapsed) <= MAX_SNIPPET:
         return collapsed
     return collapsed[:MAX_SNIPPET] + f"... (+{len(collapsed) - MAX_SNIPPET} chars)"
@@ -35,7 +69,30 @@ def _form_fields(html: str) -> dict[str, str]:
     return {key: ("<empty>" if not value else f"<{len(value)} chars>") for key, value in parser.inputs.items()}
 
 
-def _interpret(response, expected: str | None) -> str:
+def _location(value: str) -> str:
+    """The Location header without anything that can carry a session.
+
+    LuCI firmware that keeps the session in the URL answers a login with
+    ``/cgi-bin/luci/;stok=<token>/``, and that token is a live admin session.
+    """
+    if not value:
+        return ""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return "<unparseable, redacted>"
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc.rpartition("@")[2],
+            re.sub(r";[^/]*", ";<redacted>", parts.path),
+            "<redacted>" if parts.query else "",
+            "<redacted>" if parts.fragment else "",
+        )
+    )
+
+
+def _interpret(response) -> str:
     if response.status in REDIRECT_STATUSES:
         return "redirect, which is what a successful Cudy login returns"
     if response.status == 404:
@@ -44,13 +101,36 @@ def _interpret(response, expected: str | None) -> str:
         return "the router refused the request outright; wrong credentials or a locked account"
     if response.status >= 400:
         return f"server error {response.status}, so this is not a credential problem"
-    if expected == "login-page":
-        if "luci_username" in response.text:
-            return "login form found, so the endpoint and port are correct"
-        return "no login form here, so the path or port is probably wrong"
-    if "luci_username" in response.text or "password" in response.text.lower():
-        return "login form came back after submitting, which means the credentials were rejected"
-    return "unexpected page; this is a protocol mismatch rather than a bad password"
+    if "luci_username" in response.text:
+        return "login form found, so the endpoint and port are correct"
+    return "no login form here, so the path or port is probably wrong"
+
+
+def _login_outcome(result) -> str:
+    """Classify the login reply by the tests CudyAdapter.login applies.
+
+    diagnose exists to explain what status does, so a verdict reached by other
+    rules would contradict it. One split is deliberate: the adapter calls every
+    remaining reply a rejection, and here one without the login form is named a
+    protocol mismatch, since that is the case diagnose is run to find.
+    """
+    if result.status in {401, 403} and (_looks_like_login(result.text) or _luci_login_required(result)):
+        return "rejected"
+    if result.status >= 400:
+        return "error"
+    if result.status in {301, 302, 303} or (result.status == 200 and not _looks_like_login(result.text)):
+        return "accepted"
+    if _looks_like_login(result.text):
+        return "rejected"
+    return "mismatch"
+
+
+_LOGIN_NOTES = {
+    "accepted": "a redirect or a page other than the login form, which status counts as logged in",
+    "rejected": "the login form came back, which status reports as rejected credentials",
+    "error": "an HTTP error, which status reports as such rather than as a bad password",
+    "mismatch": "neither a session nor the login form; a protocol mismatch rather than a bad password",
+}
 
 
 def diagnose_cudy(device: Device, password: str) -> dict[str, Any]:
@@ -75,7 +155,7 @@ def diagnose_cudy(device: Device, password: str) -> dict[str, Any]:
             "landed_on": landing.url,
             "server": landing.headers.get("Server", ""),
             "login_form_present": "luci_username" in landing.text,
-            "note": _interpret(landing, "login-page"),
+            "note": _interpret(landing),
         }
     )
     try:
@@ -120,7 +200,9 @@ def diagnose_cudy(device: Device, password: str) -> dict[str, Any]:
             "steps": steps,
             "verdict": f"no LuCI login page at {base}/cgi-bin/luci/; check the port and that http is the right scheme",
         }
-    if page.status >= 400:
+    login_page = parse_cudy_login_page(page.text)
+    # Stock LuCI serves its login form with 403 to anyone not yet signed in.
+    if page.status >= 400 and not (page.status in {401, 403} and login_page.is_login):
         return {
             "vendor": "cudy",
             "base_url": base,
@@ -128,7 +210,16 @@ def diagnose_cudy(device: Device, password: str) -> dict[str, Any]:
             "steps": steps,
             "verdict": f"login page returned HTTP {page.status}; this is not a credential problem",
         }
-    if not salt:
+    if login_page.first_boot:
+        return {
+            "vendor": "cudy",
+            "base_url": base,
+            "reachable": True,
+            "steps": steps,
+            "verdict": "the router shows its first-time setup page and has no admin password yet; set one in its "
+            "web UI first (no login was attempted, since submitting that page would set the password)",
+        }
+    if not salt and not device.allow_legacy_login:
         return {
             "vendor": "cudy",
             "base_url": base,
@@ -136,16 +227,18 @@ def diagnose_cudy(device: Device, password: str) -> dict[str, Any]:
             "steps": steps,
             "verdict": "login page has no salt; the login flow for this firmware is not implemented",
         }
-    form = {
-        "_csrf": csrf,
-        "token": token,
-        "salt": salt,
-        "luci_language": "autp",
-        "luci_username": device.username,
-        "luci_password": derive_cudy_password(password, salt, token),
-        "timeclock": "0",
-        "zonename": "UTC",
-    }
+    fresh = fetch_cudy_token(session, f"{base}/cgi-bin/luci/")
+    steps.append(
+        {
+            "step": "POST /cgi-bin/luci/admin/get_token",
+            "token_fetched": fresh is not None,
+            "note": "per-login token received, used in place of the page's token"
+            if fresh
+            else "no per-login token endpoint; using the token embedded in the page",
+        }
+    )
+    token = fresh or token
+    form = cudy_login_form(login_page, password, device.username, token)
     try:
         result = session.request(
             "POST",
@@ -167,22 +260,36 @@ def diagnose_cudy(device: Device, password: str) -> dict[str, Any]:
             "verdict": "login POST failed",
         }
     cookies = sorted({cookie.name for cookie in session.cookie_jar})
+    # A session cookie's value is as good as the password while it lasts. Short
+    # values (lang=en, a 0/1 flag) are not tokens, and masking them blanked every
+    # matching substring of the snippet.
+    cookie_values = [
+        cookie.value
+        for cookie in session.cookie_jar
+        if cookie.value and (cookie.name in {"sysauth", "sysauth_https"} or len(cookie.value) >= 8)
+    ]
     derived = form["luci_password"]
+    outcome = _login_outcome(result)
     steps.append(
         {
             "step": "POST /cgi-bin/luci/ (login)",
+            "flow": "salted challenge/response" if salt else "legacy plaintext (allow_legacy_login)",
             "status": result.status,
-            "location": result.headers.get("Location", ""),
+            "location": _location(result.headers.get("Location", "")),
             "cookies_set": cookies,
-            "body_snippet": _snippet(result.text, derived, password, salt, token, csrf),
-            "note": _interpret(result, None),
+            "body_snippet": _snippet(result.text, derived, password, salt, token, csrf, *cookie_values),
+            "note": _LOGIN_NOTES[outcome],
         }
     )
     sysauth = any(name in {"sysauth", "sysauth_https"} for name in cookies)
-    if result.status in REDIRECT_STATUSES or sysauth:
+    if outcome == "accepted" and sysauth:
         verdict = "login accepted; the router issued a session cookie"
-    elif "luci_username" in result.text:
+    elif outcome == "accepted":
+        verdict = f"login accepted; HTTP {result.status} without the login form, though no sysauth cookie was set"
+    elif outcome == "rejected":
         verdict = "credentials rejected; the login form came back"
+    elif outcome == "error":
+        verdict = f"login POST returned HTTP {result.status}; status reports this as an HTTP error, not a bad password"
     else:
         verdict = "no session cookie and no login form; treat this as a protocol mismatch"
     return {
@@ -239,26 +346,31 @@ def diagnose_tenda(device: Device, password: str) -> dict[str, Any]:
         data = result.json()
     except HttpError:
         data = {}
-    login_block = data.get("sysLogin") or {}
+    # Valid JSON that is not an object is exactly the "different API" firmware
+    # this report exists to identify, so it must be described, not raised on.
+    if not isinstance(data, dict):
+        data = {}
+    login_block = _block(data, "sysLogin")
     steps.append(
         {
             "step": "POST /goform/modules?login",
             "status": result.status,
-            "response_keys": sorted(data) if isinstance(data, dict) else [],
+            "response_keys": sorted(data),
             "login_flag": login_block.get("Login"),
             "cookies_set": sorted({cookie.name for cookie in session.cookie_jar}),
             "body_snippet": _snippet(result.text, encoded, password),
             "note": "login accepted" if login_block.get("Login") else "login flag was not set",
         }
     )
-    if not isinstance(data, dict) or not data:
+    if not data:
         return {
             "vendor": "tenda",
             "base_url": base,
             "reachable": True,
             "steps": steps,
-            "verdict": "the login endpoint did not return JSON; this firmware uses a different API",
+            "verdict": "the login endpoint did not return a JSON object; this firmware uses a different API",
         }
+    status_answered = False
     try:
         status_result = session.request(
             "POST",
@@ -267,24 +379,108 @@ def diagnose_tenda(device: Device, password: str) -> dict[str, Any]:
             {"Content-Type": "application/json"},
         )
         status_data = status_result.json()
+    except (HttpError, ValueError) as exc:
+        steps.append({"step": "POST /goform/modules (status)", "error": str(exc)})
+    else:
+        if not isinstance(status_data, dict):
+            note = "status module did not return a JSON object"
+            status_data = {}
+        elif not 200 <= status_result.status < 300:
+            note = f"status module answered HTTP {status_result.status}"
+        else:
+            note = "status module answered"
+            status_answered = True
         steps.append(
             {
                 "step": "POST /goform/modules (status)",
                 "status": status_result.status,
-                "response_keys": sorted(status_data) if isinstance(status_data, dict) else [],
-                "uptime_raw": (status_data.get("sysStatus") or {}).get("runningTime", "<absent>"),
-                "note": "status module answered",
+                "response_keys": sorted(status_data),
+                "uptime_raw": _block(status_data, "sysStatus").get("runningTime", "<absent>"),
+                "note": note,
             }
         )
-    except (HttpError, ValueError) as exc:
-        steps.append({"step": "POST /goform/modules (status)", "error": str(exc)})
+    if not login_block.get("Login"):
+        verdict = "login was not accepted"
+    elif status_answered:
+        verdict = "login and status both answered"
+    else:
+        verdict = "login accepted, but the status module did not answer as expected"
     return {
         "vendor": "tenda",
         "base_url": base,
         "reachable": True,
         "steps": steps,
-        "verdict": "login and status both answered" if login_block.get("Login") else "login was not accepted",
+        "verdict": verdict,
     }
+
+
+def _js_int(name: str, text: str) -> int | None:
+    match = re.search(rf"{name}\s*=\s*(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+def diagnose_tplink(device: Device, password: str) -> dict[str, Any]:
+    """Read the TP-Link login page's failed-login counter without logging in.
+
+    This firmware locks its web UI for two hours after ten failed logins, and
+    diagnose is usually run straight after one was rejected, so the credential is
+    never presented. The counter on the unauthenticated page already tells a wrong
+    password, a lockout and a wrong address apart.
+    """
+    scheme = "https" if device.https else "http"
+    base = f"{scheme}://{_host_for_url(device.host)}:{device.http_port}"
+    session = HttpSession(base, verify_tls=device.verify_tls)
+    try:
+        page = session.request("GET", "/", headers={"Referer": f"{base}/"})
+    except HttpError as exc:
+        return {
+            "vendor": "tplink",
+            "base_url": base,
+            "reachable": False,
+            "steps": [{"step": "GET / (no credentials)", "error": str(exc)}],
+            "verdict": "the router did not answer on this address",
+        }
+    auth_times = _js_int("authTimes", page.text)
+    model = re.search(r"modelName\s*=\s*\"([^\"]*)\"", page.text)
+    steps: list[dict[str, Any]] = [
+        {
+            "step": "GET / (no credentials)",
+            "status": page.status,
+            "server": page.headers.get("Server", ""),
+            "auth_times": auth_times,
+            "forbid_time": _js_int("forbidTime", page.text),
+            "model": html.unescape(model.group(1)).strip() if model else "",
+            "username": device.username or "admin",
+            "note": "requested without the Authorization cookie, so the router does not count it as a login",
+        }
+    ]
+    hours = _TPLINK_LOCKOUT_SECONDS // 3600
+    if page.status >= 400:
+        verdict = (
+            f"{base}/ returned HTTP {page.status}, so this is not the TP-Link login page; "
+            "check the port and that http is the right scheme"
+        )
+    elif auth_times is None:
+        verdict = (
+            f"the page at {base}/ has no authTimes counter, so it is not the older TP-Link web UI this tool "
+            "speaks; check the port, or the firmware uses another login flow"
+        )
+    elif auth_times >= _TPLINK_MAX_ATTEMPTS:
+        verdict = (
+            f"the web UI is locked after {auth_times} failed logins; for about {hours} hours it refuses every "
+            "password, the right one too, so wait before trying again"
+        )
+    elif auth_times:
+        verdict = (
+            f"the router has counted {auth_times} failed logins, {_TPLINK_MAX_ATTEMPTS - auth_times} left before "
+            f"a {hours}-hour lockout; the address is right, so a rejection is the username or password"
+        )
+    else:
+        verdict = (
+            "the TP-Link login page answered with no failed logins counted, so the address is right; "
+            "diagnose does not present the password, so test it once with status"
+        )
+    return {"vendor": "tplink", "base_url": base, "reachable": True, "steps": steps, "verdict": verdict}
 
 
 def diagnose_device(device: Device, password: str) -> dict[str, Any]:
@@ -303,6 +499,8 @@ def diagnose_device(device: Device, password: str) -> dict[str, Any]:
         }
     if device.vendor == "tenda":
         return diagnose_tenda(device, password)
+    if device.vendor == "tplink":
+        return diagnose_tplink(device, password)
     return diagnose_cudy(device, password)
 
 

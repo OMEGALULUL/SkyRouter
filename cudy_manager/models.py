@@ -1,3 +1,4 @@
+import ipaddress
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -7,14 +8,53 @@ class ValidationError(ValueError):
     pass
 
 
-def _bool(value: Any, default: bool = False) -> bool:
+# TP-Link's 11N firmware only accepts "admin", and every refused guess costs one
+# of the WR840N's ten attempts before a two-hour lockout.
+_DEFAULT_USERNAMES = {"tplink": "admin"}
+
+
+def default_username(vendor: str) -> str:
+    return _DEFAULT_USERNAMES.get(vendor, "root")
+
+
+_TRUE = {"1", "true", "yes", "y", "on", "enabled"}
+_FALSE = {"0", "false", "no", "n", "off", "disabled"}
+
+
+def _bool(value: Any, name: str, default: bool) -> bool:
     if value is None:
         return default
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         return bool(value)
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    # Reading every other word as False turned verify_tls off for a typo.
+    raise ValidationError(f"{name} must be true or false")
+
+
+def _text(value: Any, name: str, default: str = "") -> str:
+    # JSON null and a YAML key left empty both arrive as None, which str() stored
+    # as the word "None".
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValidationError(f"{name} must be a string")
+    return str(value)
+
+
+def _bracketed_or_bare_ipv6(host: str) -> bool:
+    inner = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return isinstance(ipaddress.ip_address(inner), ipaddress.IPv6Address)
+    except ValueError:
+        return False
 
 
 def _int(value: Any, name: str, minimum: int, maximum: int, default: int) -> int:
@@ -57,9 +97,9 @@ class RebootPolicy:
         if not isinstance(data, dict):
             raise ValidationError("reboot must be an object")
         policy = cls(
-            enabled=_bool(data.get("enabled"), False),
-            at=str(data.get("at", "04:00")),
-            timezone=str(data.get("timezone", "UTC")),
+            enabled=_bool(data.get("enabled"), "reboot.enabled", False),
+            at=_text(data.get("at"), "reboot.at", "04:00"),
+            timezone=_text(data.get("timezone"), "reboot.timezone", "UTC"),
             window_minutes=data.get("window_minutes", 15),
             min_uptime_seconds=data.get("min_uptime_seconds", 3600),
             cooldown_seconds=data.get("cooldown_seconds", 21600),
@@ -114,22 +154,26 @@ class Device:
             raise ValidationError("host is required")
         if "://" in self.host or any(char in self.host for char in "/@?#"):
             raise ValidationError("host must be an IP address or hostname, not a URL")
+        # The adapters bracket any host with a colon as IPv6, so "10.0.0.1:8080"
+        # became an unparseable URL on every status check.
+        if any(char in self.host for char in ":[]") and not _bracketed_or_bare_ipv6(self.host):
+            raise ValidationError("host must not include a port; set http_port instead")
         self.username = str(self.username).strip()
         if not self.username:
             raise ValidationError("username is required")
         self.transport = str(self.transport).strip().lower()
         if self.transport not in {"web", "ssh"}:
             raise ValidationError("transport must be web or ssh")
-        if not re.fullmatch(r"/[A-Za-z0-9_./;:-]*", self.rpc_path):
+        if not isinstance(self.rpc_path, str) or not re.fullmatch(r"/[A-Za-z0-9_./;:-]*", self.rpc_path):
             raise ValidationError("rpc_path must be an absolute URL path")
         self.http_port = _int(self.http_port, "http_port", 1, 65535, 80)
         self.ssh_port = _int(self.ssh_port, "ssh_port", 1, 65535, 22)
         self.snmp_port = _int(self.snmp_port, "snmp_port", 1, 65535, 161)
-        self.https = _bool(self.https, False)
-        self.verify_tls = _bool(self.verify_tls, True)
-        self.allow_legacy_login = _bool(self.allow_legacy_login, False)
-        self.accept_unknown_host_key = _bool(self.accept_unknown_host_key, False)
-        self.enabled = _bool(self.enabled, True)
+        self.https = _bool(self.https, "https", False)
+        self.verify_tls = _bool(self.verify_tls, "verify_tls", True)
+        self.allow_legacy_login = _bool(self.allow_legacy_login, "allow_legacy_login", False)
+        self.accept_unknown_host_key = _bool(self.accept_unknown_host_key, "accept_unknown_host_key", False)
+        self.enabled = _bool(self.enabled, "enabled", True)
         if not isinstance(self.metadata, dict):
             raise ValidationError("metadata must be an object")
         self.reboot = RebootPolicy.from_dict(
@@ -147,29 +191,34 @@ class Device:
             raise ValidationError(
                 f"device {identifier} contains plaintext credential fields; use secret references"
             )
-        host = data.get("host", data.get("ip", ""))
-        vendor = data.get("vendor", "cudy" if data.get("is_cudy", True) else "tenda")
+        host = _text(data.get("host", data.get("ip")), "host")
+        vendor = _text(data.get("vendor"), "vendor", "cudy" if data.get("is_cudy", True) else "tenda")
+        metadata = data.get("metadata")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise ValidationError("metadata must be an object")
         device = cls(
             identifier=identifier,
-            vendor=str(vendor),
-            host=str(host),
-            username=str(data.get("username", "root")),
-            password_ref=str(data.get("password_ref", "")),
-            snmp_community_ref=str(data.get("snmp_community_ref", "")),
-            model=str(data.get("model", "")),
+            vendor=vendor,
+            host=host,
+            username=_text(data.get("username"), "username", default_username(vendor)),
+            password_ref=_text(data.get("password_ref"), "password_ref"),
+            snmp_community_ref=_text(data.get("snmp_community_ref"), "snmp_community_ref"),
+            model=_text(data.get("model"), "model"),
             http_port=data.get("http_port", 80),
-            https=_bool(data.get("https", data.get("use_https", False)), False),
-            verify_tls=_bool(data.get("verify_tls", True), True),
+            https=_bool(data.get("https", data.get("use_https")), "https", False),
+            verify_tls=_bool(data.get("verify_tls"), "verify_tls", True),
             ssh_port=data.get("ssh_port", 22),
             snmp_port=data.get("snmp_port", 161),
-            transport=data.get("transport", "web"),
-            rpc_path=data.get("rpc_path", "/ubus"),
+            transport=_text(data.get("transport"), "transport", "web"),
+            rpc_path=_text(data.get("rpc_path"), "rpc_path", "/ubus"),
             allow_legacy_login=data.get("allow_legacy_login", False),
             accept_unknown_host_key=data.get("accept_unknown_host_key", False),
             enabled=data.get("enabled", True),
             reboot=RebootPolicy.from_dict(data.get("reboot")),
-            metadata=dict(data.get("metadata", {})),
-            last_seen=str(data.get("last_seen", "")),
+            metadata=dict(metadata),
+            last_seen=_text(data.get("last_seen"), "last_seen"),
         )
         device.validate()
         return device

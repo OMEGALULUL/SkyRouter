@@ -157,7 +157,7 @@ class TestVerifyReason:
         manager.add_device("r1", "192.168.1.1", "cudy", password="pw")
         manager.adapter_for = lambda device: self._adapter_raising(ProtocolMismatch("unknown firmware"))
 
-        assert manager.verify_credentials("r1")["reason"] == "unreachable"
+        assert manager.verify_credentials("r1")["reason"] == "protocol"
 
     def test_success_is_labelled_ok(self, tmp_path: Path):
         manager = build_manager(tmp_path)

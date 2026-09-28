@@ -1,4 +1,6 @@
+import http.client
 import ipaddress
+import logging
 import re
 import ssl
 import urllib.error
@@ -6,6 +8,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -88,8 +92,13 @@ class CudyDiscovery:
             with opener.open(request, timeout=self.timeout) as response:  # noqa: S310
                 return response.status, response.read(262144).decode(errors="replace")
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read(262144).decode(errors="replace")
-        except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError):
+            try:
+                return exc.code, exc.read(262144).decode(errors="replace")
+            except (OSError, http.client.HTTPException):
+                return None
+        # urllib lets http.client's parse errors through unwrapped, and any LAN host
+        # (an SSH or TLS service on a probed port) can provoke them.
+        except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError, http.client.HTTPException):
             return None
 
     def _probe(self, host: str) -> DiscoveredDevice | None:
@@ -111,7 +120,10 @@ class CudyDiscovery:
             if page:
                 status, body = page
                 lowered = body.lower()
-                if status < 500 and any(marker in lowered for marker in ("cudy", "luci", "cgi-bin/luci")):
+                # Many servers echo the requested path in their error page (Express's
+                # "Cannot GET /cgi-bin/luci/"), so the probe's own URL proves nothing.
+                evidence = lowered.replace("cgi-bin/luci", "")
+                if status < 500 and any(marker in evidence for marker in ("cudy", "luci")):
                     model = self._model_from_text(body)
                     return DiscoveredDevice(
                         host=host,
@@ -127,7 +139,9 @@ class CudyDiscovery:
         match = re.search(r"(?:model|product)[^A-Za-z0-9]{0,12}([A-Za-z0-9-]{3,})", body, re.IGNORECASE)
         if match:
             return match.group(1)
-        title = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
+        # Stopping at the next "<" keeps this linear: a lazy ".*?" rescans to the end
+        # of the body for every unclosed <title>, and the re module holds the GIL.
+        title = re.search(r"<title[^<>]*>([^<]*)</title>", body, re.IGNORECASE)
         return " ".join(title.group(1).split()) if title else "Cudy Router"
 
     def discover(self) -> list[DiscoveredDevice]:
@@ -140,6 +154,11 @@ class CudyDiscovery:
                 try:
                     device = future.result()
                 except (OSError, ValueError):
+                    device = None
+                except Exception:
+                    # A scan of a /22 takes minutes; one host provoking something no
+                    # probe anticipated must not throw away every other result.
+                    logger.exception("discovery probe of %s raised an unexpected error", futures[future])
                     device = None
                 if device is not None:
                     self.discovered.append(device)

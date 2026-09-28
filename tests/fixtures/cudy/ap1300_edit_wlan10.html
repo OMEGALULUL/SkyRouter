@@ -1,0 +1,352 @@
+<form class="form-horizontal" role="form" method="post" name="cbi" action="/cgi-bin/luci/admin/network/wireless/config/multi_ssid_add_edit_ssid/wlan10" enctype="multipart/form-data" onkeydown="if(event.keyCode==13){return false;}">
+	<div>
+		<input type="hidden" name="token" value="dc677f9fe73cf8a540df38d98f4ca691" />
+		<input type="hidden" name="timeclock" value="" />
+		<input type="hidden" name="cbi.submit" value="1" />
+		<input type="password" class="sr-only">
+	</div>
+
+
+
+<div class="modal-header">
+	<button type="button" class="close" data-dismiss="modal" aria-hidden="true">&times;</button>
+	<h4 class="modal-title" id="modal-label-wireless">5GHz	SSID Settings</h4>
+</div>
+<div class="modal-body">
+
+		
+		
+		
+			<div class="form-group" id="cbi-wireless-wlan10-disabled"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.disabled">Enable</label>
+		<div class="col-sm-5">
+
+	<input type="hidden" value="1" name="cbi.cbe.wireless.wlan10.disabled" />
+	<input type="hidden" id="cbid.wireless.wlan10.disabled" name="cbid.wireless.wlan10.disabled" value="0" />
+
+	
+	<i class="fa fa-toggle-on  fa-2x text-primary" 
+	   onclick="if (this.classList.contains('fa-toggle-off')) { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   } else { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   }"></i>
+	
+
+	<i class="fa fa-spinner fa-2x fa-pulse text-primary hidden"></i>
+	</div>
+		</div>
+
+
+
+
+<div class="form-group" id="cbi-wireless-wlan10-smart_connect"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.smart_connect">Smart Connect<i class="fa fa-question-circle-o" aria-hidden="true" data-toggle="popover" data-placement="bottom" data-trigger="hover" data-content="When enabled, 2.4GHz and 5GHz networks share the same network name and password(SSID will be displayed in both the 2.4GHz and 5GHz lists). Your wireless devices will automatically switch to connect to the Wi-Fi band that provides the fastest speed" data-container="body"></i></label>
+		<div class="col-sm-5">
+
+	<input type="hidden" value="1" name="cbi.cbe.wireless.wlan10.smart_connect" />
+	<input type="hidden" id="cbid.wireless.wlan10.smart_connect" name="cbid.wireless.wlan10.smart_connect" value="0" />
+
+	
+	<i class="fa fa-toggle-off  fa-2x text-primary" 
+	   onclick="if (this.classList.contains('fa-toggle-off')) { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   } else { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   }"></i>
+	
+
+	<i class="fa fa-spinner fa-2x fa-pulse text-primary hidden"></i>
+	</div>
+		</div>
+
+
+
+
+<div class="form-group" id="cbi-wireless-wlan10-ssid"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.ssid">SSID</label>
+		<div class="col-sm-5">
+<input type="text"class="form-control strmaxlength(32) required" name="cbid.wireless.wlan10.ssid" id="cbid.wireless.wlan10.ssid" value="Example-5G" placeholder="SSID is required" strmaxlength="32" />	</div>
+		</div>
+
+
+
+
+<div class="form-group" id="cbi-wireless-wlan10-encryption"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.encryption">Encryption</label>
+		<div class="col-sm-5">
+
+<select class="form-control" onchange="wireless_update_wlan10_encryption(this.value)" id="cbid.wireless.wlan10.encryption" name="cbid.wireless.wlan10.encryption">
+<option  id="cbi-wireless-wlan10-encryption-none" value="none">No Encryption</option><option  id="cbi-wireless-wlan10-encryption-psk-mixed" value="psk-mixed" selected="selected">WPA-PSK/WPA2-PSK</option><option  id="cbi-wireless-wlan10-encryption-psk2" value="psk2">WPA2-PSK</option><option  id="cbi-wireless-wlan10-encryption-psk2psk3" value="psk2psk3">WPA2-PSK/WPA3-SAE</option><option  id="cbi-wireless-wlan10-encryption-psk3" value="psk3">WPA3-SAE</option><option  id="cbi-wireless-wlan10-encryption-wpa-mixed" value="wpa-mixed">WPA/WPA2-Enterprise</option><option  id="cbi-wireless-wlan10-encryption-wpa2" value="wpa2">WPA2-Enterprise</option>
+</select>
+<small class="text-danger"  id="cbid.wireless.wlan10.encryption.tips.psk2psk3"><i class="fa fa-exclamation-circle" aria-hidden="true"></i> WPA3 offers higher security, but some older clients may be incompatible.
+</small>
+<small class="text-danger"  id="cbid.wireless.wlan10.encryption.tips.psk3"><i class="fa fa-exclamation-circle" aria-hidden="true"></i> WPA3 offers higher security, but some older clients may be incompatible, and WPS is unavailable.
+</small>
+	</div>
+		</div>
+
+
+
+
+<script type="text/javascript">//<![CDATA[
+function wireless_update_wlan10_encryption(value) {
+	if (value == "psk2psk3") {
+		$("[id='cbid.wireless.wlan10.encryption.tips.psk2psk3']").show();
+		$("[id='cbid.wireless.wlan10.encryption.tips.psk3']").hide();
+	} else if (value == "psk3") {
+		$("[id='cbid.wireless.wlan10.encryption.tips.psk2psk3']").hide();
+		$("[id='cbid.wireless.wlan10.encryption.tips.psk3']").show();
+	} else {
+		$("[id='cbid.wireless.wlan10.encryption.tips.psk2psk3']").hide();
+		$("[id='cbid.wireless.wlan10.encryption.tips.psk3']").hide();
+	}
+
+	cbi_d_update();
+}
+wireless_update_wlan10_encryption("psk-mixed");
+//]]></script><div class="form-group" id="cbi-wireless-wlan10-nas_id"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.nas_id">NAS ID</label>
+		<div class="col-sm-5">
+<div><input type="text"class="form-control strmaxlength(48) required" onblur="cbi_input_update(this)"
+	 name="cbid.wireless.wlan10.nas_id" id="cbid.wireless.wlan10.nas_id" value="_apmac_" strmaxlength="48" disabled="disabled" style="display: none;"/></div>
+	<div><select class="form-control required" onchange="cbi_select_update(this)" id="cbid.wireless.wlan10.nas_id.select" name="cbid.wireless.wlan10.nas_id">
+	<option  value="_apmac_" selected="selected">AP MAC</option><option  value="_apname_">AP Name</option>
+		<option value="">-- custom --</option>
+	</select></div>
+	<script type="text/javascript">
+		cbi_select_init("[id='cbid.wireless.wlan10.nas_id.select']", "_apmac_");
+	</script>	</div>
+		</div>
+
+
+<script type="text/javascript" id="cbip-wireless-wlan10-nas_id">
+		
+		cbi_d_add("cbi-wireless-wlan10-nas_id", {"cbid.wireless.wlan10.encryption":"wpa"}, "cbip-wireless-wlan10-nas_id");cbi_d_add("cbi-wireless-wlan10-nas_id", {"cbid.wireless.wlan10.encryption":"wpa-mixed"}, "cbip-wireless-wlan10-nas_id");cbi_d_add("cbi-wireless-wlan10-nas_id", {"cbid.wireless.wlan10.encryption":"wpa2"}, "cbip-wireless-wlan10-nas_id");
+	</script>
+
+<div class="form-group" id="cbi-wireless-wlan10-radius_server"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.radius_server">RADIUS Server IP</label>
+		<div class="col-sm-5">
+<input type="text"class="form-control ip4addr required" name="cbid.wireless.wlan10.radius_server" id="cbid.wireless.wlan10.radius_server" value=""  />	</div>
+		</div>
+
+
+<script type="text/javascript" id="cbip-wireless-wlan10-radius_server">
+		
+		cbi_d_add("cbi-wireless-wlan10-radius_server", {"cbid.wireless.wlan10.encryption":"wpa"}, "cbip-wireless-wlan10-radius_server");cbi_d_add("cbi-wireless-wlan10-radius_server", {"cbid.wireless.wlan10.encryption":"wpa-mixed"}, "cbip-wireless-wlan10-radius_server");cbi_d_add("cbi-wireless-wlan10-radius_server", {"cbid.wireless.wlan10.encryption":"wpa2"}, "cbip-wireless-wlan10-radius_server");
+	</script>
+
+<div class="form-group" id="cbi-wireless-wlan10-radius_port"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.radius_port">RADIUS Port</label>
+		<div class="col-sm-5">
+<input type="text"class="form-control port required" name="cbid.wireless.wlan10.radius_port" id="cbid.wireless.wlan10.radius_port" value=""  />	</div>
+		</div>
+
+
+<script type="text/javascript" id="cbip-wireless-wlan10-radius_port">
+		
+		cbi_d_add("cbi-wireless-wlan10-radius_port", {"cbid.wireless.wlan10.encryption":"wpa"}, "cbip-wireless-wlan10-radius_port");cbi_d_add("cbi-wireless-wlan10-radius_port", {"cbid.wireless.wlan10.encryption":"wpa-mixed"}, "cbip-wireless-wlan10-radius_port");cbi_d_add("cbi-wireless-wlan10-radius_port", {"cbid.wireless.wlan10.encryption":"wpa2"}, "cbip-wireless-wlan10-radius_port");
+	</script>
+
+<div class="form-group" id="cbi-wireless-wlan10-radius_secret"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.radius_secret">RADIUS Password</label>
+		<div class="col-sm-5">
+<div class="input-group">
+	<input type="password"  class="form-control strmaxlength(64) required" 
+	 name="cbid.wireless.wlan10.radius_secret" id="cbid.wireless.wlan10.radius_secret" value="" placeholder="Password" strmaxlength="64" />
+	<span class="input-group-addon" onclick="cbi_display_toggle(this)"><i class="fa fa-eye"></i></span>
+	</div>	</div>
+		</div>
+
+
+<script type="text/javascript" id="cbip-wireless-wlan10-radius_secret">
+		
+		cbi_d_add("cbi-wireless-wlan10-radius_secret", {"cbid.wireless.wlan10.encryption":"wpa"}, "cbip-wireless-wlan10-radius_secret");cbi_d_add("cbi-wireless-wlan10-radius_secret", {"cbid.wireless.wlan10.encryption":"wpa-mixed"}, "cbip-wireless-wlan10-radius_secret");cbi_d_add("cbi-wireless-wlan10-radius_secret", {"cbid.wireless.wlan10.encryption":"wpa2"}, "cbip-wireless-wlan10-radius_secret");
+	</script>
+
+<div class="form-group" id="cbi-wireless-wlan10-key"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.key">Password</label>
+		<div class="col-sm-5">
+<div class="input-group">
+	<input type="password"  class="form-control wpakey required" 
+	 name="cbid.wireless.wlan10.key" id="cbid.wireless.wlan10.key" value="old-password-1" placeholder="Password"  />
+	<span class="input-group-addon" onclick="cbi_display_toggle(this)"><i class="fa fa-eye"></i></span>
+	</div>	</div>
+		</div>
+
+
+<script type="text/javascript" id="cbip-wireless-wlan10-key">
+		
+		cbi_d_add("cbi-wireless-wlan10-key", {"cbid.wireless.wlan10.encryption":"psk"}, "cbip-wireless-wlan10-key");cbi_d_add("cbi-wireless-wlan10-key", {"cbid.wireless.wlan10.encryption":"psk2"}, "cbip-wireless-wlan10-key");cbi_d_add("cbi-wireless-wlan10-key", {"cbid.wireless.wlan10.encryption":"psk-mixed"}, "cbip-wireless-wlan10-key");cbi_d_add("cbi-wireless-wlan10-key", {"cbid.wireless.wlan10.encryption":"psk2psk3"}, "cbip-wireless-wlan10-key");cbi_d_add("cbi-wireless-wlan10-key", {"cbid.wireless.wlan10.encryption":"psk3"}, "cbip-wireless-wlan10-key");
+	</script>
+
+<div class="form-group" id="cbi-wireless-wlan10-vlan"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.vlan">VLAN</label>
+		<div class="col-sm-5">
+<input type="text"class="form-control uinteger"data-msg-or="Please enter a value within range 10-4094" name="cbid.wireless.wlan10.vlan" id="cbid.wireless.wlan10.vlan" value="" range="[10,4094]" /></div>
+	<div class="col-sm-3 hidden-xs">
+	<label class="form-control-static" for="cbid.wireless.wlan10.vlan"" style="white-space:nowrap;">(Optional)</label>	</div>
+		</div>
+
+
+
+
+<div class="form-group" id="cbi-wireless-wlan10-hidden"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.hidden">Hidden Network</label>
+		<div class="col-sm-5">
+
+	<input type="hidden" value="1" name="cbi.cbe.wireless.wlan10.hidden" />
+	<input type="hidden" id="cbid.wireless.wlan10.hidden" name="cbid.wireless.wlan10.hidden" value="0" />
+
+	
+	<i class="fa fa-toggle-off  fa-2x text-primary" 
+	   onclick="if (this.classList.contains('fa-toggle-off')) { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   } else { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   }"></i>
+	
+
+	<i class="fa fa-spinner fa-2x fa-pulse text-primary hidden"></i>
+	</div>
+		</div>
+
+
+
+
+<div class="form-group" id="cbi-wireless-wlan10-isolate"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.isolate">Separate Clients</label>
+		<div class="col-sm-5">
+
+	<input type="hidden" value="1" name="cbi.cbe.wireless.wlan10.isolate" />
+	<input type="hidden" id="cbid.wireless.wlan10.isolate" name="cbid.wireless.wlan10.isolate" value="0" />
+
+	
+	<i class="fa fa-toggle-off  fa-2x text-primary" 
+	   onclick="if (this.classList.contains('fa-toggle-off')) { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   } else { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   }"></i>
+	
+
+	<i class="fa fa-spinner fa-2x fa-pulse text-primary hidden"></i>
+	</div>
+		</div>
+
+
+
+
+<div class="form-group" id="cbi-wireless-wlan10-ssid_isolation"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.ssid_isolation">SSID Isolation<i class="fa fa-question-circle-o" aria-hidden="true" data-toggle="popover" data-placement="bottom" data-trigger="hover" data-content="When enabled, clients on this SSID can not access clients on other SSIDs, but they can still access wired clients." data-container="body"></i></label>
+		<div class="col-sm-5">
+
+	<input type="hidden" value="1" name="cbi.cbe.wireless.wlan10.ssid_isolation" />
+	<input type="hidden" id="cbid.wireless.wlan10.ssid_isolation" name="cbid.wireless.wlan10.ssid_isolation" value="0" />
+
+	
+	<i class="fa fa-toggle-off  fa-2x text-primary" 
+	   onclick="if (this.classList.contains('fa-toggle-off')) { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   } else { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   }"></i>
+	
+
+	<i class="fa fa-spinner fa-2x fa-pulse text-primary hidden"></i>
+	</div>
+		</div>
+
+
+<script type="text/javascript" id="cbip-wireless-wlan10-ssid_isolation">
+		
+		cbi_d_add("cbi-wireless-wlan10-ssid_isolation", {"cbid.wireless.wlan10.isolate":"0"}, "cbip-wireless-wlan10-ssid_isolation");
+	</script>
+
+<div class="form-group" id="cbi-wireless-wlan10-bandwidth_control"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.bandwidth_control">Rate Limit for each band</label>
+		<div class="col-sm-5">
+
+	<input type="hidden" value="1" name="cbi.cbe.wireless.wlan10.bandwidth_control" />
+	<input type="hidden" id="cbid.wireless.wlan10.bandwidth_control" name="cbid.wireless.wlan10.bandwidth_control" value="0" />
+
+	
+	<i class="fa fa-toggle-off  fa-2x text-primary" 
+	   onclick="if (this.classList.contains('fa-toggle-off')) { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   } else { 
+	   	
+	   		cbi_switch_toggle(this, false); 
+	   	
+	   }"></i>
+	
+
+	<i class="fa fa-spinner fa-2x fa-pulse text-primary hidden"></i>
+	</div>
+		</div>
+
+
+
+
+<div class="form-group" id="cbi-wireless-wlan10-ddrate"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.ddrate">Download Rate</label>
+		<div class="col-sm-5">
+<div class="input-group">
+	<input type="text" class="form-control uinteger" name="cbid.wireless.wlan10.ddrate" id="cbid.wireless.wlan10.ddrate" value="" placeholder="1-10000" range="[1,10000]" />
+	<span class="input-group-addon">Mbps</span>
+	</div></div>
+	<div class="col-sm-3 hidden-xs">
+	<label class="form-control-static" for="cbid.wireless.wlan10.ddrate"" style="white-space:nowrap;">(Optional)</label>	</div>
+		</div>
+
+
+<script type="text/javascript" id="cbip-wireless-wlan10-ddrate">
+		
+		cbi_d_add("cbi-wireless-wlan10-ddrate", {"cbid.wireless.wlan10.bandwidth_control":"1"}, "cbip-wireless-wlan10-ddrate");
+	</script>
+
+<div class="form-group" id="cbi-wireless-wlan10-uurate"><label class="col-sm-4 control-label" for="cbid.wireless.wlan10.uurate">Upload Rate</label>
+		<div class="col-sm-5">
+<div class="input-group">
+	<input type="text" class="form-control uinteger" name="cbid.wireless.wlan10.uurate" id="cbid.wireless.wlan10.uurate" value="" placeholder="1-10000" range="[1,10000]" />
+	<span class="input-group-addon">Mbps</span>
+	</div></div>
+	<div class="col-sm-3 hidden-xs">
+	<label class="form-control-static" for="cbid.wireless.wlan10.uurate"" style="white-space:nowrap;">(Optional)</label>	</div>
+		</div>
+
+
+<script type="text/javascript" id="cbip-wireless-wlan10-uurate">
+		
+		cbi_d_add("cbi-wireless-wlan10-uurate", {"cbid.wireless.wlan10.bandwidth_control":"1"}, "cbip-wireless-wlan10-uurate");
+	</script>
+
+
+			
+
+<!-- /nsection -->
+
+
+<div>
+<div class="form-group">
+		<div class="col-sm-offset-4 col-sm-5">
+		
+			<button class="btn btn-block btn-primary" type="submit" name="cbi.apply">Save &#38; Apply</button>
+		
+			<button class="btn btn-block btn-primary hidden" type="button" disabled=true>Please Wait...</button>
+		</div>
+	</div>
+	<script type="text/javascript">
+		$("[data-toggle='popover']").popover();
+		cbi_d_update();
+		cbi_init_message("Do you want to leave this page? Your changes may not be saved.");
+	</script>
+</form>

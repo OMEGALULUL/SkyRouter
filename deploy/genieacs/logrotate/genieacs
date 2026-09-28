@@ -1,0 +1,17 @@
+# /etc/logrotate.d/genieacs: rotate the GenieACS log files (README step 5).
+#
+# No copytruncate: GenieACS reopens a log file when its inode changes, so the
+# usual rename-and-create rotation loses no lines.
+# The su line is required because /var/log/genieacs belongs to genieacs, and
+# logrotate refuses to rotate in a directory writable by a non-root user without it.
+/var/log/genieacs/*.log {
+    su genieacs genieacs
+    daily
+    rotate 30
+    dateext
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 genieacs genieacs
+}

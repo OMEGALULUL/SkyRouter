@@ -1,6 +1,7 @@
 import contextlib
 import fcntl
 import json
+import logging
 import os
 import re
 import secrets
@@ -8,6 +9,10 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+KEY_LOST_ENV = "ROUTER_MANAGER_KEY_LOST"
 
 
 class SecretStoreError(RuntimeError):
@@ -41,27 +46,68 @@ class SecretStore:
         with contextlib.suppress(OSError):
             os.chmod(path, mode)
 
+    def _read_key(self) -> bytes:
+        self._chmod(self.key_path, 0o600)
+        key = self.key_path.read_bytes().strip()
+        try:
+            self._fernet_cls(key)
+        except (ValueError, TypeError) as exc:
+            raise SecretStoreError("master key is invalid") from exc
+        return key
+
+    def _refuse_to_replace_a_lost_key(self) -> None:
+        # A new key cannot decrypt what is already stored, and anything reset under it
+        # is then unreadable by the old key too: restoring a backup later would lose
+        # those instead. The references are kept on an explicit override because
+        # set-password needs them to still resolve.
+        stored = self._load_values()
+        if not stored:
+            return
+        if os.environ.get(KEY_LOST_ENV, "").strip() == "1":
+            logger.warning(
+                "%s is set: creating a new master key; the %d stored secrets stay unreadable until reset",
+                KEY_LOST_ENV,
+                len(stored),
+            )
+            return
+        raise SecretStoreError(
+            f"master.key is missing from {self.directory} but secrets.json still holds {len(stored)} "
+            "secret(s) encrypted with it; restore master.key from backup, or if it is lost for good set "
+            f"{KEY_LOST_ENV}=1 once and reset every device with set-password"
+        )
+
     def _load_or_create_key(self) -> bytes:
         if self.key_path.exists():
-            self._chmod(self.key_path, 0o600)
-            key = self.key_path.read_bytes().strip()
-            try:
-                self._fernet_cls(key)
-            except (ValueError, TypeError) as exc:
-                raise SecretStoreError("master key is invalid") from exc
-            return key
+            return self._read_key()
+        self._refuse_to_replace_a_lost_key()
         key = self._fernet_cls.generate_key()
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd, temporary = tempfile.mkstemp(prefix="master.", dir=self.directory)
         try:
-            fd = os.open(self.key_path, flags, 0o600)
-        except FileExistsError:
-            return self.key_path.read_bytes().strip()
-        try:
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(key)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Unlike rename, link refuses to replace a key another process published
+            # first, and unlike O_EXCL it never exposes the file before it is written.
+            os.link(temporary, self.key_path)
+        except FileExistsError:
+            return self._read_key()
         finally:
-            self._chmod(self.key_path, 0o600)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+        self._fsync_directory()
         return key
+
+    def _fsync_directory(self) -> None:
+        # secrets.json is fsynced, so a key whose directory entry is lost in a power
+        # cut would leave a durable vault that nothing can decrypt.
+        with contextlib.suppress(OSError):
+            fd = os.open(self.directory, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
     def _load_values(self) -> dict[str, str]:
         if not self.vault_path.exists():

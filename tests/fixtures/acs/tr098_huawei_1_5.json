@@ -1,0 +1,302 @@
+{
+  "_fixture": "Constructed, not captured: a Huawei ONT in TR-098 with X_HW_RFBand, 2.4 GHz on WLANConfiguration.1-2 and 5 GHz on .5-6, a management WAN next to the Internet PPPoE WAN.",
+  "_id": "00E0FC-HG8145V5-48575443A1B2C3D4",
+  "_deviceId": {"_Manufacturer": "Huawei Technologies Co., Ltd", "_OUI": "00E0FC", "_ProductClass": "HG8145V5", "_SerialNumber": "48575443A1B2C3D4"},
+  "_registered": "2026-09-01T08:00:00.000Z",
+  "_lastInform": "2026-09-28T09:15:02.311Z",
+  "_lastBootstrap": "2026-09-01T08:00:00.000Z",
+  "InternetGatewayDevice": {
+    "_object": true,
+    "_writable": false,
+    "_timestamp": "2026-09-28T09:00:00.000Z",
+    "DeviceInfo": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "Manufacturer": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Huawei Technologies Co., Ltd"},
+      "ManufacturerOUI": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "00E0FC"},
+      "ModelName": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "HG8145V5", "_writable": false},
+      "ProductClass": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "HG8145V5"},
+      "SerialNumber": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "48575443A1B2C3D4"},
+      "SoftwareVersion": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "V5R020C10S115"},
+      "HardwareVersion": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "15AD.A"},
+      "UpTime": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 86400, "_writable": false},
+      "X_HW_CpuUsed": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 12, "_writable": false}
+    },
+    "ManagementServer": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "ConnectionRequestURL": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "http://10.10.0.31:7547/tr069"},
+      "PeriodicInformEnable": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:boolean", "_value": true, "_writable": true},
+      "PeriodicInformInterval": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 300, "_writable": true},
+      "ConnectionRequestUsername": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "00E0FC-HG8145V5-48575443A1B2C3D4", "_writable": true},
+      "ConnectionRequestPassword": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+      "Username": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "skybre-cpe", "_writable": true},
+      "Password": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true}
+    },
+    "LANDevice": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "1": {
+        "_object": true,
+        "_writable": false,
+        "_timestamp": "2026-09-28T09:00:00.000Z",
+        "WLANConfiguration": {
+          "_object": true,
+          "_writable": false,
+          "_timestamp": "2026-09-28T09:00:00.000Z",
+          "1": {
+            "_object": true,
+            "_writable": false,
+            "_timestamp": "2026-09-28T09:00:00.000Z",
+            "X_HW_RFBand": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "2.4GHz", "_writable": false},
+            "SSID": {"_object": false, "_timestamp": "2026-09-28T08:30:00.000Z", "_type": "xsd:string", "_value": "Casa-Silva", "_writable": true},
+            "Enable": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:boolean", "_value": true, "_writable": true},
+            "Status": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Up", "_writable": false},
+            "BeaconType": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "WPAand11i", "_writable": true},
+            "IEEE11iAuthenticationMode": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "PSKAuthentication", "_writable": true},
+            "IEEE11iEncryptionModes": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "AESEncryption", "_writable": true},
+            "WPAAuthenticationMode": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "PSKAuthentication", "_writable": true},
+            "BasicEncryptionModes": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "None", "_writable": true},
+            "KeyPassphrase": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+            "PreSharedKey": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "1": {
+                "_object": true,
+                "_writable": false,
+                "_timestamp": "2026-09-28T09:00:00.000Z",
+                "KeyPassphrase": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+                "PreSharedKey": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true}
+              }
+            },
+            "X_HW_Standard": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "11bgnax", "_writable": false},
+            "Channel": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 11, "_writable": true},
+            "TotalAssociations": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 1, "_writable": false},
+            "AssociatedDevice": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "1": {
+                "_object": true,
+                "_writable": false,
+                "_timestamp": "2026-09-28T09:00:00.000Z",
+                "AssociatedDeviceMACAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "A4:5E:60:11:22:33", "_writable": false},
+                "AssociatedDeviceIPAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "192.168.100.20", "_writable": false},
+                "X_HW_RSSI": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:int", "_value": -61, "_writable": false}
+              }
+            }
+          },
+          "2": {
+            "_object": true,
+            "_writable": false,
+            "_timestamp": "2026-09-28T09:00:00.000Z",
+            "X_HW_RFBand": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "2.4GHz", "_writable": false},
+            "SSID": {"_object": false, "_timestamp": "2026-09-28T08:30:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+            "Enable": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:boolean", "_value": false, "_writable": true},
+            "Status": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Disabled", "_writable": false},
+            "BeaconType": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Basic", "_writable": true},
+            "IEEE11iAuthenticationMode": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "PSKAuthentication", "_writable": true},
+            "IEEE11iEncryptionModes": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "AESEncryption", "_writable": true},
+            "WPAAuthenticationMode": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "PSKAuthentication", "_writable": true},
+            "BasicEncryptionModes": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "None", "_writable": true},
+            "KeyPassphrase": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+            "PreSharedKey": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "1": {
+                "_object": true,
+                "_writable": false,
+                "_timestamp": "2026-09-28T09:00:00.000Z",
+                "KeyPassphrase": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+                "PreSharedKey": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true}
+              }
+            },
+            "X_HW_Standard": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "11bgnax", "_writable": false}
+          },
+          "5": {
+            "_object": true,
+            "_writable": false,
+            "_timestamp": "2026-09-28T09:00:00.000Z",
+            "X_HW_RFBand": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "5GHz", "_writable": false},
+            "SSID": {"_object": false, "_timestamp": "2026-09-28T08:30:00.000Z", "_type": "xsd:string", "_value": "Casa-Silva-5G", "_writable": true},
+            "Enable": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:boolean", "_value": true, "_writable": true},
+            "Status": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Up", "_writable": false},
+            "BeaconType": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "11i", "_writable": true},
+            "IEEE11iAuthenticationMode": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "PSKAuthentication", "_writable": true},
+            "IEEE11iEncryptionModes": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "AESEncryption", "_writable": true},
+            "WPAAuthenticationMode": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "PSKAuthentication", "_writable": true},
+            "BasicEncryptionModes": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "None", "_writable": true},
+            "KeyPassphrase": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+            "PreSharedKey": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "1": {
+                "_object": true,
+                "_writable": false,
+                "_timestamp": "2026-09-28T09:00:00.000Z",
+                "KeyPassphrase": {"_object": false, "_timestamp": "2026-09-28T09:10:01.000Z", "_type": "xsd:string", "_value": "zz-secret-hw-wlan5-psk", "_writable": true},
+                "PreSharedKey": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true}
+              }
+            },
+            "X_HW_Standard": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "11anacax", "_writable": false},
+            "Channel": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 149, "_writable": true},
+            "TotalAssociations": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 0, "_writable": false}
+          },
+          "6": {
+            "_object": true,
+            "_writable": false,
+            "_timestamp": "2026-09-28T09:00:00.000Z",
+            "X_HW_RFBand": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "5GHz", "_writable": false},
+            "SSID": {"_object": false, "_timestamp": "2026-09-28T08:30:00.000Z", "_type": "xsd:string", "_value": "Casa-Silva-Guest", "_writable": true},
+            "Enable": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:boolean", "_value": true, "_writable": true},
+            "Status": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Up", "_writable": false},
+            "BeaconType": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "11i", "_writable": true},
+            "IEEE11iAuthenticationMode": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "PSKAuthentication", "_writable": true},
+            "IEEE11iEncryptionModes": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "AESEncryption", "_writable": true},
+            "WPAAuthenticationMode": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "PSKAuthentication", "_writable": true},
+            "BasicEncryptionModes": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "None", "_writable": true},
+            "KeyPassphrase": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+            "PreSharedKey": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "1": {
+                "_object": true,
+                "_writable": false,
+                "_timestamp": "2026-09-28T09:00:00.000Z",
+                "KeyPassphrase": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true},
+                "PreSharedKey": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "", "_writable": true}
+              }
+            },
+            "X_HW_Standard": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "11anacax", "_writable": false},
+            "Channel": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 149, "_writable": true},
+            "TotalAssociations": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 0, "_writable": false}
+          }
+        },
+        "Hosts": {
+          "_object": true,
+          "_writable": false,
+          "_timestamp": "2026-09-28T09:00:00.000Z",
+          "Host": {
+            "_object": true,
+            "_writable": false,
+            "_timestamp": "2026-09-28T09:00:00.000Z",
+            "1": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "MACAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "A4:5E:60:11:22:33", "_writable": false},
+              "IPAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "192.168.100.20", "_writable": false},
+              "HostName": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "iphone-ana", "_writable": false},
+              "Active": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:boolean", "_value": true, "_writable": false},
+              "Layer2Interface": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1", "_writable": false}
+            },
+            "2": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "MACAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "00-1A-2B-3C-4D-5E", "_writable": false},
+              "IPAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "192.168.100.30", "_writable": false},
+              "HostName": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "smart-tv", "_writable": false},
+              "Active": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:boolean", "_value": true, "_writable": false},
+              "InterfaceType": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Ethernet", "_writable": false},
+              "Layer2Interface": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.2", "_writable": false}
+            }
+          }
+        }
+      }
+    },
+    "WANDevice": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "1": {
+        "_object": true,
+        "_writable": false,
+        "_timestamp": "2026-09-28T09:00:00.000Z",
+        "WANConnectionDevice": {
+          "_object": true,
+          "_writable": false,
+          "_timestamp": "2026-09-28T09:00:00.000Z",
+          "1": {
+            "_object": true,
+            "_writable": false,
+            "_timestamp": "2026-09-28T09:00:00.000Z",
+            "WANIPConnection": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "1": {
+                "_object": true,
+                "_writable": false,
+                "_timestamp": "2026-09-28T09:00:00.000Z",
+                "Name": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "1_TR069_R_VID_100", "_writable": false},
+                "ConnectionStatus": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Connected", "_writable": false},
+                "ExternalIPAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "10.20.30.40", "_writable": false},
+                "Uptime": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 86000, "_writable": false},
+                "X_HW_SERVICELIST": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "TR069", "_writable": true}
+              }
+            }
+          },
+          "2": {
+            "_object": true,
+            "_writable": false,
+            "_timestamp": "2026-09-28T09:00:00.000Z",
+            "WANPPPConnection": {
+              "_object": true,
+              "_writable": false,
+              "_timestamp": "2026-09-28T09:00:00.000Z",
+              "1": {
+                "_object": true,
+                "_writable": false,
+                "_timestamp": "2026-09-28T09:00:00.000Z",
+                "Name": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "2_INTERNET_R_VID_200", "_writable": false},
+                "ConnectionStatus": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "Connected", "_writable": false},
+                "ExternalIPAddress": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "41.193.10.20", "_writable": false},
+                "Uptime": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:unsignedInt", "_value": 3600, "_writable": false},
+                "Username": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "ana.silva@isp.example", "_writable": true},
+                "Password": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "zz-secret-hw-ppp", "_writable": true},
+                "X_HW_SERVICELIST": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "INTERNET", "_writable": true}
+              }
+            }
+          }
+        }
+      }
+    },
+    "Layer3Forwarding": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "DefaultConnectionService": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.2.WANPPPConnection.1", "_writable": true}
+    },
+    "UserInterface": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "X_HW_WebUserInfo": {
+        "_object": true,
+        "_writable": false,
+        "_timestamp": "2026-09-28T09:00:00.000Z",
+        "1": {
+          "_object": true,
+          "_writable": false,
+          "_timestamp": "2026-09-28T09:00:00.000Z",
+          "UserName": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "telecomadmin", "_writable": true},
+          "Password": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "zz-secret-hw-web", "_writable": true}
+        }
+      }
+    },
+    "LANConfigSecurity": {
+      "_object": true,
+      "_writable": false,
+      "_timestamp": "2026-09-28T09:00:00.000Z",
+      "ConfigPassword": {"_object": false, "_timestamp": "2026-09-28T09:00:00.000Z", "_type": "xsd:string", "_value": "zz-secret-hw-config", "_writable": true}
+    }
+  }
+}

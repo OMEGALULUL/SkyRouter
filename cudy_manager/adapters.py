@@ -5,6 +5,7 @@ import json
 import re
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlencode
@@ -25,6 +26,15 @@ class AuthenticationRejected(AdapterError):
     def __init__(self, message: str, response: Any | None = None):
         super().__init__(message)
         self.response = response
+
+
+class RouterLockedOut(AuthenticationRejected):
+    """The router refuses every login until its lockout expires.
+
+    A subclass so callers that stop re-sending a refused credential keep doing so,
+    while those that report the outcome can say the password went untested rather
+    than that it is wrong.
+    """
 
 
 class ProtocolMismatch(AdapterError):
@@ -49,6 +59,9 @@ class RouterAdapter(ABC):
 
     def set_ssid(self, ssid: str, radio: str | None = None) -> bool:
         raise UnsupportedOperation("SSID changes are not supported by this adapter")
+
+    def set_wifi_password(self, password: str, radio: str | None = None) -> bool:
+        raise UnsupportedOperation("Wi-Fi password changes are not supported by this adapter")
 
     def mesh_status(self) -> dict[str, Any]:
         raise UnsupportedOperation("mesh status is not supported by this adapter")
@@ -138,9 +151,214 @@ def _uptime_seconds(value: Any) -> int | None:
     return total
 
 
+def _labelled_value(rows: list[list[str]], *labels: str) -> str:
+    """The cell after the first cell naming one of ``labels``.
+
+    Cudy status tables are label/value rows, and each cell holds the same text
+    twice (a desktop and a mobile copy), so the doubled text is collapsed.
+    """
+    for row in rows:
+        for index, cell in enumerate(row[:-1]):
+            if any(label in cell.lower() for label in labels):
+                words = row[index + 1].split()
+                half = len(words) // 2
+                if words and len(words) % 2 == 0 and words[:half] == words[half:]:
+                    words = words[:half]
+                return " ".join(words)
+    return ""
+
+
+_DURATION = re.compile(r"\d+\s*(?:days?|d)\s*\d{1,2}:\d{2}:\d{2}|\d{1,2}:\d{2}:\d{2}|\d+", re.IGNORECASE)
+
+
 def _looks_like_login(text: str) -> bool:
     lowered = text.lower()
     return "luci_username" in lowered or "name=\"password\"" in lowered or "wrong password" in lowered
+
+
+def _luci_login_required(response: Any) -> bool:
+    return any(
+        key.lower() == "x-luci-login-required" and str(value).strip().lower() == "yes"
+        for key, value in response.headers.items()
+    )
+
+
+_CUDY_CHALLENGE_PATH = "/cgi-bin/luci/admin/get_token"
+_CUDY_CHALLENGE = re.compile(r"[A-Za-z0-9]{8,128}")
+_CUDY_RETRY_PAUSE = 1.0
+_CUDY_WIFI_FORM = "/cgi-bin/luci/admin/network/wireless/config/multi_ssid_add_edit_ssid/{iface}"
+_CUDY_WIFI_IFACES = {"2.4G": "wlan00", "5G": "wlan10"}
+# Modes whose "key" field is a WPA passphrase; open and WPA-Enterprise networks have none.
+_CUDY_PASSPHRASE_MODES = {"psk", "psk2", "psk-mixed", "psk2psk3", "psk3"}
+
+
+def _cbi_fields(text: str) -> list[tuple[str, str]]:
+    form = _CbiForm()
+    form.feed(text)
+    return form.fields
+
+
+def _partial(done: list[str], band: str, reason: str) -> str:
+    if done:
+        return f"changed on {' and '.join(done)}, but not on {band}: {reason}; the bands now differ"
+    return f"the router did not accept the change on {band}: {reason}; nothing was changed"
+
+
+@dataclass
+class CudyLoginPage:
+    """What a Cudy login page asks for, read the way the router's own sysauth.js reads it."""
+
+    csrf: str
+    token: str
+    salt: str
+    username: str
+    is_login: bool
+    # Factory-fresh firmware serves a "create password" form instead: submitting it
+    # sets the admin password rather than checking it.
+    first_boot: bool
+
+
+def parse_cudy_login_page(text: str) -> CudyLoginPage:
+    parser = _FormParser()
+    parser.feed(text)
+    inputs = parser.inputs
+    return CudyLoginPage(
+        csrf=inputs.get("_csrf", ""),
+        token=inputs.get("token", ""),
+        salt=inputs.get("salt", ""),
+        # The stock form carries a fixed hidden username ("admin") that the browser
+        # always submits, whatever the device record says.
+        username=inputs.get("luci_username", ""),
+        is_login="luci_username" in inputs or "luci_password" in inputs,
+        first_boot='id="luci_password_create"' in text and 'id="luci_password_login"' not in text,
+    )
+
+
+def cudy_login_form(page: CudyLoginPage, password: str, username: str, token: str) -> dict[str, str]:
+    return {
+        "_csrf": page.csrf,
+        "token": token,
+        "salt": page.salt,
+        "luci_language": "auto",
+        "luci_username": page.username or username,
+        "luci_password": derive_cudy_password(password, page.salt, token) if page.salt else password,
+        "timeclock": str(int(time.time())),
+        "zonename": "UTC",
+    }
+
+
+def fetch_cudy_token(http: "HttpSession", referer: str) -> str | None:
+    """The per-login token the browser fetches just before submitting.
+
+    Real firmware (AP1300, git-26.232) POSTs here and hashes with the answer, not
+    with the token embedded in the page; None means this firmware has no such step.
+    """
+    try:
+        headers = {"Referer": referer, "X-Requested-With": "XMLHttpRequest"}
+        reply = http.request("POST", _CUDY_CHALLENGE_PATH, b"", headers)
+    except HttpError:
+        return None
+    token = reply.text.strip()
+    return token if reply.status == 200 and _CUDY_CHALLENGE.fullmatch(token) else None
+
+
+class _CbiForm(HTMLParser):
+    """The first POST form on a LuCI CBI page, as a browser would submit it.
+
+    Cudy's Wi-Fi forms are posted back whole, so every field the router's own
+    page would send must be sent unchanged: text and hidden inputs by value,
+    checkboxes and radios only when checked, a select's selected option.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.action = ""
+        self.fields: list[tuple[str, str]] = []
+        self._in_form = False
+        self._done = False
+        self._select: dict[str, Any] | None = None
+        self._textarea: list[str] | None = None
+        self._textarea_name = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key: value or "" for key, value in attrs}
+        if self._done:
+            return
+        if tag == "form" and not self._in_form and values.get("method", "get").lower() == "post":
+            self._in_form = True
+            self.action = values.get("action", "")
+            return
+        if not self._in_form:
+            return
+        name = values.get("name", "")
+        if tag == "input" and name:
+            kind = values.get("type", "text").lower()
+            if kind in {"submit", "button", "image", "reset", "file"}:
+                return
+            if kind in {"checkbox", "radio"}:
+                if "checked" in values:
+                    self.fields.append((name, values.get("value", "on")))
+                return
+            self.fields.append((name, values.get("value", "")))
+        elif tag == "select" and name:
+            self._select = {"name": name, "first": None, "chosen": None}
+        elif tag == "option" and self._select is not None:
+            value = values.get("value", "")
+            if self._select["first"] is None:
+                self._select["first"] = value
+            if "selected" in values:
+                self._select["chosen"] = value
+        elif tag == "textarea" and name:
+            self._textarea, self._textarea_name = [], name
+
+    def handle_data(self, data: str) -> None:
+        if self._textarea is not None:
+            self._textarea.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "select" and self._select is not None:
+            chosen = self._select["chosen"] if self._select["chosen"] is not None else self._select["first"]
+            if chosen is not None:
+                self.fields.append((self._select["name"], chosen))
+            self._select = None
+        elif tag == "textarea" and self._textarea is not None:
+            self.fields.append((self._textarea_name, "".join(self._textarea)))
+            self._textarea = None
+        elif tag == "form" and self._in_form:
+            self._in_form, self._done = False, True
+
+
+_CBI_DEPENDENCY = re.compile(r'cbi_d_add\(\s*"([^"]+)"\s*,\s*(\{[^}]*\})')
+
+
+def _cbi_submission(text: str, changes: dict[str, str]) -> tuple[str, list[tuple[str, str]]]:
+    """What the page would POST after ``changes``, with its dependency rules applied.
+
+    ``cbi_d_update`` in the browser removes a field whose ``cbi_d_add`` conditions
+    are all unmet before the form is sent; the RADIUS fields, for instance, only
+    exist while encryption is WPA-Enterprise.
+    """
+    form = _CbiForm()
+    form.feed(text)
+    missing = [name for name in changes if name not in {field for field, _ in form.fields}]
+    if missing:
+        raise ProtocolMismatch(f"Cudy Wi-Fi form has no field {missing[0]}; this firmware uses a different page")
+    fields = [(name, changes.get(name, value)) for name, value in form.fields]
+    rules: dict[str, list[dict[str, str]]] = {}
+    for target, raw in _CBI_DEPENDENCY.findall(text):
+        try:
+            rule = json.loads(raw)
+        except ValueError:
+            continue
+        rules.setdefault(target, []).append({str(key): str(value) for key, value in rule.items()})
+    visible = dict(fields)
+    kept = []
+    for name, value in fields:
+        options = rules.get("cbi-" + name.removeprefix("cbid.").replace(".", "-"))
+        if options and not any(all(visible.get(key) == want for key, want in rule.items()) for rule in options):
+            continue
+        kept.append((name, value))
+    return form.action, kept
 
 
 def derive_cudy_password(password: str, salt: str, token: str = "") -> str:
@@ -185,14 +403,32 @@ class CudyAdapter(RouterAdapter):
     def login(self) -> bool:
         if self.authenticated:
             return True
+        try:
+            return self._login_once()
+        except AuthenticationRejected as exc:
+            if not getattr(exc, "cudy_token_may_be_stale", False):
+                raise
+            # A Cudy keeps one valid login token: anyone logging in meanwhile, even
+            # the operator in the router's own web UI, invalidates ours, and the
+            # router then answers exactly as it does to a wrong password. One retry
+            # with a fresh token tells the two apart; a wrong password is refused again.
+            time.sleep(_CUDY_RETRY_PAUSE)
+            return self._login_once()
+
+    def _login_once(self) -> bool:
         response = self._get("/cgi-bin/luci/")
-        parser = _FormParser()
-        parser.feed(response.text)
-        self.csrf_token = parser.inputs.get("_csrf", "")
-        self.token = parser.inputs.get("token", "")
-        self.salt = parser.inputs.get("salt", "")
-        if response.status >= 400:
+        page = parse_cudy_login_page(response.text)
+        self.csrf_token = page.csrf
+        self.token = page.token
+        self.salt = page.salt
+        # Stock LuCI serves its login form with 403 to anyone not yet signed in.
+        if response.status >= 400 and not (response.status in {401, 403} and page.is_login):
             raise AdapterError(f"Cudy login page returned HTTP {response.status}")
+        if page.first_boot:
+            raise UnsupportedOperation(
+                "this Cudy has no admin password yet (it shows the first-time setup page); set one in its web UI "
+                "first, since signing in from here would set it"
+            )
         if not self.salt and not self.csrf_token and not self.device.allow_legacy_login:
             raise ProtocolMismatch(
                 "Cudy login page exposed no salt and no token, so the expected challenge/response handshake "
@@ -201,20 +437,19 @@ class CudyAdapter(RouterAdapter):
             )
         if not self.salt and not self.device.allow_legacy_login:
             raise UnsupportedOperation("Cudy login did not provide a salt; enable legacy_login only on a trusted LAN")
-        password = self.password
-        if self.salt:
-            password = derive_cudy_password(self.password, self.salt, self.token)
-        form = {
-            "_csrf": self.csrf_token,
-            "token": self.token,
-            "salt": self.salt,
-            "luci_language": "autp",
-            "luci_username": self.device.username,
-            "luci_password": password,
-            "timeclock": str(int(time.time())),
-            "zonename": "UTC",
-        }
+        self.token = fetch_cudy_token(self.http, f"{self.base_url}/cgi-bin/luci/") or page.token
+        form = cudy_login_form(page, self.password, self.device.username, self.token)
         result = self._post("/cgi-bin/luci/", form)
+        if result.status in {401, 403} and (_looks_like_login(result.text) or _luci_login_required(result)):
+            # Stock LuCI answers a wrong password with 403 and the login form. That is
+            # the router saying no, and reporting it as a generic HTTP error would send
+            # the operator to check the network instead of the password.
+            refused = AuthenticationRejected(
+                f"Cudy rejected the credentials: HTTP {result.status} with the login form",
+                response=result,
+            )
+            refused.cudy_token_may_be_stale = bool(self.token)  # type: ignore[attr-defined]
+            raise refused
         if result.status >= 400:
             raise AdapterError(f"Cudy login POST returned HTTP {result.status}")
         if result.status in {301, 302, 303} or (result.status == 200 and not _looks_like_login(result.text)):
@@ -229,7 +464,7 @@ class CudyAdapter(RouterAdapter):
                 self.session_id = cookie.value or ""
         return True
 
-    def _session_get(self, path: str):
+    def _session_get(self, path: str, missing_ok: bool = False):
         if not self.authenticated:
             self.login()
         response = self._get(path)
@@ -237,6 +472,8 @@ class CudyAdapter(RouterAdapter):
             self.authenticated = False
             self.login()
             response = self._get(path)
+        if response.status == 404 and missing_ok:
+            return response
         if response.status >= 400:
             raise AdapterError(f"Cudy request returned HTTP {response.status}")
         return response
@@ -247,9 +484,17 @@ class CudyAdapter(RouterAdapter):
         parser = _FormParser()
         parser.feed(text)
         firmware = ""
-        match = re.search(r"(?:firmware|software)[^<]{0,40}([A-Za-z0-9._-]{3,})", text, re.IGNORECASE)
+        # The value must start with a digit and may sit in the next cell. A pattern
+        # that accepts any word backtracks into the label and returns "ion" from
+        # "Firmware Version".
+        labelled = _labelled_value(parser.rows, "firmware", "software version")
+        match = re.search(r"v?\d[\w.-]*", labelled) or re.search(
+            r"(?:firmware|software)(?:\s*version)?\s*:?\s*(?:<[^>]*>\s*){0,4}(v?\d[\w.-]*)",
+            text,
+            re.IGNORECASE,
+        )
         if match:
-            firmware = html.unescape(match.group(1))
+            firmware = html.unescape(match.group(match.lastindex or 0))
         result: dict[str, Any] = {
             "online": True,
             "firmware": firmware,
@@ -259,15 +504,23 @@ class CudyAdapter(RouterAdapter):
         # Capture the whole duration expression. Matching only the leading number
         # would drop the H:MM:SS part, and would fail outright on pages that label
         # the field "Activity Time", leaving the scheduler unable to read uptime.
-        uptime = re.search(
-            r"(?:uptime|activity time)[^0-9]{0,40}"
-            r"(\d+\s*(?:days?)?\s*\d{1,2}:\d{2}:\d{2}|\d{1,2}:\d{2}:\d{2}|\d+)",
-            text,
-            re.IGNORECASE,
-        )
-        if uptime:
-            result["uptime_text"] = uptime.group(0)
-            result["uptime_seconds"] = _uptime_seconds(uptime.group(1))
+        # Read the value cell, not the first digit after the label: on real firmware
+        # (AP1300 2.5.25) that digit belongs to the next element's id, which gave an
+        # uptime of 2 seconds and would have let the scheduler reboot too early.
+        duration = _DURATION.search(_labelled_value(parser.rows, "uptime", "activity time"))
+        if duration:
+            result["uptime_text"] = duration.group(0)
+            result["uptime_seconds"] = _uptime_seconds(duration.group(0))
+        else:
+            inline = re.search(
+                r"(?:uptime|activity time)\s*:?\s*"
+                r"(\d+\s*(?:days?|d)?\s*\d{1,2}:\d{2}:\d{2}|\d{1,2}:\d{2}:\d{2}|\d+)",
+                html.unescape(re.sub(r"<[^>]+>", " ", text)),
+                re.IGNORECASE,
+            )
+            if inline:
+                result["uptime_text"] = inline.group(1)
+                result["uptime_seconds"] = _uptime_seconds(inline.group(1))
         return result
 
     def clients(self) -> list[dict[str, Any]]:
@@ -280,39 +533,104 @@ class CudyAdapter(RouterAdapter):
                 clients.append({"name": row[1], "cells": row})
         return clients
 
-    def _submit_reboot_form(self) -> bool:
-        response = self._session_get("/cgi-bin/luci/admin/system/reboot")
-        parser = _FormParser()
-        parser.feed(response.text)
-        form = next((item for item in parser.forms if "reboot" in item["action"].lower()), None)
-        if form is None and parser.forms:
-            form = parser.forms[0]
-        if form is None:
-            return False
-        action = form["action"] or "/cgi-bin/luci/admin/system/reboot"
-        if not action.startswith("/"):
-            action = "/cgi-bin/luci/admin/system/reboot"
-        fields = {key: str(value) for key, value in form["inputs"].items()}
-        fields.setdefault("token", self.token)
-        fields["submit"] = "1"
-        result = self._post(action, fields)
-        return result.status in {200, 202, 204, 301, 302, 303}
-
     def reboot(self) -> bool:
-        if not self.authenticated:
-            self.login()
-        token_fields = {key: value for key, value in {"_csrf": self.csrf_token, "token": self.token}.items() if value}
-        result = self._post("/cgi-bin/luci/admin/system/reboot/call", token_fields)
-        if result.status in {200, 202, 204, 301, 302, 303} and not _looks_like_login(result.text):
+        # What the router's own reboot page does (AP1300, 2.5.25): its script GETs
+        # reboot/apply as soon as the page loads. The POST to reboot/call used before
+        # came from older LuCI; this firmware answered it without restarting.
+        response = self._session_get("/cgi-bin/luci/admin/system/reboot/apply", missing_ok=True)
+        if response.status == 404:
+            tokens = {"_csrf": self.csrf_token, "token": self.token}
+            response = self._post("/cgi-bin/luci/admin/system/reboot/call", {k: v for k, v in tokens.items() if v})
+        if response.status in {200, 202, 204} and not _looks_like_login(response.text):
             return True
-        return self._submit_reboot_form()
+        raise AdapterError(f"Cudy did not accept the reboot request (HTTP {response.status})")
+
+    def _wifi_ifaces(self, radio: str | None) -> list[tuple[str, str]]:
+        if radio is None:
+            return list(_CUDY_WIFI_IFACES.items())
+        if radio not in _CUDY_WIFI_IFACES:
+            raise AdapterError("Cudy radio must be 2.4G or 5G")
+        return [(radio, _CUDY_WIFI_IFACES[radio])]
+
+    def _wifi_form(self, iface: str) -> str:
+        return self._session_get(_CUDY_WIFI_FORM.format(iface=iface)).text
+
+    def _write_wifi(self, radio: str | None, option: str, value: str) -> bool:
+        """Post the band's own Wi-Fi form back with one option changed, then read it back.
+
+        Taken from a real AP1300 (2.5.25): the page the router's UI uses for one
+        network, submitted with its Save & Apply button. Every other field goes back
+        exactly as the page gave it, so nothing else on the network changes.
+        """
+        targets = self._wifi_ifaces(radio)
+        pages = {iface: self._wifi_form(iface) for _, iface in targets}
+        for band, iface in targets:
+            fields = dict(_cbi_fields(pages[iface]))
+            if radio is not None and fields.get(f"cbid.wireless.{iface}.smart_connect") == "1":
+                raise UnsupportedOperation(
+                    "Smart Connect joins both bands into one network; change both bands together"
+                )
+            if option == "key":
+                encryption = fields.get(f"cbid.wireless.{iface}.encryption", "")
+                if encryption not in _CUDY_PASSPHRASE_MODES:
+                    raise AdapterError(
+                        f"the {band} network uses encryption {encryption or 'none'!r}, which has no Wi-Fi password "
+                        "to change; set up WPA2 or WPA3 on the router first"
+                    )
+        done: list[str] = []
+        for band, iface in targets:
+            name = f"cbid.wireless.{iface}.{option}"
+            action, submission = _cbi_submission(pages[iface], {name: value, "timeclock": str(int(time.time()))})
+            if not action.startswith("/cgi-bin/luci/"):
+                action = _CUDY_WIFI_FORM.format(iface=iface)
+            submission.append(("cbi.apply", ""))
+            try:
+                reply = self.http.request(
+                    "POST",
+                    action,
+                    urlencode(submission).encode(),
+                    {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Referer": f"{self.base_url}/cgi-bin/luci/admin/setup",
+                    },
+                )
+            except HttpError as exc:
+                raise AdapterError(_partial(done, band, f"no answer ({exc})")) from exc
+            if reply.status >= 400 or _looks_like_login(reply.text):
+                raise AdapterError(_partial(done, band, f"HTTP {reply.status}"))
+            if dict(_cbi_fields(self._wifi_form(iface))).get(name) != value:
+                raise AdapterError(_partial(done, band, "the router did not keep the change"))
+            done.append(band)
+        return True
 
     def set_ssid(self, ssid: str, radio: str | None = None) -> bool:
-        raise UnsupportedOperation("Cudy SSID changes require an SSH transport on this firmware")
+        return self._write_wifi(radio, "ssid", ssid)
+
+    def set_wifi_password(self, password: str, radio: str | None = None) -> bool:
+        return self._write_wifi(radio, "key", password)
 
     def mesh_status(self) -> dict[str, Any]:
         response = self._session_get("/cgi-bin/luci/admin/network/wireless")
         return {"online": response.status < 400, "source": "cudy-luci"}
+
+
+class _TendaModuleError(AdapterError):
+    """The router answered, but refused the requested module (errCode)."""
+
+
+def _json_object(result: Any, what: str) -> dict[str, Any]:
+    try:
+        data = result.json()
+    except HttpError as exc:
+        raise AdapterError(f"{what} returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise ProtocolMismatch(f"{what} returned JSON that is not an object: {result.text[:80]!r}")
+    return data
+
+
+def _block(data: dict[str, Any], key: str) -> dict[str, Any]:
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
 
 
 class TendaAdapter(RouterAdapter):
@@ -354,12 +672,10 @@ class TendaAdapter(RouterAdapter):
         )
         if result.status >= 400:
             raise AdapterError(f"Tenda login returned HTTP {result.status}")
-        try:
-            data = result.json()
-        except HttpError as exc:
-            raise AdapterError("Tenda login returned invalid JSON") from exc
-        if not data.get("sysLogin", {}).get("Login"):
-            detail = data.get("sysLogin", {}).get("errMsg") or data.get("errMsg") or ""
+        data = _json_object(result, "Tenda login")
+        login = _block(data, "sysLogin")
+        if not login.get("Login"):
+            detail = login.get("errMsg") or data.get("errMsg") or ""
             raise AuthenticationRejected(
                 f"Tenda rejected the credentials{' (' + str(detail) + ')' if detail else ''}",
                 response=result,
@@ -373,21 +689,24 @@ class TendaAdapter(RouterAdapter):
         if not self.cookie:
             self.login()
         result = self._post(f"/goform/modules?{int(time.time() * 1000)}", payload)
-        if result.status >= 400:
-            raise AdapterError(f"Tenda request returned HTTP {result.status}")
+        if not 200 <= result.status < 300:
+            # HttpSession does not follow redirects, so a 3xx (typically to the login
+            # page) carries no module reply; accepting it reported reboots and SSID
+            # changes the router never made.
+            location = result.headers.get("Location", "")
+            raise AdapterError(f"Tenda request returned HTTP {result.status}{' to ' + location if location else ''}")
         if not result.body.strip():
             return {}
-        try:
-            data = result.json()
-        except HttpError as exc:
-            raise AdapterError("Tenda returned invalid JSON") from exc
-        if data.get("errCode") == "logout" and retry:
+        data = _json_object(result, "Tenda request")
+        if data.get("errCode") == "logout":
+            if not retry:
+                raise AdapterError("Tenda ended the session again straight after a fresh login")
             self.cookie = ""
             self.login()
             return self.request(payload, retry=False)
         error = data.get("errCode")
         if error not in (None, "", 0, "0", False):
-            raise AdapterError(f"Tenda module error {error}")
+            raise _TendaModuleError(f"Tenda module error {error}")
         return data
 
     def identity(self) -> dict[str, Any]:
@@ -405,9 +724,12 @@ class TendaAdapter(RouterAdapter):
 
     def status(self) -> dict[str, Any]:
         data = self.request({"sysStatus": {}, "lanStatus": {}, "wifiClientNum": {}})
-        system = data.get("sysStatus") or {}
-        lan = data.get("lanStatus") or {}
-        clients = data.get("wifiClientNum") or {}
+        system = data.get("sysStatus")
+        if not isinstance(system, dict):
+            # An empty or unrelated reply is not a healthy router with blank fields.
+            raise ProtocolMismatch(f"Tenda status reply carried no sysStatus module; reply began: {str(data)[:120]!r}")
+        lan = _block(data, "lanStatus")
+        clients = _block(data, "wifiClientNum")
         return {
             "online": True,
             "hostname": system.get("deviceName", ""),
@@ -424,14 +746,23 @@ class TendaAdapter(RouterAdapter):
 
     def clients(self) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
+        refused: _TendaModuleError | None = None
+        answered = False
         for radio in ("2.4G", "5G"):
             try:
                 data = self.request({"wifiClientList": {"radio": radio, "ssidIndex": ""}})
-            except AdapterError:
+            except _TendaModuleError as exc:
+                # A single-band model refuses the other radio's module. A rejected
+                # login or a router that did not answer is not about the radio, and
+                # swallowing it showed a wrong password or an offline router as idle.
+                refused = exc
                 continue
+            answered = True
             values = data.get("wifiClientList") or []
             if isinstance(values, list):
                 result.extend({"radio": radio, **item} for item in values if isinstance(item, dict))
+        if not answered and refused is not None:
+            raise refused
         return result
 
     def set_ssid(self, ssid: str, radio: str | None = None) -> bool:
@@ -453,6 +784,14 @@ class TendaAdapter(RouterAdapter):
         self.request({"wifiBasicSetIndoor": payload})
         return True
 
+
+    def set_wifi_password(self, password: str, radio: str | None = None) -> bool:
+        # The security fields of this module API are not evidenced anywhere; a guessed
+        # payload can reset the SSID to open rather than failing.
+        raise UnsupportedOperation(
+            "Tenda Wi-Fi password changes are not supported yet: the security module has not been captured "
+            "from real firmware"
+        )
     def reboot(self) -> bool:
         self.request({"sysReboot": {}})
         return True
@@ -503,6 +842,15 @@ class TpLinkAdapter(RouterAdapter):
     Everything after login is a plain page fetch using that cookie.
     """
 
+    def set_wifi_password(self, password: str, radio: str | None = None) -> bool:
+        # Excluded for the same reason as SSID changes: the security page is only
+        # community-described, sends the key in a plain-HTTP query string, and a
+        # write missing a field can leave the network open.
+        raise UnsupportedOperation(
+            "TP-Link Wi-Fi password changes are not supported on the 11N web UI until its security form has "
+            "been captured from real hardware"
+        )
+
     def __init__(self, device: Device, password: str):
         super().__init__(device, password)
         scheme = "https" if device.https else "http"
@@ -541,9 +889,18 @@ class TpLinkAdapter(RouterAdapter):
                 f"TP-Link login rejected and the web UI is now locked after {attempts} failed attempts; "
                 f"it stays locked for about {_TPLINK_LOCKOUT_SECONDS // 3600} hours"
             )
-        elif attempts:
+            # While locked the router refuses the right password too, so this must not
+            # read as a wrong one.
+            return RouterLockedOut(message)
+        if attempts:
             message = f"TP-Link login rejected ({attempts} of {_TPLINK_MAX_ATTEMPTS} attempts used before lockout)"
         return AuthenticationRejected(message)
+
+    @staticmethod
+    def _unexpected(status: int, path: str) -> AdapterError:
+        if status == 404:
+            return ProtocolMismatch(f"TP-Link {path} returned HTTP 404; not the 11N web UI, or the wrong port")
+        return AdapterError(f"TP-Link {path} returned HTTP {status}")
 
     def _login_state(self) -> str:
         """Read the router's authTimes counter.
@@ -567,10 +924,16 @@ class TpLinkAdapter(RouterAdapter):
         # Confirm the cookie works. This is the only request that presents
         # credentials, so a wrong password costs a single one of the router's ten.
         response = self._get(_TPLINK_STATUS_PATH)
-        if response.status == 403 or self._auth_times(response.text) > 0:
+        # 401 is refused like 403: counting it as a login would have the manager
+        # present the same credential on every poll, and each one may count
+        # toward the lockout.
+        if response.status in {401, 403} or self._auth_times(response.text) > 0:
             self.authenticated = False
             self.auth_cookie = ""
             raise self._rejection(self._login_state())
+        if not 200 <= response.status < 300:
+            self.auth_cookie = ""
+            raise self._unexpected(response.status, _TPLINK_STATUS_PATH)
         self.authenticated = True
         return True
 
@@ -578,10 +941,13 @@ class TpLinkAdapter(RouterAdapter):
         if not self.authenticated:
             self.login()
         response = self._get(path)
-        if response.status == 403:
+        if response.status in {401, 403} or self._auth_times(response.text) > 0:
             # The session expired, or the cookie was never accepted.
             self.authenticated = False
-            raise self._rejection("TP-Link session was refused")
+            raise self._rejection(response.text)
+        if not 200 <= response.status < 300:
+            # An error page parsed as a host table reads as "no clients".
+            raise self._unexpected(response.status, path)
         return response
 
     def status(self) -> dict[str, Any]:

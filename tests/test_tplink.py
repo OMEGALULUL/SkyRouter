@@ -13,9 +13,11 @@ instead of returning an empty but successful result.
 import contextlib
 from pathlib import Path
 
+import pytest
 from fake_router import FakeTpLink
 from test_manager import build_manager
 
+from cudy_manager import adapters
 from cudy_manager.adapters import (
     AdapterError,
     AuthenticationRejected,
@@ -23,6 +25,7 @@ from cudy_manager.adapters import (
     TpLinkAdapter,
     _tplink_clients,
 )
+from cudy_manager.http_client import HttpResponse
 from cudy_manager.models import Device
 
 
@@ -103,6 +106,107 @@ class TestTpLinkAuth:
                 pass
             except AdapterError as exc:
                 raise AssertionError(f"expected an auth rejection, got {exc}") from exc
+
+
+class _ScriptedSession:
+    """Answers each path with a fixed status and body, and records what was asked."""
+
+    def __init__(self, pages: dict[str, tuple[int, str]]):
+        self.pages = pages
+        self.requests: list[tuple[str, str, str]] = []
+
+    def request(self, method, path, data=None, headers=None, follow_redirects=False):
+        self.requests.append((method, path, (headers or {}).get("Cookie", "")))
+        status, body = self.pages.get(path, (404, "<html>not found</html>"))
+        return HttpResponse(status=status, headers={}, body=body.encode(), url="http://127.0.0.1/")
+
+    @property
+    def credentialed(self) -> int:
+        return sum(1 for _method, _path, cookie in self.requests if cookie)
+
+
+def scripted(monkeypatch, pages: dict[str, tuple[int, str]]) -> _ScriptedSession:
+    session = _ScriptedSession({"/": (200, "<script>var authTimes=0;</script>"), **pages})
+    monkeypatch.setattr(adapters, "HttpSession", lambda *a, **k: session)
+    return session
+
+
+class TestTpLinkUnexpectedStatus:
+    """Only a 2xx confirms the credential; every other answer must not count as logged in."""
+
+    def test_a_401_is_a_rejection(self, monkeypatch):
+        session = scripted(monkeypatch, {"/userRpm/StatusRpm.htm": (401, "<html>401</html>")})
+        adapter = TpLinkAdapter(device_for(80), "wrong")
+        with pytest.raises(AuthenticationRejected):
+            adapter.login()
+        assert adapter.authenticated is False
+        assert session.credentialed == 1
+
+    @pytest.mark.parametrize(
+        "status,expected",
+        [(404, ProtocolMismatch), (500, AdapterError), (302, AdapterError)],
+    )
+    def test_other_answers_are_errors_not_a_login(self, monkeypatch, status, expected):
+        scripted(monkeypatch, {"/userRpm/StatusRpm.htm": (status, "<html>error</html>")})
+        adapter = TpLinkAdapter(device_for(80), "admin")
+        with pytest.raises(expected, match=str(status)) as caught:
+            adapter.login()
+        assert not isinstance(caught.value, AuthenticationRejected)
+        assert adapter.authenticated is False
+
+    def test_a_failed_client_table_is_not_an_empty_one(self, monkeypatch):
+        from fake_router import TP_LINK_STATUS_PAGE
+
+        scripted(
+            monkeypatch,
+            {
+                "/userRpm/StatusRpm.htm": (200, TP_LINK_STATUS_PAGE.decode()),
+                "/userRpm/DhcpTableRpm.htm": (500, "<html>error</html>"),
+            },
+        )
+        with pytest.raises(AdapterError, match="500"):
+            TpLinkAdapter(device_for(80), "admin").clients()
+
+    def test_a_login_page_in_place_of_the_client_table_is_a_rejection(self, monkeypatch):
+        from fake_router import TP_LINK_STATUS_PAGE
+
+        scripted(
+            monkeypatch,
+            {
+                "/userRpm/StatusRpm.htm": (200, TP_LINK_STATUS_PAGE.decode()),
+                "/userRpm/DhcpTableRpm.htm": (200, "<script>var authTimes=3;</script>"),
+            },
+        )
+        with pytest.raises(AuthenticationRejected):
+            TpLinkAdapter(device_for(80), "admin").clients()
+
+    def test_verify_reports_a_401_as_rejected_and_stops_trying(self, monkeypatch, tmp_path: Path):
+        session = scripted(monkeypatch, {"/userRpm/StatusRpm.htm": (401, "<html>401</html>")})
+        manager = build_manager(tmp_path)
+        manager.add_device("r1", "127.0.0.1", "tplink", password="wrong")
+        assert manager.verify_credentials("r1")["reason"] == "rejected"
+        assert manager.get_status("r1")["reason"] == "credentials_rejected"
+        assert session.credentialed == 1
+
+
+class TestTpLinkLockout:
+    def test_a_locked_router_is_reported_as_locked_even_with_the_right_password(self):
+        from cudy_manager.adapters import RouterLockedOut
+
+        with FakeTpLink(password="admin", max_attempts=10) as router:
+            for _ in range(10):
+                with contextlib.suppress(AuthenticationRejected):
+                    TpLinkAdapter(device_for(router.port), "wrong").login()
+            with pytest.raises(RouterLockedOut, match="locked"):
+                TpLinkAdapter(device_for(router.port), "admin").login()
+
+    def test_a_wrong_password_before_the_threshold_is_not_a_lockout(self):
+        from cudy_manager.adapters import RouterLockedOut
+
+        with FakeTpLink(password="admin", max_attempts=10) as router:
+            with pytest.raises(AuthenticationRejected) as caught:
+                TpLinkAdapter(device_for(router.port), "wrong").login()
+            assert not isinstance(caught.value, RouterLockedOut)
 
 
 class TestTpLinkStatus:
@@ -209,3 +313,132 @@ class TestTpLinkPlumbing:
             result = manager.verify_credentials("r1")
             assert result["ok"] is False
             assert result["reason"] == "rejected"
+
+
+class TestRejectedCredentialIsNotResent:
+    """The dashboard polls every 30 seconds and the WR840N locks after ten failures.
+
+    Before this latch, a wrong username or password cost one of the router's ten
+    attempts per poll, locking its web UI for two hours within about five minutes.
+    """
+
+    def add(self, manager, router, password: str = "wrong", username: str = "admin"):
+        return manager.add_device(
+            "r1", "127.0.0.1", "tplink", password=password, http_port=router.port, username=username
+        )
+
+    def test_repeated_polling_costs_one_attempt(self, tmp_path: Path):
+        with FakeTpLink(password="admin") as router:
+            manager = build_manager(tmp_path)
+            self.add(manager, router)
+            for _ in range(12):
+                status = manager.get_status("r1")
+            assert router.attempts == 1
+            assert status["online"] is None
+            assert status["reason"] == "credentials_rejected"
+            for _ in range(5):
+                manager.get_all_statuses()
+            assert router.attempts == 1
+
+    def test_actions_are_refused_without_contacting_the_router(self, tmp_path: Path):
+        import pytest
+
+        with FakeTpLink(password="admin") as router:
+            manager = build_manager(tmp_path)
+            self.add(manager, router)
+            manager.get_status("r1")
+            for action in (
+                lambda: manager.reboot_device("r1"),
+                lambda: manager.get_connected_clients("r1"),
+                lambda: manager.set_wifi_ssid("r1", "home"),
+            ):
+                with pytest.raises(AuthenticationRejected, match="already rejected"):
+                    action()
+            assert router.attempts == 1
+            assert router.reboots == 0
+
+    def test_correcting_the_password_releases_it(self, tmp_path: Path):
+        with FakeTpLink(password="admin") as router:
+            manager = build_manager(tmp_path)
+            self.add(manager, router)
+            manager.get_status("r1")
+            manager.set_password("r1", "admin", verify=False)
+            assert manager.get_status("r1")["online"] is True
+            assert router.attempts == 1
+
+    def test_correcting_the_username_releases_it(self, tmp_path: Path):
+        with FakeTpLink(password="admin") as router:
+            manager = build_manager(tmp_path)
+            self.add(manager, router, password="admin", username="root")
+            manager.get_status("r1")
+            manager.update_device("r1", username="admin")
+            assert manager.get_status("r1")["online"] is True
+            assert router.attempts == 1
+
+    def test_a_password_rotated_by_another_process_releases_it(self, tmp_path: Path):
+        """The CLI's set-password runs in its own process; the server must notice."""
+        with FakeTpLink(password="admin") as router:
+            server = build_manager(tmp_path)
+            self.add(server, router)
+            server.get_status("r1")
+            build_manager(tmp_path).set_password("r1", "admin", verify=False)
+            server._load_config()
+            assert server.get_status("r1")["online"] is True
+
+    def test_an_explicit_verify_still_tries_once(self, tmp_path: Path):
+        """Re-testing is an operator decision, so it may spend exactly one attempt."""
+        with FakeTpLink(password="admin") as router:
+            manager = build_manager(tmp_path)
+            self.add(manager, router)
+            manager.get_status("r1")
+            assert manager.verify_credentials("r1")["reason"] == "rejected"
+            assert router.attempts == 2
+            manager.get_status("r1")
+            assert router.attempts == 2
+
+    def test_the_scheduler_skips_without_trying(self, tmp_path: Path):
+        from datetime import UTC, datetime
+
+        from cudy_manager.scheduler import RebootScheduler
+
+        with FakeTpLink(password="admin") as router:
+            manager = build_manager(tmp_path)
+            self.add(manager, router)
+            manager.update_device("r1", reboot={"enabled": True, "at": "04:00", "timezone": "UTC"})
+            manager.get_status("r1")
+            scheduler = RebootScheduler(manager, tmp_path / "state.json")
+            for minute in range(1, 6):
+                results = scheduler.run_once(datetime(2026, 3, 10, 4, minute, tzinfo=UTC))
+                assert results[0]["reason"] == "router rejected the stored credentials"
+            assert router.attempts == 1
+            assert router.reboots == 0
+
+
+class TestLatchEdgesFoundInReview:
+    def add(self, manager, router, password: str = "wrong"):
+        return manager.add_device(
+            "r1", "127.0.0.1", "tplink", password=password, http_port=router.port, username="admin"
+        )
+
+    def test_an_edit_that_leaves_the_credential_alone_keeps_the_latch(self, tmp_path: Path):
+        with FakeTpLink(password="admin") as router:
+            manager = build_manager(tmp_path)
+            self.add(manager, router)
+            manager.get_status("r1")
+            manager.update_device("r1", model="TL-WR840N")
+            manager.get_status("r1")
+            assert router.attempts == 1
+
+    def test_a_locked_router_is_reported_as_locked_not_as_a_wrong_password(self, tmp_path: Path):
+        """While locked, the router refuses the right password too."""
+        with FakeTpLink(password="admin") as router:
+            manager = build_manager(tmp_path)
+            self.add(manager, router)
+            for _ in range(10):
+                manager.verify_credentials("r1")
+            assert router.attempts == 10
+            manager.set_password("r1", "admin", verify=False)
+            checked = manager.verify_credentials("r1")
+            assert checked["reason"] == "locked", checked
+            manager.get_status("r1")
+            assert manager.rejected_credential(manager.get_device("r1")) is not None

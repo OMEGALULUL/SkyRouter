@@ -1,3 +1,4 @@
+import http.client
 import http.cookiejar
 import json
 import ssl
@@ -18,6 +19,10 @@ class HttpResponse:
     headers: dict[str, str]
     body: bytes
     url: str
+    # GenieACS reports some outcomes only in the status line ("Task faulted", or a
+    # connection-request failure such as "Device is offline"), so the status code
+    # alone cannot tell them apart.
+    reason: str = ""
 
     @property
     def charset(self) -> str:
@@ -56,7 +61,11 @@ class HttpSession:
         if not verify_tls:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
+        # build_opener otherwise installs a ProxyHandler that honours http(s)_proxy, and
+        # nothing bypasses LAN addresses without no_proxy, so router passwords would go
+        # to whatever proxy the service happens to inherit.
         self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
             urllib.request.HTTPCookieProcessor(self.cookie_jar),
             _NoRedirect(),
             urllib.request.HTTPSHandler(context=context),
@@ -81,6 +90,7 @@ class HttpSession:
         data: bytes | None = None,
         headers: dict[str, str] | None = None,
         follow_redirects: bool = False,
+        timeout: float | None = None,
     ) -> HttpResponse:
         request_headers = {
             "Connection": "close",
@@ -89,31 +99,43 @@ class HttpSession:
         }
         if headers:
             request_headers.update(headers)
-        request = urllib.request.Request(  # noqa: S310
-            self._validated(path),
-            data=data,
-            headers=request_headers,
-            method=method.upper(),
-        )
+        # urllib wraps only socket errors raised while sending. A garbled status line, a
+        # short body or a URL/Location it cannot parse comes out raw, and callers only
+        # handle HttpError.
         try:
-            with self.opener.open(request, timeout=self.timeout) as response:  # noqa: S310
-                result = HttpResponse(
+            result = self._send(
+                urllib.request.Request(  # noqa: S310
+                    self._validated(path),
+                    data=data,
+                    headers=request_headers,
+                    method=method.upper(),
+                ),
+                self.timeout if timeout is None else timeout,
+            )
+            location = result.headers.get("Location")
+            if follow_redirects and location and result.status in {301, 302, 303, 307, 308}:
+                return self.request(
+                    "GET", urllib.parse.urljoin(result.url, location), follow_redirects=False, timeout=timeout
+                )
+            return result
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise HttpError(f"router request failed: {exc}") from exc
+
+    def _send(self, request: urllib.request.Request, timeout: float) -> HttpResponse:
+        try:
+            with self.opener.open(request, timeout=timeout) as response:  # noqa: S310
+                return HttpResponse(
                     status=response.status,
                     headers={key.title(): value for key, value in response.headers.items()},
                     body=response.read(),
                     url=response.geturl(),
+                    reason=response.reason or "",
                 )
         except urllib.error.HTTPError as exc:
-            result = HttpResponse(
+            return HttpResponse(
                 status=exc.code,
                 headers={key.title(): value for key, value in (exc.headers or {}).items()},
                 body=exc.read(),
                 url=exc.geturl(),
+                reason=str(exc.reason or ""),
             )
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise HttpError(f"router request failed: {exc}") from exc
-        if follow_redirects and result.status in {301, 302, 303, 307, 308}:
-            location = result.headers.get("Location")
-            if location:
-                return self.request("GET", urllib.parse.urljoin(result.url, location), follow_redirects=False)
-        return result

@@ -9,7 +9,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -129,6 +128,7 @@ class TestRealProcessSeparation:
             [sys.executable, "-c", _LONG_RUNNING_SCRIPT.format(config=tmp_path / "d.yaml", data=tmp_path / "data")],
             cwd=PROJECT,
             env={**os.environ, "PYTHONPATH": str(PROJECT)},
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
         )
@@ -143,23 +143,25 @@ class TestRealProcessSeparation:
                 "print('added')\n",
             )
             assert "added" in result.stdout, result.stderr
-            time.sleep(1.5)
-            server.terminate()
-            server.wait(timeout=30)
+            # A handshake rather than a timer: the stale write must both happen and
+            # come after the CLI's add, or this test proves nothing.
+            remaining, _ = server.communicate("go\n", timeout=60)
         finally:
             if server.poll() is None:
                 server.kill()
+                server.wait()
+        assert server.returncode == 0 and remaining.strip() == "wrote", "the server never made its stale write"
         devices = sorted(yaml.safe_load((tmp_path / "d.yaml").read_text())["devices"])
         assert devices == ["from-cli", "r1"], f"server clobbered the CLI device: {devices}"
 
 
 _LONG_RUNNING_SCRIPT = """
-import time
+import sys
 from cudy_manager.manager import DeviceManager, ManagerError
 m = DeviceManager(config_path="{config}", data_dir="{data}")
 m.add_device("r1", "192.168.1.1", "cudy", password="one")
 print("ready", flush=True)
-time.sleep(6)
+sys.stdin.readline()
 m.update_device("r1", password="rotated")
 print("wrote", flush=True)
 """

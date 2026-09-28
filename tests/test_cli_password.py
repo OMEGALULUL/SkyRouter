@@ -100,6 +100,30 @@ class TestSetPasswordCommand:
         assert "ROUTER_MANAGER_DEVICE_PASSWORD" in capsys.readouterr().err
         assert stored_password(config, data) == "old"
 
+    @pytest.mark.parametrize("value", ["0", "false", "no", ""])
+    def test_opt_out_values_still_prompt(self, env, monkeypatch, value):
+        # A leftover DEVICE_PASSWORD must not be stored just because ASSUME_YES
+        # is exported with a value that reads as "no".
+        config, data = env
+        add_device(config, data)
+        monkeypatch.setenv("ROUTER_MANAGER_ASSUME_YES", value)
+        monkeypatch.setenv("ROUTER_MANAGER_DEVICE_PASSWORD", "stale-env-password")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+        monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": PASSWORD)
+
+        assert cli.main(["set-password", "r1", "--no-verify"]) == 0
+        assert stored_password(config, data) == PASSWORD
+
+    def test_device_can_be_named_by_host(self, env, monkeypatch, capsys):
+        config, data = env
+        add_device(config, data)
+        monkeypatch.setenv("ROUTER_MANAGER_DEVICE_PASSWORD", PASSWORD)
+        monkeypatch.setenv("ROUTER_MANAGER_ASSUME_YES", "1")
+
+        assert cli.main(["set-password", "192.168.1.1", "--no-verify"]) == 0
+        assert json.loads(capsys.readouterr().out)["device"] == "r1"
+        assert stored_password(config, data) == PASSWORD
+
     def test_opt_in_never_reuses_the_web_login_password(self, env, monkeypatch):
         config, data = env
         add_device(config, data)
