@@ -1,4 +1,5 @@
 import base64
+import difflib
 import hashlib
 import html
 import json
@@ -65,6 +66,22 @@ class RouterAdapter(ABC):
 
     def mesh_status(self) -> dict[str, Any]:
         raise UnsupportedOperation("mesh status is not supported by this adapter")
+
+    def firmware_info(self) -> dict[str, Any]:
+        """``{"version", "hardware", "auto_update", "source"}``.
+
+        ``auto_update`` is None where the router has no automatic update this adapter
+        can read, else ``{"enabled", "window_start_hour", "window"}`` (a 2-hour window
+        such as "03:00-05:00"; the hour and window are None when none is set).
+        """
+        raise UnsupportedOperation("firmware information is not supported by this adapter")
+
+    def set_auto_update(self, enabled: bool, window_start_hour: int | None = None) -> bool:
+        raise UnsupportedOperation("firmware auto-update settings are not supported by this adapter")
+
+    def check_firmware_update(self, timeout: float = 60) -> dict[str, Any]:
+        """``{"available": bool | None, "current", "latest", "note"}``; a check installs nothing."""
+        raise UnsupportedOperation("firmware update checks are not supported by this adapter")
 
 
 class _FormParser(HTMLParser):
@@ -274,6 +291,10 @@ class _CbiForm(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.action = ""
         self.fields: list[tuple[str, str]] = []
+        # Per select: its option values, and the one marked selected (None when none
+        # is: the browser then sends the first, which is not a value the router holds).
+        self.options: dict[str, list[str]] = {}
+        self.selected: dict[str, str | None] = {}
         self._in_form = False
         self._done = False
         self._select: dict[str, Any] | None = None
@@ -301,9 +322,10 @@ class _CbiForm(HTMLParser):
                 return
             self.fields.append((name, values.get("value", "")))
         elif tag == "select" and name:
-            self._select = {"name": name, "first": None, "chosen": None}
+            self._select = {"name": name, "first": None, "chosen": None, "values": []}
         elif tag == "option" and self._select is not None:
             value = values.get("value", "")
+            self._select["values"].append(value)
             if self._select["first"] is None:
                 self._select["first"] = value
             if "selected" in values:
@@ -320,6 +342,8 @@ class _CbiForm(HTMLParser):
             chosen = self._select["chosen"] if self._select["chosen"] is not None else self._select["first"]
             if chosen is not None:
                 self.fields.append((self._select["name"], chosen))
+            self.options[self._select["name"]] = self._select["values"]
+            self.selected[self._select["name"]] = self._select["chosen"]
             self._select = None
         elif tag == "textarea" and self._textarea is not None:
             self.fields.append((self._textarea_name, "".join(self._textarea)))
@@ -342,7 +366,7 @@ def _cbi_submission(text: str, changes: dict[str, str]) -> tuple[str, list[tuple
     form.feed(text)
     missing = [name for name in changes if name not in {field for field, _ in form.fields}]
     if missing:
-        raise ProtocolMismatch(f"Cudy Wi-Fi form has no field {missing[0]}; this firmware uses a different page")
+        raise ProtocolMismatch(f"Cudy form has no field {missing[0]}; this firmware uses a different page")
     fields = [(name, changes.get(name, value)) for name, value in form.fields]
     rules: dict[str, list[dict[str, str]]] = {}
     for target, raw in _CBI_DEPENDENCY.findall(text):
@@ -359,6 +383,173 @@ def _cbi_submission(text: str, changes: dict[str, str]) -> tuple[str, list[tuple
             continue
         kept.append((name, value))
     return form.action, kept
+
+
+# The Auto Update page of a real AP1300 (2.5.25) and the requests its own script
+# makes to check for new firmware.
+_CUDY_AUTOUPGRADE_PAGE = "/cgi-bin/luci/admin/system/autoupgrade?nomodal="
+_CUDY_UPDATE_CHECK = "/cgi-bin/luci/admin/system/autoupgrade/updatecheck"
+_CUDY_CHECK_STATUS = "/cgi-bin/luci/admin/system/autoupgrade/checkstatus/000000000000"
+_CUDY_CHECK_RESULT = "/cgi-bin/luci/admin/system/autoupgrade?updatecheck=&nomodal="
+_CUDY_CHECK_POLL = 1.0
+_CUDY_AUTO_UPGRADE = "cbid.upgrade.1.auto_upgrade"
+_CUDY_UPGRADE_TIME = "cbid.upgrade.1.upgrade_time"
+# Every label on the page: a value that is another label means the value was empty.
+_CUDY_FIRMWARE_LABELS = {
+    "auto update", "current time", "update time", "firmware version", "hardware", "firmware file path",
+}
+# Three dotted numbers, so neither the hardware revision ("V1.1") nor an IP address
+# reads as a firmware version.
+_FIRMWARE_VERSION = re.compile(r"(?<![\w.])[vV]?(\d+\.\d+\.\d+(?:-\w+)*)(?!\w|\.\d)")
+_NEWER_WORDS = re.compile(r"\b(?:new|newer|newest|latest|available)\b", re.IGNORECASE)
+_AVAILABLE_AFTER = re.compile(r"\s*(?:is\s+)?(?:now\s+)?available\b", re.IGNORECASE)
+_LATEST_WORDS = re.compile(r"\b(?:latest|newest)\b", re.IGNORECASE)
+_UP_TO_DATE = re.compile(
+    r"\balready\s+(?:running\s+|on\s+)?(?:the\s+)?(?:latest|newest|up[\s-]to[\s-]date)"
+    r"|\bup[\s-]to[\s-]date\b"
+    r"|\bno\s+(?:new|newer)\s+(?:firmware|version|update)"
+    r"|\bno\s+(?:firmware\s+)?updates?\s+(?:is\s+|are\s+)?(?:available|found)",
+    re.IGNORECASE,
+)
+
+
+class _PageText(HTMLParser):
+    """The text a browser shows, one entry per text node; scripts and styles are left out."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.chunks: list[str] = []
+        self._hidden = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style"}:
+            self._hidden += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self._hidden:
+            self._hidden -= 1
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.split())
+        if text and not self._hidden:
+            self.chunks.append(text)
+
+
+def _page_text(text: str) -> list[str]:
+    parser = _PageText()
+    parser.feed(text)
+    return parser.chunks
+
+
+def _static_after(chunks: list[str], label: str) -> str:
+    """The static text shown after ``label``, as a CBI page shows a read-only value.
+
+    Labels and values may each be doubled (a desktop and a mobile copy), so repeats
+    of the label are skipped; whole-chunk matching keeps a "Firmware" menu link from
+    passing for the "Firmware Version" label.
+    """
+    want = label.lower()
+    for index, chunk in enumerate(chunks):
+        text = chunk.lower()
+        if text.rstrip(": ") == want:
+            for following in chunks[index + 1 :]:
+                bare = following.lower().rstrip(": ")
+                if bare == want:
+                    continue
+                return "" if bare in _CUDY_FIRMWARE_LABELS else following
+            return ""
+        if text.startswith(want + ":"):
+            return chunk[len(label) + 1 :].strip()
+    return ""
+
+
+def _cudy_firmware_details(text: str) -> tuple[str, str]:
+    chunks = _page_text(text)
+    version = re.match(r"v?\d[\w.-]*", _static_after(chunks, "firmware version"), re.IGNORECASE)
+    return (version.group(0) if version else ""), _static_after(chunks, "hardware")
+
+
+def _update_window(hour: int) -> str:
+    return f"{hour:02d}:00-{(hour + 2) % 24:02d}:00"
+
+
+def _window_hour(value: str | None) -> int | None:
+    if value is None or not value.isdigit() or not 0 <= int(value) <= 23:
+        return None
+    return int(value)
+
+
+def _cudy_auto_update(form: "_CbiForm") -> dict[str, Any] | None:
+    switch = dict(form.fields).get(_CUDY_AUTO_UPGRADE)
+    if switch not in {"0", "1"}:
+        return None
+    # The window stays in the page while auto-update is off (only hidden), so it is
+    # the one the router will use when it is turned back on.
+    hour = _window_hour(form.selected.get(_CUDY_UPGRADE_TIME))
+    return {
+        "enabled": switch == "1",
+        "window_start_hour": hour,
+        "window": _update_window(hour) if hour is not None else None,
+    }
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(number) for number in re.findall(r"\d+", version))
+
+
+def _cudy_update_result(before: str, after: str, current: str) -> dict[str, Any]:
+    """What the router's update check says, read only from what it added to the page.
+
+    The result page's markup has not been seen on real hardware. The page before the
+    check is the same page without the result, so only the text the check changed
+    is read: the page's own labels, help text and current version cannot be taken
+    for an answer. A newer version must be named beside a word such as "new" or
+    "latest"; anything less, or an answer that contradicts itself, is not a result.
+    """
+    old, new = _page_text(before), _page_text(after)
+    newer: list[str] = []
+    said_current = named_current = False
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    for tag, _, _, start, end in matcher.get_opcodes():
+        if tag not in {"insert", "replace"}:
+            continue
+        # The two chunks before the change are its context: a label the page already
+        # had ("Latest Version") may be the one a filled-in value belongs to.
+        lead = " ".join(new[max(0, start - 2) : start])
+        block = " ".join(new[start:end])
+        if _UP_TO_DATE.search(block):
+            said_current = True
+        text = f"{lead} {block}"
+        previous_end = 0
+        for match in _FIRMWARE_VERSION.finditer(text):
+            context = text[max(previous_end, match.start() - 60) : match.start()]
+            previous_end = match.end()
+            if match.start() <= len(lead):
+                continue
+            version = match.group(1)
+            if current and _version_key(version) > _version_key(current):
+                if _NEWER_WORDS.search(context) or _AVAILABLE_AFTER.match(text, match.end()):
+                    newer.append(version)
+            elif current and _version_key(version) == _version_key(current) and _LATEST_WORDS.search(context):
+                said_current = named_current = True
+    result: dict[str, Any] = {"available": None, "current": current, "latest": None}
+    if newer and not said_current:
+        latest = max(newer, key=_version_key)
+        result.update(available=True, latest=latest)
+        result["note"] = f"the router reports firmware {latest} is available; nothing was installed"
+    elif said_current and not newer:
+        result.update(available=False, latest=current if named_current else None)
+        result["note"] = "the router reports it already runs the latest firmware"
+    elif newer:
+        result["note"] = (
+            "result not recognised: the router's answer both names a newer version and says the firmware is current"
+        )
+    else:
+        result["note"] = (
+            "result not recognised: the router finished its update check, but the result page did not say "
+            "whether newer firmware exists"
+        )
+    return result
 
 
 def derive_cudy_password(password: str, salt: str, token: str = "") -> str:
@@ -613,6 +804,123 @@ class CudyAdapter(RouterAdapter):
         response = self._session_get("/cgi-bin/luci/admin/network/wireless")
         return {"online": response.status < 400, "source": "cudy-luci"}
 
+    def _autoupgrade_page(self) -> str | None:
+        response = self._session_get(_CUDY_AUTOUPGRADE_PAGE, missing_ok=True)
+        return None if response.status == 404 else response.text
+
+    def _require_autoupgrade_page(self) -> str:
+        text = self._autoupgrade_page()
+        if text is None:
+            raise UnsupportedOperation("this Cudy firmware has no Auto Update page (HTTP 404)")
+        return text
+
+    def _running_version(self, text: str | None) -> tuple[str, str]:
+        version, hardware = _cudy_firmware_details(text) if text is not None else ("", "")
+        if not version:
+            # Older pages without the Auto Update page still name it on the status page.
+            version = str(self.status().get("firmware", ""))
+        return version, hardware
+
+    def firmware_info(self) -> dict[str, Any]:
+        text = self._autoupgrade_page()
+        version, hardware = self._running_version(text)
+        form = _CbiForm()
+        form.feed(text or "")
+        return {"version": version, "hardware": hardware, "auto_update": _cudy_auto_update(form), "source": "cudy-luci"}
+
+    def set_auto_update(self, enabled: bool, window_start_hour: int | None = None) -> bool:
+        """Switch the router's own automatic firmware update, as its Auto Update page's Save & Apply does.
+
+        The window is the page's 2-hour Update Time slot, named by its start hour. The
+        page's dependency rule sends it only while auto-update is on, so one cannot be
+        set while turning it off. The file field (manual upload) is never sent.
+        """
+        if not isinstance(enabled, bool):
+            raise AdapterError("auto-update must be turned on or off (true or false)")
+        if window_start_hour is not None and (
+            isinstance(window_start_hour, bool)
+            or not isinstance(window_start_hour, int)
+            or not 0 <= window_start_hour <= 23
+        ):
+            raise AdapterError("the update window's start hour must be a whole hour from 0 to 23")
+        if not enabled and window_start_hour is not None:
+            raise AdapterError("an update window can only be set while turning auto-update on")
+        text = self._require_autoupgrade_page()
+        form = _CbiForm()
+        form.feed(text)
+        if _cudy_auto_update(form) is None:
+            raise ProtocolMismatch("the Cudy Auto Update page has no Auto Update switch; this firmware differs")
+        changes = {_CUDY_AUTO_UPGRADE: "1" if enabled else "0", "timeclock": str(int(time.time()))}
+        hour = window_start_hour
+        if enabled:
+            if hour is None:
+                hour = _window_hour(form.selected.get(_CUDY_UPGRADE_TIME))
+                if hour is None:
+                    # The browser would send the list's first slot (00:00), which nobody chose.
+                    raise AdapterError("the router has no update window set; choose a start hour (0-23) to turn it on")
+            if str(hour) not in form.options.get(_CUDY_UPGRADE_TIME, []):
+                raise ProtocolMismatch(f"the router's Update Time list has no window starting at {hour:02d}:00")
+            changes[_CUDY_UPGRADE_TIME] = str(hour)
+        action, submission = _cbi_submission(text, changes)
+        if not action.startswith("/cgi-bin/luci/"):
+            action = _CUDY_AUTOUPGRADE_PAGE
+        submission.append(("cbi.apply", ""))
+        try:
+            reply = self.http.request(
+                "POST",
+                action,
+                urlencode(submission).encode(),
+                {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": f"{self.base_url}{_CUDY_AUTOUPGRADE_PAGE}",
+                },
+            )
+        except HttpError as exc:
+            raise AdapterError(f"the router did not answer the auto-update change ({exc})") from exc
+        if reply.status >= 400 or _looks_like_login(reply.text):
+            raise AdapterError(f"the router did not accept the auto-update change (HTTP {reply.status})")
+        check = _CbiForm()
+        check.feed(self._require_autoupgrade_page())
+        now = _cudy_auto_update(check)
+        kept = now is not None and now["enabled"] == enabled and (not enabled or now["window_start_hour"] == hour)
+        if not kept:
+            shown = "no Auto Update switch" if now is None else "auto-update " + ("on" if now["enabled"] else "off")
+            if now is not None and now["enabled"]:
+                shown += f", window {now['window'] or 'unset'}"
+            raise AdapterError(f"the router did not keep the auto-update change; it now shows {shown}")
+        return True
+
+    def check_firmware_update(self, timeout: float = 60) -> dict[str, Any]:
+        """Have the router look for newer firmware, the way its Auto Update page's script does.
+
+        A check installs nothing. ``available`` is None whenever the router's answer
+        cannot be read with certainty (see ``_cudy_update_result``).
+        """
+        before = self._require_autoupgrade_page()
+        current, _ = self._running_version(before)
+        token = dict(_cbi_fields(before)).get("token", "")
+        if not token:
+            raise ProtocolMismatch("the Cudy Auto Update page carried no form token to start an update check with")
+        reply = self._post(_CUDY_UPDATE_CHECK, {"token": token})
+        if reply.status == 404:
+            raise ProtocolMismatch("this Cudy firmware has no update check (HTTP 404)")
+        if reply.status >= 400 or _looks_like_login(reply.text):
+            raise AdapterError(f"the router did not start its update check (HTTP {reply.status})")
+        deadline = time.monotonic() + timeout
+        while True:
+            answer = self._session_get(_CUDY_CHECK_STATUS).text.strip()
+            if answer == "checkdone":
+                break
+            if answer == "timeout":
+                note = "the router's own update check timed out, so it could not say whether newer firmware exists"
+                return {"available": None, "current": current, "latest": None, "note": note}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                note = f"the router had not finished its update check after {timeout:g} s"
+                return {"available": None, "current": current, "latest": None, "note": note}
+            time.sleep(min(_CUDY_CHECK_POLL, remaining))
+        return _cudy_update_result(before, self._session_get(_CUDY_CHECK_RESULT).text, current)
+
 
 class _TendaModuleError(AdapterError):
     """The router answered, but refused the requested module (errCode)."""
@@ -795,6 +1103,22 @@ class TendaAdapter(RouterAdapter):
     def reboot(self) -> bool:
         self.request({"sysReboot": {}})
         return True
+
+    def firmware_info(self) -> dict[str, Any]:
+        # sysStatus names the software version but not the hardware.
+        return {"version": self.status()["firmware"], "hardware": "", "auto_update": None, "source": "tenda-goform"}
+
+    def set_auto_update(self, enabled: bool, window_start_hour: int | None = None) -> bool:
+        raise UnsupportedOperation(
+            "Tenda firmware auto-update is not supported yet: its upgrade module has not been captured from real "
+            "firmware"
+        )
+
+    def check_firmware_update(self, timeout: float = 60) -> dict[str, Any]:
+        raise UnsupportedOperation(
+            "Tenda firmware update checks are not supported yet: its upgrade module has not been captured from "
+            "real firmware"
+        )
 
 
 # Old TP-Link firmware (WR840N and siblings) locks the web UI for two hours after
@@ -1013,6 +1337,30 @@ class TpLinkAdapter(RouterAdapter):
             self.authenticated = False
             raise self._rejection("TP-Link refused the reboot request")
         return result.status in {200, 202, 204, 301, 302, 303}
+
+    def firmware_info(self) -> dict[str, Any]:
+        # Read from the status page, so this costs no login beyond a status poll's.
+        status = self.status()
+        return {
+            "version": status.get("firmware", ""),
+            "hardware": status.get("model", ""),
+            "auto_update": None,
+            "source": "tplink-11n",
+        }
+
+    # Both refuse before logging in: a login spent on an unsupported call still
+    # counts toward the router's ten.
+    def set_auto_update(self, enabled: bool, window_start_hour: int | None = None) -> bool:
+        raise UnsupportedOperation(
+            "TP-Link firmware settings are not supported on the 11N web UI: firmware writes stay excluded, since "
+            "its firmware page has not been captured from real hardware"
+        )
+
+    def check_firmware_update(self, timeout: float = 60) -> dict[str, Any]:
+        raise UnsupportedOperation(
+            "TP-Link firmware update checks are not supported on the 11N web UI: its firmware page has not been "
+            "captured from real hardware"
+        )
 
 
 _MAC_PATTERN = re.compile(r"\b([0-9A-F]{2}(?:[:-][0-9A-F]{2}){5})\b", re.IGNORECASE)

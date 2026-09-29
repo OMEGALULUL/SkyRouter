@@ -1,0 +1,118 @@
+<!--
+  RECONSTRUCTED, NOT CAPTURED. The Auto Update page of a Cudy AP1300 (hardware
+  "AP1300 V1.1", firmware 2.5.25-20260820-141832, GET
+  /cgi-bin/luci/admin/system/autoupgrade?nomodal=), rebuilt from what was read off
+  the real device: the form's action, its field names and values, the Update Time
+  options and their labels, the dependency rules, the page's labels and the three
+  requests its update-check script makes. The markup around them copies the
+  captured Wi-Fi forms (ap1300_edit_wlan00.html) and status page; the token is a
+  dummy. The result page of an update check has never been seen and is not here.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AP1300 - Firmware - LuCI</title>
+<script type="text/javascript" src="/luci-static/resources/cbi.js"></script>
+</head>
+<body>
+<nav class="navbar">
+	<ul class="nav navbar-nav">
+		<li><a href="/cgi-bin/luci/admin/system/status">Status</a></li>
+		<li class="active"><a href="/cgi-bin/luci/admin/system/autoupgrade">Firmware</a></li>
+		<li><a href="/cgi-bin/luci/admin/system/reboot">Reboot</a></li>
+	</ul>
+</nav>
+<form class="form-horizontal" role="form" method="post" name="cbi" action="/cgi-bin/luci/admin/system/autoupgrade?nomodal=" enctype="multipart/form-data" onkeydown="if(event.keyCode==13){return false;}">
+	<div>
+		<input type="hidden" name="token" value="5f0c9a3e7b2d4816a9e0c3b75d1f2e84" />
+		<input type="hidden" name="timeclock" value="" />
+		<input type="hidden" name="cbi.submit" value="1" />
+	</div>
+
+<div class="form-group" id="cbi-upgrade-1-auto_upgrade"><label class="col-sm-4 control-label" for="cbid.upgrade.1.auto_upgrade">Auto Update</label>
+		<div class="col-sm-5">
+
+	<input type="hidden" value="1" name="cbi.cbe.upgrade.1.auto_upgrade" />
+	<input type="hidden" id="cbid.upgrade.1.auto_upgrade" name="cbid.upgrade.1.auto_upgrade" value="1" />
+
+	<i class="fa fa-toggle-on  fa-2x text-primary"
+	   onclick="cbi_switch_toggle(this, false);"></i>
+
+	<i class="fa fa-spinner fa-2x fa-pulse text-primary hidden"></i>
+	</div>
+		</div>
+
+<div class="form-group" id="cbi-upgrade-1-cur_time"><label class="col-sm-4 control-label" for="cbid.upgrade.1.cur_time">Current Time</label>
+		<div class="col-sm-5">
+	<p class="form-control-static hidden-xs ">2026-09-28 10:15:42</p>
+	<p class="visible-xs ">2026-09-28 10:15:42</p>
+	</div>
+		</div>
+
+<script type="text/javascript" id="cbip-upgrade-1-cur_time">
+		cbi_d_add("cbi-upgrade-1-cur_time", {"cbid.upgrade.1.auto_upgrade":"1"}, "cbip-upgrade-1-cur_time");
+	</script>
+
+<div class="form-group" id="cbi-upgrade-1-upgrade_time"><label class="col-sm-4 control-label" for="cbid.upgrade.1.upgrade_time">Update Time</label>
+		<div class="col-sm-5">
+
+<select class="form-control" onchange="cbi_d_update(this.id)" id="cbid.upgrade.1.upgrade_time" name="cbid.upgrade.1.upgrade_time">
+<option  id="cbi-upgrade-1-upgrade_time-0" value="0">00:00 - 02:00</option><option  id="cbi-upgrade-1-upgrade_time-1" value="1">01:00 - 03:00</option><option  id="cbi-upgrade-1-upgrade_time-2" value="2">02:00 - 04:00</option><option  id="cbi-upgrade-1-upgrade_time-3" value="3" selected="selected">03:00 - 05:00</option><option  id="cbi-upgrade-1-upgrade_time-4" value="4">04:00 - 06:00</option><option  id="cbi-upgrade-1-upgrade_time-5" value="5">05:00 - 07:00</option><option  id="cbi-upgrade-1-upgrade_time-6" value="6">06:00 - 08:00</option><option  id="cbi-upgrade-1-upgrade_time-7" value="7">07:00 - 09:00</option><option  id="cbi-upgrade-1-upgrade_time-8" value="8">08:00 - 10:00</option><option  id="cbi-upgrade-1-upgrade_time-9" value="9">09:00 - 11:00</option><option  id="cbi-upgrade-1-upgrade_time-10" value="10">10:00 - 12:00</option><option  id="cbi-upgrade-1-upgrade_time-11" value="11">11:00 - 13:00</option><option  id="cbi-upgrade-1-upgrade_time-12" value="12">12:00 - 14:00</option><option  id="cbi-upgrade-1-upgrade_time-13" value="13">13:00 - 15:00</option><option  id="cbi-upgrade-1-upgrade_time-14" value="14">14:00 - 16:00</option><option  id="cbi-upgrade-1-upgrade_time-15" value="15">15:00 - 17:00</option><option  id="cbi-upgrade-1-upgrade_time-16" value="16">16:00 - 18:00</option><option  id="cbi-upgrade-1-upgrade_time-17" value="17">17:00 - 19:00</option><option  id="cbi-upgrade-1-upgrade_time-18" value="18">18:00 - 20:00</option><option  id="cbi-upgrade-1-upgrade_time-19" value="19">19:00 - 21:00</option><option  id="cbi-upgrade-1-upgrade_time-20" value="20">20:00 - 22:00</option><option  id="cbi-upgrade-1-upgrade_time-21" value="21">21:00 - 23:00</option><option  id="cbi-upgrade-1-upgrade_time-22" value="22">22:00 - 00:00</option><option  id="cbi-upgrade-1-upgrade_time-23" value="23">23:00 - 01:00</option>
+</select>
+	</div>
+		</div>
+
+<script type="text/javascript" id="cbip-upgrade-1-upgrade_time">
+		cbi_d_add("cbi-upgrade-1-upgrade_time", {"cbid.upgrade.1.auto_upgrade":"1"}, "cbip-upgrade-1-upgrade_time");
+	</script>
+
+<div class="form-group" id="cbi-upgrade-1-version"><label class="col-sm-4 control-label">Firmware Version</label>
+		<div class="col-sm-5">
+	<p class="form-control-static hidden-xs ">2.5.25-20260820-141832</p>
+	<p class="visible-xs ">2.5.25-20260820-141832</p>
+	</div>
+		</div>
+
+<div class="form-group" id="cbi-upgrade-1-hardware"><label class="col-sm-4 control-label">Hardware</label>
+		<div class="col-sm-5">
+	<p class="form-control-static hidden-xs ">AP1300 V1.1</p>
+	<p class="visible-xs ">AP1300 V1.1</p>
+	</div>
+		</div>
+
+<div class="form-group" id="cbi-rlf-1-firmware"><label class="col-sm-4 control-label" for="cbi.rlf.1.firmware">Firmware File Path</label>
+		<div class="col-sm-5">
+	<input class="form-control" type="file" name="cbi.rlf.1.firmware" id="cbi.rlf.1.firmware" />
+	</div>
+		</div>
+
+<div>
+<div class="form-group">
+		<div class="col-sm-offset-4 col-sm-5">
+			<button class="btn btn-block btn-primary" type="submit" name="cbi.apply">Save &#38; Apply</button>
+			<button class="btn btn-block btn-primary hidden" type="button" disabled=true>Please Wait...</button>
+		</div>
+	</div>
+	<script type="text/javascript">
+		cbi_d_update();
+	</script>
+</div>
+</form>
+<script type="text/javascript">//<![CDATA[
+	// The three requests of the real page's update check; the code around them is not the router's.
+	function update_check(token) {
+		$.post("/cgi-bin/luci/admin/system/autoupgrade/updatecheck", { token: token }, function() {
+			(function poll() {
+				$.get("/cgi-bin/luci/admin/system/autoupgrade/checkstatus/000000000000", function(state) {
+					if (state == "checkdone" || state == "timeout")
+						location.href = "/cgi-bin/luci/admin/system/autoupgrade?updatecheck=&nomodal=";
+					else
+						setTimeout(poll, 1000);
+				});
+			})();
+		});
+	}
+//]]></script>
+</body>
+</html>

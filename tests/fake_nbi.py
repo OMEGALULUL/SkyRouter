@@ -21,6 +21,13 @@ into the cache (secret leaves read back per the router's ``readback``), and
 SetParameterValues is only sent for a cached, writable, changed leaf, then cached
 as the plaintext sent, stamped session time + 1 ms (F15).
 
+Firmware: PUT /files/<name> stores a file with its metadata taken from the fileType,
+oui, productClass and version request headers (201), DELETE removes it (200, or 404),
+and GET /files lists the GridFS fs.files documents. A download task is taken as
+the router accepting the Download RPC; the transfer then completes in a later
+session by default (``set_download``): the router boots into the file's version,
+or reports a TransferComplete fault on the task's channel.
+
 Typical fixture::
 
     @pytest.fixture
@@ -50,13 +57,14 @@ _PRESET_ROUTE = re.compile(rf"/presets/({_SEGMENT})/?")
 _PROVISION_ROUTE = re.compile(rf"/provisions/({_SEGMENT})/?")
 _TAG_ROUTE = re.compile(rf"/devices/({_SEGMENT})/tags/({_SEGMENT})/?")
 _FAULT_ROUTE = re.compile(r"/faults/([A-Za-z0-9\-_%:]+)/?")
+_FILE_ROUTE = re.compile(rf"/files/({_SEGMENT})/?")
 _DEVICE_TASKS_ROUTE = re.compile(rf"/devices/({_SEGMENT})/tasks/?")
 _TASK_ROUTE = re.compile(rf"/tasks/({_SEGMENT})(/[A-Za-z_]*)?")
 _DEVICE_ROUTE = re.compile(rf"/devices/({_SEGMENT})/?")
 _COLLECTION_ROUTE = re.compile(r"/([A-Za-z0-9_]+)/?")
 _HEX24 = re.compile(r"[0-9a-f]{24}")
 
-# Collections the 1.2.10+ generic route serves. Only the first five hold data here.
+# Collections the 1.2.10+ generic route serves. Only the first six hold data here.
 _COLLECTIONS = {
     "devices",
     "tasks",
@@ -198,6 +206,15 @@ class FakeCpe:
     task_faults: dict[str, tuple[str, str]] = field(default_factory=dict)
     hidden: Callable[[str], bool] = is_secret_path
     reboots: int = 0
+    # How the router handles a Download it accepted: "next_session" installs it and
+    # reports from the boot session that follows, "same_session" before this one
+    # ends, "ignore" never does anything with it.
+    download: str = "next_session"
+    # A TransferComplete fault (code, message) instead of installing.
+    download_fault: tuple[str, str] | None = None
+    # The version it reports after installing; None means the file's own version.
+    download_version: str | None = None
+    pending_transfer: dict[str, Any] | None = None
 
     def read(self, path: str) -> Any:
         leaf = self.leaves[path]
@@ -577,6 +594,9 @@ class FakeNbi:
         self.faults: dict[str, dict[str, Any]] = {}
         self.presets: dict[str, dict[str, Any]] = {}
         self.provisions: dict[str, dict[str, Any]] = {}
+        # GridFS: fs.files documents, and the content kept apart as the chunks are.
+        self.files: dict[str, dict[str, Any]] = {}
+        self.file_data: dict[str, bytes] = {}
         self.requests: list[RecordedRequest] = []
         self.sessions: list[dict[str, Any]] = []
         self.cr_requests: list[str] = []
@@ -680,6 +700,27 @@ class FakeNbi:
     ) -> None:
         with self.lock:
             self.cpes[device_id].task_faults[task_name] = (code, message)
+
+    def set_download(
+        self,
+        device_id: str,
+        when: str = "next_session",
+        *,
+        fault: tuple[str, str] | None = None,
+        version: str | None = None,
+    ) -> None:
+        """How the router handles the next firmware Download it accepts (see FakeCpe.download)."""
+        if when not in ("next_session", "same_session", "ignore"):
+            raise ValueError(f"unknown download behaviour {when!r}")
+        with self.lock:
+            cpe = self.cpes[device_id]
+            cpe.download, cpe.download_fault, cpe.download_version = when, fault, version
+
+    def software_version(self, device_id: str) -> Any:
+        """What the router itself reports as DeviceInfo.SoftwareVersion."""
+        with self.lock:
+            leaf = self.cpes[device_id].leaves.get(self._software_version_path(device_id))
+            return leaf.value if leaf else None
 
     def set_busy(self, device_id: str, times: int | None = None) -> None:
         """The router is mid-session for the next ``times`` lock attempts (None: until cleared)."""
@@ -799,6 +840,8 @@ class FakeNbi:
             if method != "DELETE":
                 return _not_allowed("DELETE")
             return self._delete_fault(_decode_segment(match.group(1)))
+        if match := _FILE_ROUTE.fullmatch(path):
+            return self._file(method, _decode_segment(match.group(1)), request)
         if match := _DEVICE_TASKS_ROUTE.fullmatch(path):
             if method != "POST":
                 return _not_allowed("POST")
@@ -843,6 +886,32 @@ class FakeNbi:
         if method == "DELETE":
             self.provisions.pop(name, None)
             self.cache_invalidations += 1
+            return _text(200)
+        return _not_allowed("PUT, DELETE")
+
+    def _file(self, method: str, name: str, request: RecordedRequest) -> _Reply:
+        if method == "PUT":
+            # Node lowercases header names, so any capitalisation reaches GenieACS.
+            headers = {key.lower(): value for key, value in request.headers.items()}
+            metadata = {
+                key: headers.get(key.lower())
+                for key in ("fileType", "oui", "productClass", "version")
+                if headers.get(key.lower()) is not None
+            }
+            self.files[name] = {
+                "_id": name,
+                "length": len(request.body),
+                "chunkSize": 261120,
+                "uploadDate": iso(self.now()),
+                "filename": name,
+                "metadata": metadata,
+            }
+            self.file_data[name] = request.body
+            return _text(201)
+        if method == "DELETE":
+            if self.files.pop(name, None) is None:
+                return _text(404, "404 Not Found")
+            self.file_data.pop(name, None)
             return _text(200)
         return _not_allowed("PUT, DELETE")
 
@@ -965,6 +1034,8 @@ class FakeNbi:
             return list(self.presets.values())
         if collection == "provisions":
             return list(self.provisions.values())
+        if collection == "files":
+            return list(self.files.values())
         return []
 
     def _query(self, method: str, collection: str, params: dict[str, str]) -> _Reply:
@@ -1042,6 +1113,10 @@ class FakeNbi:
                 "tasks": [],
                 "written": [],
             }
+            if cpe.pending_transfer is not None:
+                # The router opens this session with the outcome of a Download it
+                # accepted in an earlier one.
+                self._complete_transfer(device_id, doc, cpe, now, report)
             for task in [t for t in self.tasks if t.get("device") == device_id]:
                 fault_id = f"{device_id}:task_{task['_id']}"
                 expiry = parse_iso(task.get("expiry"))
@@ -1104,7 +1179,76 @@ class FakeNbi:
             cpe.reboots += 1
             # The router comes back with a 1 BOOT inform, which moves _lastBoot (F30).
             doc["_lastBoot"] = iso(now + timedelta(milliseconds=1))
+        elif name == "download":
+            self._accept_download(task, doc, cpe, now, report)
         return None
+
+    def _software_version_path(self, device_id: str) -> str:
+        cpe = self.cpes[device_id]
+        for path in cpe.leaves:
+            if path.endswith(".DeviceInfo.SoftwareVersion"):
+                return path
+        root = "Device" if "Device" in self.devices[device_id] else "InternetGatewayDevice"
+        return f"{root}.DeviceInfo.SoftwareVersion"
+
+    def _accept_download(
+        self, task: dict[str, Any], doc: dict[str, Any], cpe: FakeCpe, now: datetime, report: dict[str, Any]
+    ) -> None:
+        # The Download RPC succeeding only means the router took the job on; the
+        # transfer's outcome comes in a TransferComplete, usually a session later.
+        if cpe.download == "ignore":
+            return
+        stored = self.files.get(task.get("file", ""))
+        fault = cpe.download_fault
+        if stored is None and fault is None:
+            # genieacs-fs answers 404, so the router's transfer fails.
+            fault = ("cwmp.9010", "Download failure")
+        version = cpe.download_version or (stored or {}).get("metadata", {}).get("version")
+        cpe.pending_transfer = {"task_id": task["_id"], "file": task.get("file"), "version": version, "fault": fault}
+        if cpe.download == "same_session":
+            self._complete_transfer(task["device"], doc, cpe, now + timedelta(milliseconds=2), report)
+
+    def _complete_transfer(
+        self, device_id: str, doc: dict[str, Any], cpe: FakeCpe, now: datetime, report: dict[str, Any]
+    ) -> None:
+        transfer, cpe.pending_transfer = cpe.pending_transfer, None
+        assert transfer is not None
+        stamp = iso(now)
+        if transfer["fault"] is not None:
+            code, message = transfer["fault"]
+            # No reboot: the router still runs its old image and only reports the failure.
+            report["events"].append("7 TRANSFER COMPLETE")
+            fault_id = f"{device_id}:task_{transfer['task_id']}"
+            self.faults[fault_id] = {
+                "_id": fault_id,
+                "device": device_id,
+                "channel": f"task_{transfer['task_id']}",
+                "timestamp": stamp,
+                "code": code,
+                "message": message,
+                "detail": {"faultCode": code.rsplit(".", 1)[-1], "faultString": message},
+                "retries": 0,
+                "provisions": json.dumps([["download", transfer["file"]]]),
+            }
+            return
+        report["events"] += ["1 BOOT", "7 TRANSFER COMPLETE", "M Download"]
+        cpe.reboots += 1
+        doc["_lastBoot"] = stamp
+        path = self._software_version_path(device_id)
+        cpe.leaves[path] = CpeLeaf(transfer["version"], "xsd:string", False)
+        # SoftwareVersion is a forced Inform parameter, so the boot inform recaches it.
+        _set_cached_leaf(
+            doc,
+            path,
+            {
+                "_object": False,
+                "_value": transfer["version"],
+                "_type": "xsd:string",
+                "_writable": False,
+                "_timestamp": stamp,
+            },
+            stamp,
+        )
 
     def _refresh(self, doc: dict[str, Any], cpe: FakeCpe, path: str, now: datetime) -> None:
         stamp = iso(now)

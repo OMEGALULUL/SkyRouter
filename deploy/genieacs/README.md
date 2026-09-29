@@ -282,6 +282,11 @@ sudo tail -n 50 /var/log/genieacs/cwmp.log /var/log/genieacs/nbi.log
 
 On Cudy this is System > TR069, with Data Model set to TR-181.
 
+A router that is also a direct device in SkyRouter is then in both inventories. A
+maintenance plan with `"all": true`, or naming it both ways, would restart it once
+for each, so keep each router in one inventory (see Maintenance plans in the main
+README).
+
 A DHCP reservation for the laptop keeps `$ACS_ADDR` from changing under the
 router. Confirm the router checked in (the projection keeps the output to IDs
 and times):
@@ -384,10 +389,56 @@ As in the lab. To run SkyRouter as a service, see
   unhold it deliberately. For a new Node, copy it to its own `/opt/node-v…`
   directory, change `Environment=PATH=` in the three units, then
   `sudo systemctl daemon-reload` and restart.
-- **Firmware pushes (phase 3).** `sudo systemctl enable --now genieacs-fs`, open
-  7567 on the VPN interface only, and set `GENIEACS_FS_URL_PREFIX` only if the
-  file server sits behind a proxy. It has no authentication, so never store a
-  file with secrets in it.
+- **Firmware pushes (phase 3).** See [Firmware pushes](#firmware-pushes).
+
+## Firmware pushes
+
+SkyRouter's TR-069 firmware upgrades (`router-manager acs firmware`, described in
+the top-level README) store each image in GenieACS through the NBI, and the router
+then fetches it from `genieacs-fs` on port 7567. Uploading works without the file
+server; an upgrade does not, so enable it before the first one:
+
+```bash
+sudo systemctl enable --now genieacs-fs
+systemctl status --no-pager genieacs-fs
+```
+
+**`genieacs-fs` has no authentication.** It hands any stored file to anyone who
+can reach 7567 and knows the file's name. So:
+
+- **Routers reach it over the VPN only.** Open 7567 on the VPN interface alone, the
+  way [step 7 (production)](#step-7-production-only-the-vpn-gets-in) opens 7547,
+  and never on a LAN or public interface. Push firmware to production routers
+  only, not to lab routers on the LAN.
+- **Names are unguessable.** SkyRouter stores every image as `skybre-fw-` followed
+  by 32 random hex characters, and only ever points a router at such a name. Do
+  not upload files to GenieACS by hand, where a readable name such as
+  `AP1300.bin` would be served to anyone who guessed it.
+- **Nothing secret goes in.** Never store a configuration backup or anything else
+  holding a password; the file store is only for firmware images.
+- **Remove what is no longer needed** with `router-manager acs firmware remove
+  <name>`, which deletes it from GenieACS too. SkyRouter refuses while an upgrade is
+  still using the file.
+
+The address in each Download request is `GENIEACS_FS_URL_PREFIX` followed by the
+file name. Leave the prefix unset, as `genieacs.env.example` has it, and the address
+follows the one the router used to reach CWMP. Set it, with the trailing `/`, only
+when routers must fetch files from somewhere else, such as behind a proxy or with
+`genieacs-fs` on another host:
+
+```bash
+sudoedit /etc/genieacs/genieacs.env      # GENIEACS_FS_URL_PREFIX=http://10.10.0.2:7567/
+sudo systemctl restart genieacs-cwmp genieacs-fs
+```
+
+`genieacs-cwmp` writes the Download requests, so it needs the restart as well as
+the file server. Each fetch is logged in `/var/log/genieacs/fs-access.log`, which
+is the first place to look when a router accepted an upgrade but never installed
+it:
+
+```bash
+sudo tail -n 20 /var/log/genieacs/fs-access.log
+```
 
 ---
 

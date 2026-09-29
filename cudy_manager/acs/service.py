@@ -14,6 +14,13 @@ cached secret cannot make the write look unnecessary, and a verdict drawn from
 each leaf's cached value and _timestamp against B's own timestamp, which is
 GenieACS's clock and so immune to skew.
 
+A firmware upgrade (a download task) is never taken as done when its task goes:
+that only means the router accepted the Download RPC, and the transfer's outcome
+arrives later, in a TransferComplete that may come in a later session. It is
+verified only once the router reports the file's version as its SoftwareVersion
+from a boot after the task was queued; a transfer fault on the task's channel
+rejects it.
+
 Everything here blocks: call it from async code through asyncio.to_thread.
 """
 
@@ -21,12 +28,13 @@ import contextlib
 import hashlib
 import logging
 import re
+import secrets
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ..manager import validate_wifi_passphrase, validate_wifi_ssid
 from ..models import ValidationError
@@ -34,6 +42,8 @@ from ..secrets import SecretStore, SecretStoreError
 from . import bootstrap, params
 from . import tasks as nbi_tasks
 from .client import (
+    FIRMWARE_FILE_TYPE,
+    MAX_FILE_BYTES,
     AcsBusy,
     AcsClient,
     AcsError,
@@ -43,6 +53,7 @@ from .client import (
     device_search_query,
     validate_device_id,
     validate_fault_id,
+    validate_file_metadata,
     validate_tag,
 )
 from .jobs import (
@@ -53,16 +64,19 @@ from .jobs import (
     ERROR,
     EXPIRED,
     JOB_ID_RE,
+    KIND_FIRMWARE,
     KIND_REBOOT,
     KIND_REFRESH,
     KIND_WIFI,
     NOT_APPLIED,
     QUEUED,
     REJECTED,
+    TERMINAL_STATES,
     VERIFIED,
     WAITING_FOR_CHECKIN,
     WATCH_BOOT,
     WATCH_SCRUB,
+    FirmwareIndex,
     JobStore,
     JobStoreError,
     is_active,
@@ -89,6 +103,25 @@ CONTACT_WAIT = timedelta(minutes=2)
 EXPIRY_GRACE = timedelta(minutes=1)
 BOOT_WAIT = timedelta(minutes=15)
 PRUNE_INTERVAL = 60.0
+# How long a router that accepted a firmware download gets to install it and come
+# back reporting the new version. Downloading, flashing and rebooting take a few
+# minutes; an hour also covers a slow link, and past it the operator should look.
+FIRMWARE_INSTALL_WAIT = timedelta(hours=1)
+MAX_FIRMWARE_BYTES = MAX_FILE_BYTES
+_FIRMWARE_PREFIX = "skybre-fw-"
+# The activity log's kinds and results, for the jobs worth an entry there. A
+# refresh changes nothing on the router, so it gets none.
+_ACTIVITY_KINDS = {KIND_WIFI: "wifi", KIND_REBOOT: "reboot", KIND_FIRMWARE: "firmware"}
+_ACTIVITY_RESULTS = {
+    VERIFIED: "applied",
+    ACKNOWLEDGED: "applied",
+    REJECTED: "refused",
+    NOT_APPLIED: "failed",
+    EXPIRED: "failed",
+    ERROR: "failed",
+    CANCELLED: "info",
+}
+SYSTEM_ACTOR = "system"
 
 # §3.8 allows fewer characters than GenieACS or the client would.
 _TAG_RE = re.compile(r"[a-z0-9_-]{1,32}")
@@ -130,6 +163,54 @@ class AcsConfirmationRequired(ValidationError):
         self.plan = plan
 
 
+class FirmwareMismatch(AcsConfirmationRequired):
+    """The file was stored for a different OUI or product class than the router reports.
+
+    Send it again with confirm_model_mismatch=True. ``plan`` names both sides.
+    """
+
+
+class ActivitySink(Protocol):
+    """What AcsService needs of cudy_manager.activity.ActivityLog."""
+
+    def record(
+        self,
+        *,
+        who: str,
+        router: str,
+        kind: str,
+        what: str,
+        result: str,
+        router_name: str = "",
+        details: Mapping[str, Any] | None = None,
+    ) -> Any: ...
+
+
+def _actor(actor: Any) -> str:
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValidationError("actor must be a non-empty string")
+    return clean_text(actor.strip(), 100)
+
+
+def _same_identity(first: Any, second: Any) -> bool:
+    # Routers disagree on the case of their OUI, and GenieACS keeps what they sent.
+    return str(first or "").strip().casefold() == str(second or "").strip().casefold()
+
+
+def _stripped(value: Any) -> Any:
+    return value.strip() if isinstance(value, str) else value
+
+
+def _display_name(filename: Any) -> str | None:
+    if filename is None:
+        return None
+    if not isinstance(filename, str):
+        raise ValidationError("filename must be a string")
+    # Only for showing: the stored name is SkyRouter's own, never this one.
+    base = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    return clean_text(base, 128).strip() or None
+
+
 def _vault_prefix(acs_id: str) -> str:
     # Device IDs carry "%", which vault references cannot, hence the hash.
     return f"acs-wifi-{hashlib.sha256(acs_id.encode('utf-8')).hexdigest()[:20]}-"
@@ -154,6 +235,16 @@ def validate_ssid(ssid: Any) -> str:
 
 def _short(exc: BaseException | str, limit: int = 200) -> str:
     return clean_text(str(exc), limit)
+
+
+def _expiry(value: Any, default: int) -> int:
+    """How long a queued task may wait for the router, in whole seconds; ``default`` when None."""
+    if value is None:
+        return default
+    lowest, highest = nbi_tasks.MIN_EXPIRY, nbi_tasks.MAX_EXPIRY
+    if isinstance(value, bool) or not isinstance(value, int) or not lowest <= value <= highest:
+        raise ValidationError(f"expiry must be whole seconds from {lowest} to {highest}")
+    return value
 
 
 def _bands_overlap(first: str, second: str) -> bool:
@@ -201,6 +292,15 @@ def _fault_text(summary: dict[str, Any]) -> str:
     return text
 
 
+def _fault_codes(summary: dict[str, Any]) -> str:
+    """A fault without the router's own wording: its codes and the parameters they are about."""
+    text = str(summary.get("code") or "").strip() or "unknown fault"
+    parameters = summary.get("parameters") or []
+    if parameters:
+        text += " (" + ", ".join(f"{p['path']}: {p['code']}".strip() for p in parameters) + ")"
+    return text
+
+
 class AcsService:
     def __init__(
         self,
@@ -210,6 +310,7 @@ class AcsService:
         inform_interval: int = bootstrap.DEFAULT_INFORM_INTERVAL,
         scrub_secrets: bool = True,
         clock: Callable[[], datetime] | None = None,
+        activity: ActivitySink | None = None,
     ):
         self.client = client
         self.secrets = secrets
@@ -218,10 +319,17 @@ class AcsService:
         self.scrub_secrets = bool(scrub_secrets)
         self.clock = clock or (lambda: datetime.now(UTC))
         self.jobs = JobStore(self.data_dir, self._now)
+        self.firmware = FirmwareIndex(self.data_dir)
+        # Optional: the permanent who-changed-what log. Each Wi-Fi, reboot and
+        # firmware job lands there once, when it first reaches a terminal state.
+        self.activity = activity
         self._last_prune = float("-inf")
         # Two Wi-Fi changes to one band share a pending vault entry and a uniqueKey, so
         # superseding the older one and recording the newer one must not interleave.
         self._wifi_lock = threading.Lock()
+        # Two upgrades of one router share the skyrouter-firmware uniqueKey, so the
+        # second would silently replace the first's task (F14).
+        self._firmware_lock = threading.Lock()
 
     def _now(self) -> datetime:
         now = self.clock()
@@ -399,17 +507,34 @@ class AcsService:
         )
         return self._start(job, doc, [task])
 
-    def reboot(self, acs_id: str) -> dict[str, Any]:
-        """Reboot the router; verified once _lastBoot moves past the task's timestamp (F30)."""
+    def reboot(self, acs_id: str, actor: str = SYSTEM_ACTOR, expiry: int | None = None) -> dict[str, Any]:
+        """Reboot the router; verified once _lastBoot moves past the task's timestamp (F30).
+
+        ``expiry`` (seconds, default an hour) bounds how long the task waits for a
+        router that misses the connection request; a maintenance plan passes what
+        is left of its window.
+        """
         validate_device_id(acs_id)
+        actor = _actor(actor)
+        seconds = _expiry(expiry, nbi_tasks.DEFAULT_EXPIRY)
         doc = self._device(acs_id, _POLL_PROJECTION)
         # Never two reboots in a row from one impatient operator.
         running = self._running(acs_id, KIND_REBOOT)
         if running is not None:
             return running
+        # A restart between the download and the router's own install restart can
+        # leave it on a half-written image; maintenance plans already hold back here,
+        # and the dashboard button must too.
+        upgrading = self._running(acs_id, KIND_FIRMWARE)
+        if upgrading is not None:
+            raise AcsBusy(
+                f"a firmware upgrade is in progress on this router (job {upgrading['id']}); "
+                "reboot it after the upgrade finishes"
+            )
         job = new_job(new_job_id(), acs_id, KIND_REBOOT, self._now(), request={})
         job["phase"] = "reboot"
-        return self._start(job, doc, [nbi_tasks.reboot(job=job["id"], step="reboot")])
+        job["actor"] = actor
+        return self._start(job, doc, [nbi_tasks.reboot(job=job["id"], step="reboot", expiry=seconds)])
 
     def set_wifi(
         self,
@@ -418,6 +543,7 @@ class AcsService:
         ssid: str | None = None,
         passphrase: str | None = None,
         confirm_guessed_band: bool = False,
+        actor: str = SYSTEM_ACTOR,
     ) -> dict[str, Any]:
         """Change the SSID and/or passphrase of the primary network on one band or all (§3.7).
 
@@ -435,6 +561,7 @@ class AcsService:
             raise ValidationError("nothing to change: give a new SSID, a new passphrase, or both")
         if not isinstance(confirm_guessed_band, bool):
             raise ValidationError("confirm_guessed_band must be true or false")
+        actor = _actor(actor)
 
         doc = self._device(acs_id, params.DETAIL_PROJECTION)
         plan = params.wifi_write_plan(doc, band, ssid, passphrase is not None)
@@ -461,6 +588,7 @@ class AcsService:
             },
         )
         job["plan"] = {"attempt": 0, "replans": 0, "avoid": [], "refreshed": False}
+        job["actor"] = actor
         if passphrase is not None:
             job["vault_refs"] = {"pending": vault_ref(acs_id, band, "pending")}
         # Without the lock, two requests could each find nothing to supersede and both
@@ -481,12 +609,14 @@ class AcsService:
         except (AcsError, SecretStoreError, ValidationError) as exc:
             self._fail(job, exc)
         finally:
-            self.jobs.release(job_id, token, job)
+            self._release(job_id, token, job)
         return public_view(job)
 
-    def cancel_job(self, job_id: str) -> dict[str, Any]:
+    def cancel_job(self, job_id: str, actor: str | None = None) -> dict[str, Any]:
         """Delete the job's tasks. AcsBusy (409) while the router is mid-session."""
         validate_job_id(job_id)
+        if actor is not None:
+            actor = _actor(actor)
         stored = self.jobs.get(job_id)
         if stored is None:
             raise AcsNotFound("No such job", status=404)
@@ -502,10 +632,255 @@ class AcsService:
             if job["state"] in ACTIVE_STATES and self._delete_outstanding(job):
                 self._advance(job, token, closing=True)
             if job["state"] in ACTIVE_STATES:
-                self._end(job, CANCELLED, "Cancelled before the router took the change.")
+                job["cancelled_by"] = actor
+                self._end(job, CANCELLED, self._cancel_message(job))
         finally:
-            self.jobs.release(job_id, token, job)
+            self._release(job_id, token, job)
         return public_view(job)
+
+    def _cancel_message(self, job: dict[str, Any]) -> str:
+        if job["kind"] == KIND_FIRMWARE and any(
+            step["step"] == "download" and step.get("outcome") == "gone" for step in job["steps"]
+        ):
+            # Nothing takes a Download back once the router has it.
+            return (
+                "Stopped watching. The router had already accepted the firmware download, so it may still install it."
+            )
+        return "Cancelled before the router took the change."
+
+    # -- firmware -------------------------------------------------------------------------
+
+    def add_firmware(
+        self,
+        data: bytes,
+        filename: str | None,
+        model_hint: str | None,
+        version: str,
+        oui: str,
+        product_class: str,
+    ) -> dict[str, Any]:
+        """Store a firmware image on the ACS and in SkyRouter's library; returns its record.
+
+        ``version`` must be exactly what the router reports as DeviceInfo.SoftwareVersion
+        once it runs this image, because that is how an upgrade is verified. ``oui``
+        and ``product_class`` are those of the routers it is meant for (their
+        DeviceId), which every upgrade is checked against. The stored name is random:
+        genieacs-fs hands any stored file, unauthenticated, to whoever knows its name.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValidationError("the firmware must be given as bytes")
+        if not data:
+            raise ValidationError("the firmware file is empty")
+        if len(data) > MAX_FIRMWARE_BYTES:
+            raise ValidationError(f"the firmware file is larger than {MAX_FIRMWARE_BYTES // (1024 * 1024)} MiB")
+        version = validate_file_metadata(_stripped(version), "version")
+        oui = validate_file_metadata(_stripped(oui), "OUI")
+        product_class = validate_file_metadata(_stripped(product_class), "product class")
+        if model_hint is not None and not isinstance(model_hint, str):
+            raise ValidationError("model hint must be a string")
+        hint = (clean_text(model_hint, 64).strip() or None) if model_hint is not None else None
+        name = f"{_FIRMWARE_PREFIX}{secrets.token_hex(16)}"
+        record: dict[str, Any] = {
+            "name": name,
+            "filename": _display_name(filename),
+            "model_hint": hint,
+            "version": version,
+            "oui": oui,
+            "product_class": product_class,
+            "file_type": FIRMWARE_FILE_TYPE,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "uploaded_at": iso(self._now()),
+        }
+        try:
+            self.client.put_file(name, bytes(data), FIRMWARE_FILE_TYPE, oui, product_class, version)
+        except AcsUnavailable as exc:
+            if exc.outcome_unknown:
+                # Without a library record it is never offered to a router, but a
+                # stored copy would still be served to anyone who learnt its name.
+                self._discard_file(name)
+            raise
+        try:
+            self.firmware.add(record)
+        except (JobStoreError, OSError):
+            self._discard_file(name)
+            raise
+        return {**record, "on_acs": True, "in_use_by": []}
+
+    def list_firmware(self) -> list[dict[str, Any]]:
+        """The library, newest first. ``on_acs`` is None while the ACS cannot be asked."""
+        records = self.firmware.all()
+        stored: set[str] | None
+        try:
+            stored = {str(item.get("name")) for item in self.client.list_files()}
+        except AcsError as exc:
+            logger.warning("could not list the firmware files on the ACS: %s", exc)
+            stored = None
+        users = self._firmware_users()
+        views = []
+        for record in records.values():
+            name = str(record.get("name"))
+            views.append(
+                {**record, "on_acs": None if stored is None else name in stored, "in_use_by": users.get(name, [])}
+            )
+        views.sort(key=lambda view: str(view.get("uploaded_at", "")), reverse=True)
+        return views
+
+    def remove_firmware(self, name: str) -> dict[str, Any]:
+        """Delete a library file from the ACS and the library. AcsBusy while an upgrade uses it."""
+        nbi_tasks.validate_firmware_name(name)
+        if self.firmware.get(name) is None:
+            raise AcsNotFound("No such firmware in the library", status=404)
+        # Under the lock, so an upgrade cannot start on the file between the check
+        # and the delete and then have the router fetch a file that is gone.
+        with self._firmware_lock:
+            users = self._firmware_users().get(name)
+            if users:
+                raise AcsBusy(
+                    f"firmware {name} is being installed by job {users[0]}; wait for it to finish or cancel it first"
+                )
+            with contextlib.suppress(AcsNotFound):
+                self.client.delete_file(name)
+            self.firmware.remove(name)
+        return {"name": name, "removed": True}
+
+    def _firmware_users(self) -> dict[str, list[str]]:
+        users: dict[str, list[str]] = {}
+        for job in self.jobs.all().values():
+            if job.get("kind") == KIND_FIRMWARE and is_active(job):
+                users.setdefault(str((job.get("request") or {}).get("firmware")), []).append(str(job.get("id")))
+        return users
+
+    def _discard_file(self, name: str) -> None:
+        try:
+            self.client.delete_file(name)
+        except AcsNotFound:
+            pass
+        except AcsError as exc:
+            logger.warning("could not delete firmware file %s from the ACS: %s", name, exc)
+
+    def firmware_upgrade(
+        self,
+        acs_id: str,
+        firmware_name: str,
+        confirm_model_mismatch: bool = False,
+        actor: str = SYSTEM_ACTOR,
+        expiry: int | None = None,
+    ) -> dict[str, Any]:
+        """Install a library file on the router: a download task and a connection request.
+
+        Refused unless the router is checking in, reports the OUI and product class
+        the file was stored for (FirmwareMismatch, 409, unless confirm_model_mismatch),
+        and runs something other than the file's version. The job is verified only
+        when the router reports that version after a boot later than the task.
+        ``expiry`` (seconds, default 24 h) bounds how long the download waits for the
+        router to take it; installing can take up to FIRMWARE_INSTALL_WAIT after that.
+        """
+        validate_device_id(acs_id)
+        nbi_tasks.validate_firmware_name(firmware_name)
+        if not isinstance(confirm_model_mismatch, bool):
+            raise ValidationError("confirm_model_mismatch must be true or false")
+        actor = _actor(actor)
+        seconds = _expiry(expiry, nbi_tasks.FIRMWARE_EXPIRY)
+        record = self.firmware.get(firmware_name)
+        if record is None:
+            raise AcsNotFound("No such firmware in the library", status=404)
+        running = self._running_firmware(acs_id, firmware_name)
+        if running is not None:
+            return running
+        stored = self.client.get_file(firmware_name)
+        if stored is None:
+            raise ValidationError(
+                f"firmware {firmware_name} is no longer on the ACS; remove it from the library and upload it again"
+            )
+        if stored.get("size") is not None and stored["size"] != record.get("size"):
+            raise ValidationError(
+                f"the ACS copy of firmware {firmware_name} is not the file SkyRouter stored; upload it again"
+            )
+
+        now = self._now()
+        doc = self._device(acs_id, params.FIRMWARE_PROJECTION)
+        device = params.firmware_identity(doc, now, self.inform_interval)
+        if device["online"] is not True:
+            # A router that stopped checking in may be half-way through something
+            # already; firmware is the last thing to queue blind for it.
+            raise ValidationError(
+                f"the router has not checked in since {device['last_inform']}; "
+                "SkyRouter only sends firmware to a router that is checking in"
+            )
+        mismatch = [key for key in ("oui", "product_class") if not _same_identity(device[key], record.get(key))]
+        if mismatch and not confirm_model_mismatch:
+            raise FirmwareMismatch(
+                self._mismatch_message(record, device, mismatch), self._mismatch_plan(record, device, mismatch)
+            )
+        current = device["software_version"]
+        if not current:
+            raise ValidationError("the ACS does not know which firmware the router runs; refresh its info first")
+        if current == record["version"]:
+            raise ValidationError(f"the router already runs firmware {current}")
+
+        job = new_job(
+            new_job_id(),
+            acs_id,
+            KIND_FIRMWARE,
+            now,
+            request={
+                "firmware": firmware_name,
+                "version": record["version"],
+                "from_version": current,
+                "sha256": record.get("sha256"),
+                "size": record.get("size"),
+                "oui": device["oui"],
+                "product_class": device["product_class"],
+                "model": device["model"],
+                "confirm_model_mismatch": confirm_model_mismatch,
+                "model_mismatch": mismatch,
+            },
+        )
+        job["phase"] = "firmware"
+        job["actor"] = actor
+        task = nbi_tasks.download(firmware_name, job=job["id"], step="download", expiry=seconds)
+        with self._firmware_lock:
+            running = self._running_firmware(acs_id, firmware_name)
+            if running is not None:
+                return running
+            # remove_firmware may have deleted it since the look above.
+            if self.firmware.get(firmware_name) is None:
+                raise AcsNotFound("No such firmware in the library", status=404)
+            token = self.jobs.create(job)
+        return self._start(job, doc, [task], token=token)
+
+    def _running_firmware(self, acs_id: str, name: str) -> dict[str, Any] | None:
+        running = self._running(acs_id, KIND_FIRMWARE)
+        if running is None or running["request"].get("firmware") == name:
+            # The same file again is a second click, answered with the first job.
+            return running
+        raise AcsBusy(
+            f"another firmware upgrade is under way on this router (job {running['id']}); wait for it or cancel it"
+        )
+
+    @staticmethod
+    def _mismatch_plan(record: dict[str, Any], device: dict[str, Any], mismatch: list[str]) -> dict[str, Any]:
+        return {
+            "device": {
+                key: device.get(key)
+                for key in ("acs_id", "oui", "product_class", "manufacturer", "model", "software_version")
+            },
+            "firmware": {
+                key: record.get(key) for key in ("name", "oui", "product_class", "model_hint", "version", "filename")
+            },
+            "mismatch": list(mismatch),
+        }
+
+    @staticmethod
+    def _mismatch_message(record: dict[str, Any], device: dict[str, Any], mismatch: list[str]) -> str:
+        labels = {"oui": "OUI", "product_class": "product class"}
+        stored_for = ", ".join(f"{labels[key]} {record.get(key)}" for key in mismatch)
+        reported = ", ".join(f"{labels[key]} {device.get(key) or 'unknown'}" for key in mismatch)
+        return (
+            f"firmware {record.get('name')} was stored for {stored_for}, but the router reports {reported}. "
+            "Firmware built for another model can leave a router unusable; confirm to install it anyway."
+        )
 
     # -- faults, tags and the bootstrap ---------------------------------------------------
 
@@ -596,7 +971,7 @@ class AcsService:
             logger.exception("ACS job %s could not be advanced", job_id)
             job["last_error"] = "internal error; see the SkyRouter log"
         finally:
-            self.jobs.release(job_id, token, job)
+            self._release(job_id, token, job)
 
     def _abandon(self, job: dict[str, Any], message: str) -> None:
         if job["state"] in ACTIVE_STATES:
@@ -607,8 +982,12 @@ class AcsService:
 
     # -- job plumbing -------------------------------------------------------------------
 
-    def _start(self, job: dict[str, Any], doc: dict[str, Any], steps: list[nbi_tasks.Task]) -> dict[str, Any]:
-        token = self.jobs.create(job)
+    def _start(
+        self, job: dict[str, Any], doc: dict[str, Any], steps: list[nbi_tasks.Task], token: str | None = None
+    ) -> dict[str, Any]:
+        """Queue the steps and ask the router to check in. ``token`` is the lease of a job already created."""
+        if token is None:
+            token = self.jobs.create(job)
         try:
             for task in steps:
                 self._queue(job, token, task)
@@ -616,8 +995,98 @@ class AcsService:
         except AcsError as exc:
             self._fail(job, exc)
         finally:
-            self.jobs.release(job["id"], token, job)
+            self._release(job["id"], token, job)
         return public_view(job)
+
+    def _release(self, job_id: str, token: str, job: dict[str, Any]) -> bool:
+        self._record_activity(job)
+        return self.jobs.release(job_id, token, job)
+
+    # -- the activity log -----------------------------------------------------------------
+
+    def _record_activity(self, job: dict[str, Any]) -> None:
+        """Log a Wi-Fi, reboot or firmware job the first time it reaches a terminal state.
+
+        Later upgrades (acknowledged to verified) are not logged again: the entry
+        records that the change happened and who asked for it.
+        """
+        kind = _ACTIVITY_KINDS.get(job.get("kind", ""))
+        if self.activity is None or kind is None or job.get("state") not in TERMINAL_STATES:
+            return
+        if job.get("activity_recorded"):
+            return
+        job["activity_recorded"] = True
+        try:
+            message, details = self._activity_text(job)
+            self.activity.record(
+                who=job.get("actor") or SYSTEM_ACTOR,
+                # As the activity log names TR-069 routers, and as MaintenanceRunner
+                # logs them: with the bare ID one router's history split in two.
+                router=f"acs:{job['acs_id']}",
+                kind=kind,
+                what=f"{self._activity_label(job)} over TR-069: {message}",
+                result=_ACTIVITY_RESULTS.get(job["state"], "info"),
+                details=details,
+            )
+        except Exception:  # noqa: BLE001 - the audit log must never stop or undo a job
+            logger.exception("ACS job %s: could not record it in the activity log", job["id"])
+
+    def _activity_text(self, job: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        message, details = str(job.get("message") or ""), self._activity_details(job)
+        fault = job.get("fault")
+        if job.get("kind") == KIND_WIFI and (job.get("request") or {}).get("passphrase") and isinstance(fault, dict):
+            # A router's FaultString can quote the value it refused, and the pending
+            # password has already left the vault, so it cannot be looked for. The
+            # log is permanent and exported: only the codes go in it.
+            left_out = "the router's own wording is left out, as it can quote the new password"
+            message = message.replace(_fault_text(fault), f"{_fault_codes(fault)}; {left_out}")
+            wording = [fault.get("message"), *(entry.get("message") for entry in fault.get("parameters") or [])]
+            for text in wording:
+                # A WPA passphrase is at least 8 characters, so a shorter text cannot hold one.
+                if isinstance(text, str) and len(text.strip()) >= 8 and text in message:
+                    message = message.replace(text, f"({left_out})")
+            details.pop("fault_message", None)
+        return message, details
+
+    def _activity_label(self, job: dict[str, Any]) -> str:
+        request = job.get("request") or {}
+        if job["kind"] == KIND_FIRMWARE:
+            return f"Firmware upgrade to {request.get('version')}"
+        if job["kind"] == KIND_WIFI:
+            return f"Wi-Fi change ({request.get('band')})"
+        return "Reboot"
+
+    def _activity_details(self, job: dict[str, Any]) -> dict[str, Any]:
+        # Keys the activity log would take for a secret's name (pass, key, token, ...)
+        # are avoided; it refuses the whole entry over one.
+        request = job.get("request") or {}
+        details: dict[str, Any] = {"job": job["id"], "state": job["state"], "via": "tr069"}
+        if job.get("cancelled_by"):
+            details["cancelled_by"] = job["cancelled_by"]
+        if job["kind"] == KIND_FIRMWARE:
+            details.update(
+                {
+                    "firmware": request.get("firmware"),
+                    "version": request.get("version"),
+                    "from_version": request.get("from_version"),
+                    "sha256": request.get("sha256"),
+                    "model_mismatch_confirmed": bool(request.get("model_mismatch")),
+                }
+            )
+        elif job["kind"] == KIND_WIFI:
+            details["band"] = request.get("band")
+            # Which settings changed; the passphrase itself is only ever in the vault.
+            details["changed"] = []
+            if request.get("ssid") is not None:
+                details["changed"].append("ssid")
+                details["ssid"] = request["ssid"]
+            if request.get("passphrase"):
+                details["changed"].append("passphrase")
+        fault = job.get("fault")
+        if isinstance(fault, dict):
+            details["fault_code"] = fault.get("code")
+            details["fault_message"] = fault.get("message")
+        return details
 
     def _queue(self, job: dict[str, Any], token: str, task: nbi_tasks.Task) -> dict[str, Any]:
         stored = self.client.queue_task(job["acs_id"], task)
@@ -716,7 +1185,7 @@ class AcsService:
         transition(job, WAITING_FOR_CHECKIN, self._waiting_message(job, result.reason), now)
 
     def _waiting_message(self, job: dict[str, Any], reason: str) -> str:
-        verb = "apply" if job["kind"] == KIND_WIFI else "run"
+        verb = {KIND_WIFI: "apply", KIND_FIRMWARE: "start"}.get(job["kind"], "run")
         when = f", expected around {job['expected_by']}" if job.get("expected_by") else ""
         why = f" ({reason})" if reason else ""
         return f"Queued. The router is not reachable right now{why}, so this will {verb} at its next check-in{when}."
@@ -908,7 +1377,7 @@ class AcsService:
                     old["watch"] = None
                     note(old, f"A newer Wi-Fi change (job {new_id}) replaces this one's read-back.", self._now())
             finally:
-                self.jobs.release(old["id"], token, old)
+                self._release(old["id"], token, old)
 
     # -- advancing ------------------------------------------------------------------------
 
@@ -930,6 +1399,8 @@ class AcsService:
                 self._advance_reboot(job, closing)
             elif phase == "refresh":
                 self._advance_refresh(job, closing)
+            elif phase == "firmware":
+                self._advance_firmware(job, closing)
             else:
                 self._lost(job)
         elif job.get("watch") == WATCH_SCRUB:
@@ -1403,3 +1874,109 @@ class AcsService:
         if step["gone_checks"] < 2 and not closing:
             return
         self._end(job, ACKNOWLEDGED, "GenieACS finished the refresh, but the router sent nothing newer.")
+
+    # Firmware ---------------------------------------------------------------------------
+
+    def _advance_firmware(self, job: dict[str, Any], closing: bool) -> None:
+        step = self._find_step(job, "download")
+        if step is None:
+            self._lost(job)
+            return
+        self._ensure_contacted(job, step, closing)
+        acs_id, request = job["acs_id"], job["request"]
+        # A failed transfer is reported in TransferComplete, possibly sessions after
+        # the task went, so the task's channel is looked at on every poll.
+        faults = self.client.faults(ids=[f"{acs_id}:task_{step['task_id']}"])
+        if faults:
+            # Clearing it also stops GenieACS sending the Download again (F16).
+            if not self._clear(faults[-1]):
+                return
+            step["outcome"] = "faulted"
+            job["fault"] = _fault_summary(faults[-1])
+            self._end(
+                job,
+                REJECTED,
+                f"The router did not install firmware {request['version']}: {_fault_text(job['fault'])}",
+            )
+            return
+        if not step.get("outcome"):
+            if self.client.tasks(ids=[step["task_id"]]):
+                self._while_pending(job, step, closing)
+                return
+            step["outcome"] = "gone"
+
+        now = self._now()
+        device = params.firmware_identity(self._device(acs_id, params.FIRMWARE_PROJECTION), now, self.inform_interval)
+        target, running = request["version"], device["software_version"]
+        submitted = parse_time(step.get("submitted_ts"))
+        last_boot = parse_time(device["last_boot"])
+        # Both times are GenieACS's, so clock skew cannot fake a boot.
+        if running == target and last_boot and submitted and last_boot > submitted:
+            job["result"].update({"running": running, "booted_at": iso(last_boot)})
+            self._end(job, VERIFIED, f"The router restarted at {iso(last_boot)} and now runs firmware {target}.")
+            return
+        if closing:
+            return
+        if "accepted_at" not in job["result"]:
+            self._firmware_accepted(job, step, device, now)
+            return
+
+        accepted_inform = parse_time(job["result"].get("accepted_inform"))
+        if last_boot and accepted_inform and last_boot > accepted_inform:
+            # It restarted after taking the download, but not into the new version.
+            # GenieACS saves the device and the transfer's fault separately, so one
+            # more look gives the fault the chance to explain why.
+            step["boot_checks"] = step.get("boot_checks", 0) + 1
+            if step["boot_checks"] < 2:
+                return
+            job["result"].update({"running": running, "booted_at": iso(last_boot)})
+            if running == request["from_version"]:
+                message = (
+                    f"The router restarted after accepting the download but still runs firmware {running}; "
+                    f"it did not install {target}."
+                )
+            else:
+                message = (
+                    f"The router restarted and reports firmware {running or 'unknown'}, not {target}. "
+                    "Check that the version recorded for this file is exactly what the router reports."
+                )
+            self._end(job, NOT_APPLIED, message)
+            return
+        accepted_at = parse_time(job["result"].get("accepted_at"))
+        if accepted_at is None or now - accepted_at < FIRMWARE_INSTALL_WAIT:
+            return
+        last_inform = parse_time(device["last_inform"])
+        if last_inform and accepted_inform and last_inform > accepted_inform:
+            message = (
+                f"The router accepted the firmware download at {iso(accepted_at)} and has checked in since, "
+                f"but still reports firmware {running}. It may install it later; check the router."
+            )
+        else:
+            message = (
+                f"The router accepted the firmware download at {iso(accepted_at)} but has not checked in since. "
+                "It may still be installing, or it may not have come back; check it on site."
+            )
+        self._end(job, EXPIRED, message)
+
+    def _firmware_accepted(
+        self, job: dict[str, Any], step: dict[str, Any], device: dict[str, Any], now: datetime
+    ) -> None:
+        """The download task has gone without a fault: accepted, or dropped unrun as expired."""
+        last_inform = parse_time(device["last_inform"])
+        expiry = parse_time(step.get("expiry"))
+        if expiry is not None and last_inform is not None and last_inform >= expiry:
+            # GenieACS drops an expired task, unrun, at the first session after its
+            # expiry, so a task that went in a session that late was never sent.
+            self._end(job, EXPIRED, f"The router did not check in before the upgrade expired at {step['expiry']}.")
+            return
+        job["result"]["accepted_at"] = iso(now)
+        # GenieACS's time for the session that took it, to compare _lastBoot with.
+        job["result"]["accepted_inform"] = device["last_inform"]
+        job["expected_by"] = None
+        transition(
+            job,
+            WAITING_FOR_CHECKIN,
+            f"The router accepted the download of firmware {job['request']['version']}; "
+            "waiting for it to install it, restart and check in.",
+            now,
+        )

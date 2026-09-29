@@ -15,6 +15,7 @@ class FakeManager:
         self.status = status if status is not None else {"online": True, "uptime_seconds": 100000}
         self.reboot_result = reboot_result
         self.reboots: list[str] = []
+        self.actors: list[str] = []
 
     def get_all_devices(self):
         return list(self.devices)
@@ -24,8 +25,9 @@ class FakeManager:
             return self.status
         return self.status[identifier]
 
-    def reboot_device(self, identifier):
+    def reboot_device(self, identifier, actor="system"):
         self.reboots.append(identifier)
+        self.actors.append(actor)
         return self.reboot_result
 
 
@@ -229,7 +231,7 @@ class TestAmbiguousRebootOutcome:
 
     def test_connection_dropped_by_the_reboot_still_counts(self, tmp_path: Path):
         class DropsConnection(FakeManager):
-            def reboot_device(self, identifier):
+            def reboot_device(self, identifier, actor="system"):
                 self.reboots.append(identifier)
                 raise AdapterError("router request failed: connection reset by peer")
 
@@ -293,7 +295,7 @@ class TestUnexpectedErrorIsolation:
             pass
 
         class FailsFirst(FakeManager):
-            def reboot_device(self, identifier):
+            def reboot_device(self, identifier, actor="system"):
                 self.reboots.append(identifier)
                 if identifier == "bad":
                     raise SshChannelClosed("channel closed")
@@ -413,3 +415,207 @@ class TestWindowBoundaries:
         fired = self._sweep(scheduler, datetime(2026, 11, 1, 4, 0, tzinfo=UTC), 6)
 
         assert fired == [datetime(2026, 11, 1, 5, 30, tzinfo=UTC)]
+
+
+class StubMaintenance:
+    """MaintenanceRunner as RebootScheduler uses it."""
+
+    def __init__(self, results=None, error=None, restarted=None):
+        self.results = results or []
+        self.error = error
+        self.restarted = restarted
+        self.reboot_history = None
+        self.calls: list[datetime | None] = []
+        self.started = threading.Event()
+        self.release: threading.Event | None = None
+
+    def run_once(self, now=None):
+        self.calls.append(now)
+        self.started.set()
+        if self.release is not None:
+            self.release.wait(5)
+        if self.error is not None:
+            raise self.error
+        return [dict(result) for result in self.results]
+
+    def last_restart(self, device_id):
+        return self.restarted
+
+
+PLAN_RESULT = {"source": "maintenance", "device": "router-2", "status": "done"}
+
+
+class TestTick:
+    def test_the_scheduler_names_itself_in_the_activity_log(self, tmp_path: Path):
+        manager = FakeManager([make_device()])
+        RebootScheduler(manager, tmp_path / "state.json").run_once(at(4, 1))
+        assert manager.actors == ["scheduler"]
+
+    def test_without_plans_a_tick_is_run_once_with_a_source(self, tmp_path: Path):
+        manager = FakeManager([make_device()])
+        results = RebootScheduler(manager, tmp_path / "state.json").tick(at(4, 1))
+        assert [(item["device"], item["status"], item["source"]) for item in results] == [
+            ("router-1", "initiated", "reboot")
+        ]
+
+    def test_a_tick_runs_the_reboots_and_the_plans(self, tmp_path: Path):
+        stub = StubMaintenance(results=[PLAN_RESULT])
+        scheduler = RebootScheduler(FakeManager([make_device()]), tmp_path / "state.json", maintenance=stub)
+        results = scheduler.tick(at(4, 1), wait=True)
+        assert [item["source"] for item in results] == ["reboot", "maintenance"]
+        assert stub.calls == [at(4, 1)]
+
+    def test_a_failing_reboot_pass_does_not_stop_the_plans(self, tmp_path: Path, monkeypatch):
+        stub = StubMaintenance(results=[PLAN_RESULT])
+        scheduler = RebootScheduler(FakeManager([make_device()]), tmp_path / "state.json", maintenance=stub)
+
+        def unreadable(now=None):
+            raise SchedulerError("scheduler state is unreadable")
+
+        monkeypatch.setattr(scheduler, "run_once", unreadable)
+        results = scheduler.tick(at(4, 1), wait=True)
+        assert results == [
+            {"source": "reboot", "action": "reboot", "status": "failed", "reason": "scheduler state is unreadable"},
+            PLAN_RESULT,
+        ]
+
+    def test_a_failing_plan_pass_does_not_stop_the_reboots(self, tmp_path: Path):
+        stub = StubMaintenance(error=RuntimeError("maintenance plans are unreadable"))
+        manager = FakeManager([make_device()])
+        results = RebootScheduler(manager, tmp_path / "state.json", maintenance=stub).tick(at(4, 1), wait=True)
+        assert [(item["source"], item["status"]) for item in results] == [
+            ("reboot", "initiated"),
+            ("maintenance", "failed"),
+        ]
+        assert "maintenance plans are unreadable" in results[1]["reason"]
+        assert manager.reboots == ["router-1"]
+
+    def test_a_long_plan_pass_does_not_hold_up_the_reboots(self, tmp_path: Path):
+        stub = StubMaintenance(results=[PLAN_RESULT])
+        stub.release = threading.Event()
+        manager = FakeManager([make_device()])
+        scheduler = RebootScheduler(manager, tmp_path / "state.json", maintenance=stub)
+
+        first = scheduler.tick(at(4, 1))
+        assert stub.started.wait(5)
+        assert [item["source"] for item in first] == ["reboot"]
+        assert manager.reboots == ["router-1"]
+        # The pass still running is not joined by a second one.
+        assert scheduler.tick(at(4, 2)) == []
+        assert scheduler.join_maintenance(0.05) is False
+
+        stub.release.set()
+        assert scheduler.join_maintenance(5) is True
+        later = scheduler.tick(at(4, 3), wait=True)
+        assert later == [PLAN_RESULT, PLAN_RESULT]
+        assert stub.calls == [at(4, 1), at(4, 3)]
+
+    def test_a_plans_restart_starts_the_device_cooldown(self, tmp_path: Path):
+        stub = StubMaintenance(restarted=at(2, 0))
+        manager = FakeManager([make_device(cooldown_seconds=21600)])
+        results = RebootScheduler(manager, tmp_path / "state.json", maintenance=stub).run_once(at(4, 1))
+        assert results[0]["reason"] == "cooldown active: a maintenance plan restarted it recently"
+        assert manager.reboots == []
+
+    def test_an_old_plan_restart_does_not_hold_the_reboot(self, tmp_path: Path):
+        stub = StubMaintenance(restarted=at(4, 1) - timedelta(seconds=21600))
+        manager = FakeManager([make_device(cooldown_seconds=21600)])
+        RebootScheduler(manager, tmp_path / "state.json", maintenance=stub).run_once(at(4, 1))
+        assert manager.reboots == ["router-1"]
+
+    def test_the_plans_see_the_schedulers_reboots(self, tmp_path: Path):
+        stub = StubMaintenance()
+        scheduler = RebootScheduler(FakeManager([make_device()]), tmp_path / "state.json", maintenance=stub)
+        scheduler.run_once(at(4, 1))
+        assert stub.reboot_history is not None
+        assert stub.reboot_history("router-1") == at(4, 1)
+        assert stub.reboot_history("router-2") is None
+
+    def test_a_plan_in_the_same_window_as_the_device_policy_restarts_it_once(self, tmp_path: Path):
+        from cudy_manager.activity import ActivityLog
+        from cudy_manager.maintenance import MaintenanceRunner, MaintenanceStore
+
+        class Manager(FakeManager):
+            def get_device(self, identifier):
+                return next(device for device in self.devices if device.identifier == identifier)
+
+        manager = Manager([make_device()])
+        store = MaintenanceStore(tmp_path)
+        store.create(
+            {
+                "name": "Tuesday",
+                "targets": {"devices": ["router-1"]},
+                "schedule": {"days": ["tue"], "start": "04:00", "timezone": "UTC"},
+                "actions": ["reboot"],
+            }
+        )
+        runner = MaintenanceRunner(manager, None, store, ActivityLog(tmp_path), max_workers=1)
+        scheduler = RebootScheduler(manager, tmp_path / "state.json", maintenance=runner)
+
+        results = scheduler.tick(at(4, 1), wait=True)
+
+        assert [(item["source"], item["status"]) for item in results] == [
+            ("reboot", "initiated"),
+            ("maintenance", "skipped"),
+        ]
+        assert results[1]["reason"].startswith("cooldown active")
+        assert manager.reboots == ["router-1"]
+
+    def test_a_pass_the_tick_did_not_time_reads_its_own_clock(self, tmp_path: Path):
+        # The devices' own reboots can take minutes; a pass handed the tick's moment
+        # afterwards would test its windows against a time already gone.
+        stub = StubMaintenance()
+        scheduler = RebootScheduler(
+            FakeManager([make_device()]), tmp_path / "state.json", clock=lambda: at(4, 1), maintenance=stub
+        )
+        scheduler.tick(wait=True)
+        assert stub.calls == [None]
+
+
+def _runner_on(tmp_path: Path, manager, clock=None):
+    from cudy_manager.activity import ActivityLog
+    from cudy_manager.maintenance import MaintenanceRunner, MaintenanceStore
+
+    store = MaintenanceStore(tmp_path)
+    created = store.create(
+        {
+            "name": "Tuesday",
+            "targets": {"devices": ["router-1"]},
+            "schedule": {"days": ["tue"], "start": "02:00", "timezone": "UTC"},
+            "actions": ["reboot"],
+        }
+    )
+    return MaintenanceRunner(manager, None, store, ActivityLog(tmp_path), clock=clock, max_workers=1), created
+
+
+class _Manager(FakeManager):
+    def get_device(self, identifier):
+        return next(device for device in self.devices if device.identifier == identifier)
+
+
+class TestSharedCooldown:
+    def test_a_plans_reboot_holds_the_devices_own_reboot_in_its_cooldown(self, tmp_path: Path):
+        manager = _Manager([make_device(cooldown_seconds=21600)])
+        runner, _ = _runner_on(tmp_path, manager)
+        scheduler = RebootScheduler(manager, tmp_path / "state.json", maintenance=runner)
+
+        (planned,) = runner.run_once(at(2, 10))
+        results = scheduler.run_once(at(4, 1))
+
+        assert planned["status"] == "done"
+        assert results[0]["reason"] == "cooldown active: a maintenance plan restarted it recently"
+        assert manager.reboots == ["router-1"]
+
+    def test_a_reboot_another_process_sent_is_seen_by_a_waiting_runner(self, tmp_path: Path):
+        # The CLI builds its runner, then waits at its confirmation prompt while the
+        # server's own scheduler reboots the device.
+        manager = _Manager([make_device(cooldown_seconds=21600)])
+        runner, created = _runner_on(tmp_path, manager, clock=lambda: at(4, 2))
+        RebootScheduler(manager, tmp_path / "state.json", maintenance=runner)
+        server = RebootScheduler(manager, tmp_path / "state.json")
+        assert server.run_once(at(4, 1))[0]["status"] == "initiated"
+
+        (result,) = runner.run_now(created["id"], "ops")
+
+        assert result["status"] == "skipped" and result["reason"].startswith("cooldown active")
+        assert manager.reboots == ["router-1"]

@@ -15,9 +15,9 @@ from typing import Any
 
 from ..models import ValidationError
 
-# factoryReset and download come in a later phase; addObject, deleteObject and
-# provisions are never sent from SkyRouter.
-ALLOWED_TASK_NAMES = frozenset({"getParameterValues", "setParameterValues", "refreshObject", "reboot"})
+# factoryReset comes in a later phase; addObject, deleteObject and provisions are
+# never sent from SkyRouter.
+ALLOWED_TASK_NAMES = frozenset({"getParameterValues", "setParameterValues", "refreshObject", "reboot", "download"})
 
 # Vendor names such as X_ZTE-COM_ServiceList contain "-". A trailing dot is not a
 # parameter path in GenieACS's task syntax.
@@ -48,6 +48,15 @@ DEFAULT_EXPIRY = 3600
 # A Wi-Fi change must survive a router behind CGNAT that only checks in on its
 # periodic inform (§3.4).
 WIFI_EXPIRY = 21600
+# A firmware upgrade is planned, not urgent: a router that only informs a few times
+# a day still gets it.
+FIRMWARE_EXPIRY = 86400
+
+# Only files SkyRouter uploaded itself. genieacs-fs serves every stored file to
+# anyone who asks for its name, without authentication, so the names carry a random
+# token; and a free-form name or fileType/fileName would let a caller point a router
+# at any file on the ACS, including one uploaded for a different model.
+FIRMWARE_FILE_RE = re.compile(r"skybre-fw-[a-z0-9-]{8,80}")
 
 _COMMON_KEYS = frozenset({"name", "expiry", "uniqueKey", "skyrouterJob", "skyrouterStep"})
 _TASK_KEYS = {
@@ -55,9 +64,16 @@ _TASK_KEYS = {
     "setParameterValues": frozenset({"parameterValues"}),
     "refreshObject": frozenset({"objectName"}),
     "reboot": frozenset(),
+    "download": frozenset({"file"}),
 }
 
 ParamValue = str | bool | int
+
+
+def validate_firmware_name(name: Any) -> str:
+    if not isinstance(name, str) or not FIRMWARE_FILE_RE.fullmatch(name):
+        raise ValidationError("firmware file names look like skybre-fw-<8-80 lowercase letters, digits or '-'>")
+    return name
 
 
 def validate_path(path: Any, what: str = "parameter path") -> str:
@@ -138,6 +154,8 @@ def validate_task(task: Mapping[str, Any]) -> None:
         # GenieACS reads "" as the whole data model, which on a large router is a long
         # session SkyRouter never needs: refreshing one root covers the same ground.
         validate_path(task["objectName"], "refreshObject objectName")
+    elif name == "download":
+        validate_firmware_name(task["file"])
 
 
 def _paths(values: Sequence[str], what: str) -> tuple[str, ...]:
@@ -163,6 +181,7 @@ class Task:
     parameter_names: tuple[str, ...] = ()
     parameter_values: tuple[tuple[str, ParamValue], ...] = ()
     object_name: str | None = None
+    file: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameter_names", _paths(self.parameter_names, "parameter_names"))
@@ -178,6 +197,7 @@ class Task:
             "parameter_names": bool(self.parameter_names) and self.name != "getParameterValues",
             "parameter_values": bool(self.parameter_values) and self.name != "setParameterValues",
             "object_name": self.object_name is not None and self.name != "refreshObject",
+            "file": self.file is not None and self.name != "download",
         }
         if any(stray.values()):
             raise ValidationError(f"{self.name} does not take {', '.join(k for k, v in stray.items() if v)}")
@@ -191,6 +211,8 @@ class Task:
             body["parameterValues"] = [[path, value] for path, value in self.parameter_values]
         elif self.name == "refreshObject":
             body["objectName"] = self.object_name
+        elif self.name == "download":
+            body["file"] = self.file
         body["expiry"] = self.expiry
         body["uniqueKey"] = self.unique_key
         body["skyrouterJob"] = self.job
@@ -208,9 +230,10 @@ class Task:
 
     def __repr__(self) -> str:
         # Values stay out so a task in a log line or a traceback cannot leak a passphrase.
+        file = f", file={self.file!r}" if self.file is not None else ""
         return (
             f"Task(name={self.name!r}, job={self.job!r}, step={self.step!r}, "
-            f"unique_key={self.unique_key!r}, expiry={self.expiry!r}, paths={self.paths!r})"
+            f"unique_key={self.unique_key!r}, expiry={self.expiry!r}, paths={self.paths!r}{file})"
         )
 
 
@@ -239,3 +262,15 @@ def refresh_object(object_name: str, *, job: str, step: str, unique_key: str, ex
 
 def reboot(*, job: str, step: str, unique_key: str = "skyrouter-reboot", expiry: int = DEFAULT_EXPIRY) -> Task:
     return Task("reboot", job, step, unique_key, expiry)
+
+
+def download(
+    file: str, *, job: str, step: str, unique_key: str = "skyrouter-firmware", expiry: int = FIRMWARE_EXPIRY
+) -> Task:
+    """A firmware Download of one file SkyRouter stored on the ACS, by its file ID.
+
+    GenieACS fills in the file type, URL and size from the stored file. The task
+    going away only means the router accepted the Download RPC: whether it installed
+    the image shows later, in TransferComplete and DeviceInfo.SoftwareVersion.
+    """
+    return Task("download", job, step, unique_key, expiry, file=file)

@@ -13,7 +13,11 @@ holder of the lease advances it, everyone else leaves it alone, and a lease left
 behind by a process that died runs out.
 
 A record never holds a secret. A Wi-Fi change keeps its passphrase in the vault,
-and the job only keeps the vault reference.
+and the job only keeps the vault reference. A firmware job keeps the stored file's
+name and checksum, never its content.
+
+The firmware library's index (FirmwareIndex) lives beside the jobs, in
+data_dir/acs_firmware.json, under the same locking and atomic-rename rules.
 """
 
 import contextlib
@@ -77,7 +81,8 @@ TRANSITIONS: dict[str, frozenset[str]] = {
 KIND_WIFI = "wifi"
 KIND_REBOOT = "reboot"
 KIND_REFRESH = "refresh"
-KINDS = (KIND_WIFI, KIND_REBOOT, KIND_REFRESH)
+KIND_FIRMWARE = "firmware"
+KINDS = (KIND_WIFI, KIND_REBOOT, KIND_REFRESH, KIND_FIRMWARE)
 
 # What a terminal job may still be watching for: the read-back of an acknowledged
 # Wi-Fi change, or the 1 BOOT inform after an accepted reboot.
@@ -95,6 +100,23 @@ JOB_ID_RE = re.compile(r"[0-9a-f]{16}")
 
 class JobStoreError(RuntimeError):
     pass
+
+
+def _write_whole(path: Path, payload: bytes) -> None:
+    """Replace ``path`` through a private temporary file, so a reader never sees half of it."""
+    fd, temporary = tempfile.mkstemp(prefix=path.stem + ".", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
 
 
 def new_job_id() -> str:
@@ -196,20 +218,8 @@ class JobStore:
         return jobs
 
     def _save(self, jobs: dict[str, dict[str, Any]]) -> None:
-        payload = json.dumps({"version": FORMAT_VERSION, "jobs": jobs}, indent=2, sort_keys=True).encode()
-        fd, temporary = tempfile.mkstemp(prefix="acs_jobs.", dir=self.path.parent)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-            with contextlib.suppress(OSError):
-                os.chmod(self.path, 0o600)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary)
+        payload = {"version": FORMAT_VERSION, "jobs": jobs}
+        _write_whole(self.path, json.dumps(payload, indent=2, sort_keys=True).encode())
 
     @contextlib.contextmanager
     def _exclusive(self) -> Iterator[dict[str, dict[str, Any]]]:
@@ -322,3 +332,74 @@ class JobStore:
             for job_id in stale:
                 del jobs[job_id]
             return len(stale)
+
+
+# --- the firmware library ---------------------------------------------------------------
+
+FIRMWARE_FILE = "acs_firmware.json"
+
+
+class FirmwareIndex:
+    """What SkyRouter knows about the firmware files it stored on the ACS.
+
+    GenieACS keeps only fileType, oui, productClass and version with a file, so the
+    checksum, size, original file name and upload time are kept here. A record never
+    holds the file's content.
+    """
+
+    def __init__(self, data_dir: str | Path):
+        self.path = Path(data_dir).expanduser() / FIRMWARE_FILE
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._lock_path = self.path.with_name(self.path.name + ".lock")
+        self._lock = threading.RLock()
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        try:
+            raw = self.path.read_text()
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise JobStoreError("ACS firmware index is unreadable") from exc
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            # Never start afresh over it: it is the only record of which stored files
+            # are SkyRouter's and what their checksums are.
+            raise JobStoreError(f"ACS firmware index {self.path} is corrupt") from exc
+        files = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(files, dict) or not all(
+            isinstance(key, str) and isinstance(value, dict) for key, value in files.items()
+        ):
+            raise JobStoreError(f"ACS firmware index {self.path} has an invalid format")
+        return files
+
+    @contextlib.contextmanager
+    def _exclusive(self) -> Iterator[dict[str, dict[str, Any]]]:
+        with self._lock:
+            handle = os.open(self._lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                files = self._load()
+                before = json.dumps(files, sort_keys=True)
+                yield files
+                if json.dumps(files, sort_keys=True) != before:
+                    payload = {"version": FORMAT_VERSION, "files": files}
+                    _write_whole(self.path, json.dumps(payload, indent=2, sort_keys=True).encode())
+            finally:
+                os.close(handle)
+
+    def all(self) -> dict[str, dict[str, Any]]:
+        return self._load()
+
+    def get(self, name: str) -> dict[str, Any] | None:
+        return self._load().get(name)
+
+    def add(self, record: dict[str, Any]) -> None:
+        with self._exclusive() as files:
+            if record["name"] in files:
+                raise JobStoreError(f"firmware {record['name']} is already in the library")
+            files[record["name"]] = copy.deepcopy(record)
+
+    def remove(self, name: str) -> dict[str, Any] | None:
+        with self._exclusive() as files:
+            return files.pop(name, None)

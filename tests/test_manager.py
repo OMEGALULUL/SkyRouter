@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 import cudy_manager.manager as manager_module
+from cudy_manager.activity import ActivityError, ActivityLog
 from cudy_manager.adapters import AdapterError, AuthenticationRejected, ProtocolMismatch, UnsupportedOperation
 from cudy_manager.manager import DeviceManager, ManagerError
 from cudy_manager.models import ValidationError
@@ -1001,3 +1002,391 @@ class TestWifiPassword:
         device = manager.add_device("r1", "192.168.1.1", vendor, password="p", transport=transport)
         with pytest.raises(UnsupportedOperation, match="Wi-Fi password"):
             manager.adapter_for(device).set_wifi_password("goodpassword")
+
+
+def build_logged_manager(tmp_path: Path) -> tuple[DeviceManager, ActivityLog]:
+    activity = ActivityLog(tmp_path / "data")
+    manager = DeviceManager(
+        config_path=tmp_path / "cudy_devices.yaml",
+        data_dir=tmp_path / "data",
+        secret_store=SecretStore(tmp_path / "data"),
+        activity=activity,
+    )
+    return manager, activity
+
+
+class _Router:
+    """A router that answers every operation with ``outcome`` and remembers what it was asked."""
+
+    def __init__(self, outcome: object = True, during=None):
+        self.outcome = outcome
+        self.during = during
+        self.calls: list[tuple] = []
+
+    def _answer(self, *call):
+        self.calls.append(call)
+        if self.during is not None:
+            self.during()
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+    def status(self):
+        self._answer("status")
+        return {"online": True}
+
+    def reboot(self):
+        return self._answer("reboot")
+
+    def set_ssid(self, ssid, radio=None):
+        return self._answer("set_ssid", ssid, radio)
+
+    def set_wifi_password(self, password, radio=None):
+        return self._answer("set_wifi_password", password, radio)
+
+
+class TestActivityLogging:
+    def raw(self, tmp_path: Path) -> bytes:
+        path = tmp_path / "data" / "activity.jsonl"
+        return path.read_bytes() if path.exists() else b""
+
+    def only(self, activity: ActivityLog) -> dict:
+        (entry,) = activity.list()
+        return entry
+
+    def test_without_an_activity_log_nothing_is_recorded(self, tmp_path: Path, monkeypatch):
+        manager = build_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p", actor="alice")
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _Router())
+        assert manager.reboot_device("r1", actor="alice")
+        assert not (tmp_path / "data" / "activity.jsonl").exists()
+
+    def test_adding_a_router_names_who_and_where(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device(
+            "r1", "192.168.1.1", "cudy", password="router-secret-1", actor="alice", metadata={"name": "Shop"}
+        )
+        entry = self.only(activity)
+        assert (entry["who"], entry["router"], entry["router_name"]) == ("alice", "r1", "Shop")
+        assert (entry["kind"], entry["result"]) == ("setup", "applied")
+        assert entry["what"] == "Added cudy router at 192.168.1.1:80"
+        assert entry["details"] == {"vendor": "cudy", "host": "192.168.1.1", "transport": "web"}
+        assert b"router-secret-1" not in self.raw(tmp_path)
+
+    def test_the_default_actor_is_system(self, tmp_path: Path, monkeypatch):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _Router())
+        manager.reboot_device("r1")
+        assert [entry["who"] for entry in activity.list()] == ["system", "system"]
+
+    def test_a_router_without_a_name_is_shown_by_its_id(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "tplink", password="p")
+        assert self.only(activity)["router_name"] == "r1"
+
+    def test_a_refused_add_is_recorded_with_the_reason(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        with pytest.raises(ManagerError):
+            manager.add_device("r1", "192.168.1.2", "cudy", password="p", actor="bob")
+        with pytest.raises(ValidationError):
+            manager.add_device("r2", "192.168.1.3", "ubiquiti", password="p", actor="bob")
+        vendor, duplicate, _ = activity.list()
+        assert (duplicate["result"], duplicate["router"], duplicate["who"]) == ("refused", "r1", "bob")
+        assert duplicate["what"] == "Adding the router refused: device 'r1' already exists"
+        assert vendor["what"] == "Adding the router refused: vendor must be cudy, tenda, or tplink"
+        assert vendor["router"] == "r2"
+
+    def test_an_edit_names_each_setting_it_changed_with_old_and_new_values(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        manager.update_device(
+            "r1",
+            actor="bob",
+            model="AP1300",
+            http_port=8080,
+            enabled=False,
+            reboot={"enabled": True, "at": "04:30", "timezone": "Europe/Lisbon"},
+            metadata={"note": "gate code 4471"},
+        )
+        entry = activity.list()[0]
+        assert (entry["who"], entry["kind"], entry["result"]) == ("bob", "setup", "applied")
+        assert entry["what"] == (
+            'Settings changed: http_port 80 → 8080, model "" → "AP1300", enabled on → off, '
+            "reboot schedule off → daily at 04:30 Europe/Lisbon, metadata"
+        )
+        assert entry["details"] == {"changed": ["http_port", "model", "enabled", "reboot", "metadata"]}
+        assert b"4471" not in self.raw(tmp_path), "free-form metadata was copied into the log"
+
+    def test_an_edit_that_changes_nothing_says_so(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        manager.update_device("r1", model="", http_port="80")
+        assert activity.list()[0]["what"] == "Settings saved with no changes"
+
+    def test_a_password_set_through_an_edit_is_a_credentials_entry_without_the_password(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="first-router-pass")
+        manager.update_device("r1", password="n3w-router-pass", snmp_community="c0mmunity-str", actor="bob")
+        entry = activity.list()[0]
+        assert (entry["kind"], entry["result"]) == ("credentials", "applied")
+        assert entry["what"] == "router login password replaced; SNMP community replaced"
+        assert entry["details"] == {"changed": ["password", "snmp_community"]}
+        raw = self.raw(tmp_path)
+        for secret in (b"first-router-pass", b"n3w-router-pass", b"c0mmunity-str"):
+            assert secret not in raw
+
+    def test_editing_a_missing_router_is_refused(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        with pytest.raises(ManagerError):
+            manager.update_device("ghost", model="x", actor="bob")
+        entry = self.only(activity)
+        assert (entry["router"], entry["result"], entry["kind"]) == ("ghost", "refused", "setup")
+        assert entry["what"] == "Settings change refused: device 'ghost' does not exist"
+
+    def test_an_edit_is_attributed_by_id_never_by_a_matching_host(self, tmp_path: Path):
+        """update and remove take an id; naming another device whose host matches would blame it."""
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "10.0.0.1", "cudy", password="p")
+        with pytest.raises(ManagerError):
+            manager.remove_device("10.0.0.1", actor="bob")
+        assert activity.list()[0]["router"] == "10.0.0.1"
+        assert set(manager.devices) == {"r1"}
+
+    def test_removal_is_recorded(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "tenda", password="p", metadata={"name": "Office"})
+        manager.remove_device("r1", actor="carol")
+        entry = activity.list()[0]
+        assert (entry["who"], entry["router"], entry["router_name"]) == ("carol", "r1", "Office")
+        assert (entry["kind"], entry["result"]) == ("setup", "applied")
+        assert entry["what"] == "Removed tenda router at 192.168.1.1:80"
+        with pytest.raises(ManagerError):
+            manager.remove_device("r1", actor="carol")
+        assert activity.list()[0]["what"] == "Removing the router refused: device 'r1' does not exist"
+
+    @pytest.mark.parametrize(
+        ("verify", "outcome", "what", "verification"),
+        [
+            (False, True, "Router login password changed (not tested)", "skipped"),
+            (True, True, "Router login password changed and accepted by the router", "ok"),
+            (
+                True,
+                AuthenticationRejected("wrong"),
+                "Router login password changed, but the router rejected it",
+                "rejected",
+            ),
+            (
+                True,
+                AdapterError("timed out"),
+                "Router login password changed; it could not be tested (unreachable)",
+                "unreachable",
+            ),
+        ],
+    )
+    def test_a_password_change_records_how_its_test_went(
+        self, tmp_path: Path, monkeypatch, verify, outcome, what, verification
+    ):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _Router(outcome))
+        manager.set_password("192.168.1.1", "rotated-login-pass", verify=verify, actor="dave")
+        entry = activity.list()[0]
+        assert (entry["who"], entry["router"], entry["kind"]) == ("dave", "r1", "credentials")
+        assert entry["result"] == "applied"
+        assert entry["what"] == what
+        assert entry["details"] == {"verification": verification}
+        assert b"rotated-login-pass" not in self.raw(tmp_path)
+
+    def test_a_reboot_is_recorded_once_it_has_finished(self, tmp_path: Path, monkeypatch):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        seen_during: list[int] = []
+        router = _Router(True, during=lambda: seen_during.append(len(activity.list())))
+        monkeypatch.setattr(manager, "adapter_for", lambda device: router)
+        assert manager.reboot_device("r1", actor="erin")
+        assert seen_during == [1], "the reboot was logged before the router answered"
+        entry = activity.list()[0]
+        assert (entry["who"], entry["kind"], entry["result"], entry["what"]) == (
+            "erin",
+            "reboot",
+            "applied",
+            "Reboot started",
+        )
+
+    @pytest.mark.parametrize(
+        ("outcome", "result", "what"),
+        [
+            (False, "failed", "Reboot not confirmed by the router"),
+            (AdapterError("timed out"), "failed", "Reboot failed: timed out"),
+            (UnsupportedOperation("no reboot here"), "refused", "Reboot refused: no reboot here"),
+        ],
+    )
+    def test_a_reboot_that_did_not_happen_says_why(self, tmp_path: Path, monkeypatch, outcome, result, what):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _Router(outcome))
+        if isinstance(outcome, BaseException):
+            with pytest.raises(type(outcome)):
+                manager.reboot_device("r1")
+        else:
+            assert manager.reboot_device("r1") is False
+        entry = activity.list()[0]
+        assert (entry["result"], entry["what"]) == (result, what)
+
+    def test_a_credential_the_router_refused_is_not_sent_again_and_that_is_a_refusal(
+        self, tmp_path: Path, monkeypatch
+    ):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "tplink", password="wrong")
+        router = _Router(AuthenticationRejected("bad password"))
+        monkeypatch.setattr(manager, "adapter_for", lambda device: router)
+        with pytest.raises(AuthenticationRejected):
+            manager.reboot_device("r1")
+        with pytest.raises(AuthenticationRejected, match="already rejected"):
+            manager.reboot_device("r1")
+        assert router.calls == [("reboot",)]
+        latched, tried = activity.list(limit=2)
+        assert (tried["result"], tried["what"]) == ("failed", "Reboot failed: bad password")
+        assert latched["result"] == "refused"
+        assert latched["what"].startswith("Reboot refused: not contacting r1: the router already rejected")
+
+    def test_a_wifi_rename_names_the_old_and_new_network_per_band(self, tmp_path: Path, monkeypatch):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _Router())
+        manager.devices["r1"].status = {"online": True, "ssids": {"2.4G": "OldHome", "5G": "OldHome-5G"}}
+        manager.set_wifi_ssid("r1", " NewHome ", actor="carol")
+        entry = activity.list()[0]
+        assert (entry["who"], entry["kind"], entry["result"]) == ("carol", "wifi", "applied")
+        assert entry["what"] == 'Wi-Fi name changed: 2.4G "OldHome" → "NewHome", 5G "OldHome-5G" → "NewHome"'
+        assert entry["details"] == {
+            "bands": ["2.4G", "5G"],
+            "ssid": "NewHome",
+            "old": {"2.4G": "OldHome", "5G": "OldHome-5G"},
+        }
+        manager.set_wifi_ssid("r1", "Five", "5G", actor="carol")
+        assert activity.list()[0]["what"] == 'Wi-Fi name changed: 5G "OldHome-5G" → "Five"'
+
+    def test_a_wifi_rename_without_the_old_name_gives_the_new_one(self, tmp_path: Path, monkeypatch):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _Router())
+        manager.set_wifi_ssid("r1", "NewHome")
+        assert activity.list()[0]["what"] == 'Wi-Fi name changed to "NewHome" (2.4G, 5G)'
+        assert activity.list()[0]["details"]["old"] == {}
+        manager.devices["r1"].status = {"online": True, "ssids": {"2.4G": "OldHome"}}
+        manager.set_wifi_ssid("r1", "NewHome")
+        assert activity.list()[0]["what"] == 'Wi-Fi name changed: 2.4G "OldHome" → "NewHome", 5G → "NewHome"'
+
+    @pytest.mark.parametrize(
+        ("vendor", "values", "bands"),
+        [
+            ("tenda", {"metadata": {"radio": "5G"}}, "5G"),
+            ("tenda", {}, "2.4G"),
+            ("cudy", {"transport": "ssh", "metadata": {"uci_section": "wireless.lan"}}, "wireless.lan"),
+            ("cudy", {"transport": "ssh"}, "all bands"),
+        ],
+    )
+    def test_the_bands_named_are_the_ones_the_router_changes(self, tmp_path: Path, monkeypatch, vendor, values, bands):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", vendor, password="p", **values)
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _Router())
+        manager.set_wifi_password("r1", "correct horse battery")
+        assert activity.list()[0]["what"] == f"Wi-Fi password changed ({bands})"
+
+    def test_an_invalid_ssid_is_a_recorded_refusal(self, tmp_path: Path, monkeypatch):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p", metadata={"name": "Shop"})
+        monkeypatch.setattr(manager, "adapter_for", lambda device: pytest.fail("router contacted"))
+        with pytest.raises(ValidationError):
+            manager.set_wifi_ssid("r1", "x" * 33, actor="carol")
+        entry = activity.list()[0]
+        assert (entry["router"], entry["router_name"], entry["result"]) == ("r1", "Shop", "refused")
+        assert entry["what"].startswith("Wi-Fi name change refused: SSID must be at most 32 bytes")
+
+    def test_a_wifi_password_entry_says_only_which_bands_changed(self, tmp_path: Path, monkeypatch):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        router = _Router()
+        monkeypatch.setattr(manager, "adapter_for", lambda device: router)
+        manager.set_wifi_password("r1", "correct horse battery", actor="dave")
+        manager.set_wifi_password("r1", "staple horse battery", "2.4G", actor="dave")
+        second, first = activity.list(limit=2)
+        assert first["what"] == "Wi-Fi password changed (2.4G, 5G)"
+        assert first["details"] == {"bands": ["2.4G", "5G"]}
+        assert (first["who"], first["kind"], first["result"]) == ("dave", "wifi", "applied")
+        assert second["what"] == "Wi-Fi password changed (2.4G)"
+        raw = self.raw(tmp_path)
+        assert b"horse" not in raw
+        assert router.calls[0] == ("set_wifi_password", "correct horse battery", None)
+
+    def test_a_router_error_that_quotes_the_passphrase_is_withheld_from_the_log(self, tmp_path: Path, monkeypatch):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        passphrase = "correct horse battery"
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _Router(AdapterError(f"rejected key {passphrase}")))
+        with pytest.raises(AdapterError):
+            manager.set_wifi_password("r1", passphrase, actor="dave")
+        entry = activity.list()[0]
+        assert entry["result"] == "failed"
+        assert entry["what"] == (
+            "Wi-Fi password change (2.4G, 5G) failed: error details withheld because they quoted the new password"
+        )
+        assert b"horse" not in self.raw(tmp_path)
+
+    def test_a_refused_short_passphrase_keeps_the_reason(self, tmp_path: Path, monkeypatch):
+        """"pass" is part of the validation message itself, which quotes no value."""
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        with pytest.raises(ValidationError):
+            manager.set_wifi_password("r1", "pass", actor="dave")
+        entry = activity.list()[0]
+        assert entry["result"] == "refused"
+        assert entry["what"] == "Wi-Fi password change refused: Wi-Fi password must be 8 to 63 characters"
+
+    @pytest.mark.parametrize("actor", ["", "   ", None, 7, {"name": "x"}])
+    def test_a_change_needs_a_named_actor_and_nothing_happens_without_one(self, tmp_path: Path, monkeypatch, actor):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        monkeypatch.setattr(manager, "adapter_for", lambda device: pytest.fail("router contacted"))
+        calls = [
+            lambda: manager.add_device("r2", "192.168.1.2", "cudy", password="p", actor=actor),
+            lambda: manager.update_device("r1", model="X", actor=actor),
+            lambda: manager.set_password("r1", "other", verify=False, actor=actor),
+            lambda: manager.remove_device("r1", actor=actor),
+            lambda: manager.reboot_device("r1", actor=actor),
+            lambda: manager.set_wifi_ssid("r1", "Home", actor=actor),
+            lambda: manager.set_wifi_password("r1", "correct horse battery", actor=actor),
+        ]
+        for call in calls:
+            with pytest.raises(ValidationError):
+                call()
+        assert set(manager.devices) == {"r1"}
+        assert manager.get_device("r1").model == ""
+        assert manager.credentials(manager.get_device("r1")) == "p"
+        assert len(activity.list()) == 1
+
+    @pytest.mark.parametrize("error", [OSError("disk full"), ActivityError("refused")])
+    def test_a_log_that_cannot_be_written_does_not_fail_a_change_already_made(
+        self, tmp_path: Path, monkeypatch, caplog, error
+    ):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        router = _Router()
+        monkeypatch.setattr(manager, "adapter_for", lambda device: router)
+
+        def broken(**entry):
+            raise error
+
+        monkeypatch.setattr(activity, "record", broken)
+        with caplog.at_level("WARNING", logger="cudy_manager.manager"):
+            assert manager.reboot_device("r1") is True
+        assert router.calls == [("reboot",)]
+        assert "could not record activity for r1" in caplog.text
+
+    def test_the_actor_is_stored_as_given(self, tmp_path: Path):
+        manager, activity = build_logged_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p", actor="  web:admin@198.51.100.4 ")
+        assert self.only(activity)["who"] == "web:admin@198.51.100.4"

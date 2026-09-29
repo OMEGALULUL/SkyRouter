@@ -56,9 +56,12 @@ class TestLifespan:
         calls = []
 
         class RecordingScheduler:
-            def run_once(self):
+            def tick(self):
                 calls.append(1)
                 return []
+
+            def join_maintenance(self, timeout=None):
+                return True
 
             def get_state(self):
                 return {}
@@ -1162,7 +1165,7 @@ class TestSsidRoute:
     def test_invalid_radio_values_are_rejected_before_the_router_is_contacted(self, tmp_path: Path, monkeypatch):
         app = build_app(tmp_path)
         calls = []
-        monkeypatch.setattr(app.state.manager, "set_wifi_ssid", lambda *args: calls.append(args) or True)
+        monkeypatch.setattr(app.state.manager, "set_wifi_ssid", lambda *args, **_: calls.append(args) or True)
         client = TestClient(app, raise_server_exceptions=False)
         token = login(client)
         self._add(client, token)
@@ -1177,7 +1180,7 @@ class TestSsidRoute:
     def test_valid_radio_values_reach_the_manager(self, tmp_path: Path, monkeypatch):
         app = build_app(tmp_path)
         calls = []
-        monkeypatch.setattr(app.state.manager, "set_wifi_ssid", lambda *args: calls.append(args) or True)
+        monkeypatch.setattr(app.state.manager, "set_wifi_ssid", lambda *args, **_: calls.append(args) or True)
         client = TestClient(app)
         token = login(client)
         self._add(client, token)

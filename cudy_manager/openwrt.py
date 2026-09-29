@@ -1,4 +1,5 @@
 import contextlib
+import json
 import logging
 import os
 import re
@@ -156,6 +157,22 @@ def _router_refused(client: Any) -> bool:
     transport = client.get_transport()
     event = getattr(getattr(transport, "auth_handler", None), "auth_event", None)
     return bool(transport is not None and transport.is_active() and event is not None and event.is_set())
+
+
+def _release_values(text: str) -> dict[str, str]:
+    """KEY='value' lines of /etc/openwrt_release, a shell fragment, unquoted."""
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        name, equals, raw = line.strip().partition("=")
+        if not equals or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+            continue
+        try:
+            words = shlex.split(raw)
+        except ValueError:
+            # An unbalanced quote: keep what is there rather than lose the version.
+            words = [raw.strip("'\"")]
+        values[name] = " ".join(words).strip()
+    return values
 
 
 class OpenWrtAdapter(RouterAdapter):
@@ -384,6 +401,34 @@ class OpenWrtAdapter(RouterAdapter):
                 f"at the next reboot: {error or f'exit status {code}'}"
             )
         return True
+
+    def firmware_info(self) -> dict[str, Any]:
+        code, release, error = self.execute("cat /etc/openwrt_release")
+        if code != 0:
+            raise AdapterError(error or "could not read /etc/openwrt_release; the router may not run OpenWrt")
+        values = _release_values(release)
+        version = " ".join(part for part in (values.get("DISTRIB_RELEASE"), values.get("DISTRIB_REVISION")) if part)
+        hardware = ""
+        code, board, _ = self.execute("ubus call system board")
+        if code == 0:
+            with contextlib.suppress(ValueError, AttributeError):
+                hardware = str(json.loads(board).get("model") or "").strip()
+        if not hardware:
+            # Older releases, or an image built without ubus's system object.
+            code, model, _ = self.execute("cat /tmp/sysinfo/model")
+            hardware = model.strip() if code == 0 else ""
+        return {"version": version, "hardware": hardware, "auto_update": None, "source": "openwrt-ssh"}
+
+    # Both refuse without connecting: nothing on the router could answer them.
+    def set_auto_update(self, enabled: bool, window_start_hour: int | None = None) -> bool:
+        raise UnsupportedOperation(
+            "OpenWrt has no built-in automatic firmware update; upgrade it on the router with sysupgrade"
+        )
+
+    def check_firmware_update(self, timeout: float = 60) -> dict[str, Any]:
+        raise UnsupportedOperation(
+            "OpenWrt has no built-in update check SkyRouter can run; compare the release with openwrt.org"
+        )
 
     def reboot(self) -> bool:
         code, _, error = self.execute("reboot")

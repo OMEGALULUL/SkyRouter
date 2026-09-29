@@ -8,14 +8,20 @@ import threading
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters import AdapterError
 from .models import Device, ValidationError
 from .secrets import SecretStoreError
 
+if TYPE_CHECKING:
+    from .maintenance import MaintenanceRunner
+
 logger = logging.getLogger(__name__)
+
+# The actor recorded in the activity log for a reboot a device's own policy sent.
+SCHEDULER_ACTOR = "scheduler"
 
 
 class SchedulerError(RuntimeError):
@@ -28,6 +34,7 @@ class RebootScheduler:
         manager,
         state_path: str | Path,
         clock: Callable[[], datetime] | None = None,
+        maintenance: "MaintenanceRunner | None" = None,
     ):
         self.manager = manager
         self.state_path = Path(state_path).expanduser()
@@ -36,6 +43,14 @@ class RebootScheduler:
         self._lock_path = self.state_path.with_name(self.state_path.name + ".lock")
         self.state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.state = self._load()
+        self.maintenance = maintenance
+        self._maintenance_lock = threading.Lock()
+        self._maintenance_thread: threading.Thread | None = None
+        self._maintenance_results: list[dict[str, Any]] = []
+        if maintenance is not None:
+            # Either kind of restart starts the other's cooldown: a plan's reboot an
+            # hour after the device's own scheduled one only interrupts its users again.
+            maintenance.reboot_history = self.last_reboot
 
     def _load(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -122,6 +137,17 @@ class RebootScheduler:
         with self._lock:
             return self._parse_timestamp(self.state.get(identifier, {}).get("last_reboot"))
 
+    def last_reboot(self, identifier: str) -> datetime | None:
+        """When a scheduler on this state file last sent (or tried to send) the device a reboot.
+
+        Read from the file every time, not from this scheduler's copy: the CLI builds
+        one only for this, then waits at its prompt while the server's own scheduler
+        may reboot the device. The file is replaced in one step, so it needs no lock
+        to be read whole. An unreadable file raises, and the plan asking holds back.
+        """
+        entry = self._load().get(identifier)
+        return self._parse_timestamp(entry.get("last_reboot")) if isinstance(entry, dict) else None
+
     def _record_attempt(self, identifier: str, occurrence: date, current: datetime) -> None:
         with self._lock:
             entry = {
@@ -181,6 +207,10 @@ class RebootScheduler:
                 if age < device.reboot.cooldown_seconds:
                     result["reason"] = "cooldown active"
                     return result
+            restarted = self.maintenance.last_restart(device.identifier) if self.maintenance is not None else None
+            if restarted is not None and (current - restarted).total_seconds() < device.reboot.cooldown_seconds:
+                result["reason"] = "cooldown active: a maintenance plan restarted it recently"
+                return result
             # Recorded before the request goes out: a router that drops the connection
             # as it goes down, or a reply the adapter cannot read, may still have
             # rebooted, and an unrecorded attempt is sent again every tick once the
@@ -192,7 +222,7 @@ class RebootScheduler:
                 result["status"] = "failed"
                 result["reason"] = f"reboot not sent; could not record the attempt: {exc}"[:160]
                 return result
-            if not self.manager.reboot_device(device.identifier):
+            if not self.manager.reboot_device(device.identifier, actor=SCHEDULER_ACTOR):
                 result["status"] = "failed"
                 result["reason"] = "adapter did not confirm reboot"
                 return result
@@ -211,3 +241,62 @@ class RebootScheduler:
     def get_state(self) -> dict[str, Any]:
         with self._lock:
             return json.loads(json.dumps(self.state))
+
+    # -- one tick for the web lifespan -------------------------------------------------
+
+    def tick(self, now: datetime | None = None, *, wait: bool = False) -> list[dict[str, Any]]:
+        """Run the per-device reboot policies, then start a pass over the maintenance plans.
+
+        The plans run in a background thread: one pass can spend minutes in firmware
+        checks, and a device's reboot window (15 minutes by default) must not close
+        while it waits. Their results come back from a later tick, once the pass has
+        finished; ``wait`` blocks for this tick's own pass instead. Every result
+        carries ``source`` ("reboot" or "maintenance"); one side failing never stops
+        the other.
+        """
+        current = self._utc_now(now or self.clock())
+        try:
+            results = [{**result, "source": "reboot"} for result in self.run_once(current)]
+        except Exception as exc:
+            logger.exception("scheduled reboot check failed")
+            results = [{"source": "reboot", "action": "reboot", "status": "failed", "reason": str(exc)[:160]}]
+        if self.maintenance is not None:
+            # Not this tick's moment, which the reboots above may have spent minutes
+            # past: without one, the pass reads its own clock as it starts.
+            results.extend(self._tick_maintenance(None if now is None else current, wait))
+        return results
+
+    def _tick_maintenance(self, current: datetime | None, wait: bool) -> list[dict[str, Any]]:
+        with self._maintenance_lock:
+            thread = self._maintenance_thread
+            if thread is None or not thread.is_alive():
+                # A pass still running keeps going; this tick's moment is simply skipped,
+                # which costs nothing because the plans' windows last minutes.
+                thread = threading.Thread(
+                    target=self._run_maintenance, args=(self.maintenance, current), name="maintenance", daemon=True
+                )
+                self._maintenance_thread = thread
+                thread.start()
+        if wait:
+            thread.join()
+        with self._maintenance_lock:
+            finished, self._maintenance_results = self._maintenance_results, []
+        return finished
+
+    def _run_maintenance(self, runner: "MaintenanceRunner", current: datetime | None) -> None:
+        try:
+            results = runner.run_once(current)
+        except Exception as exc:
+            logger.exception("maintenance plan pass failed")
+            results = [{"source": "maintenance", "status": "failed", "reason": str(exc)[:160]}]
+        with self._maintenance_lock:
+            self._maintenance_results.extend(results)
+
+    def join_maintenance(self, timeout: float | None = None) -> bool:
+        """Wait for a maintenance pass in progress; False if it is still running after ``timeout``."""
+        with self._maintenance_lock:
+            thread = self._maintenance_thread
+        if thread is not None:
+            thread.join(timeout)
+            return not thread.is_alive()
+        return True

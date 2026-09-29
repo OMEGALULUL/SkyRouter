@@ -94,7 +94,7 @@ class TestRebootExitCode:
     def test_network_failure_is_reported_not_raised(self, workspace, capsys, monkeypatch):
         workspace.add_device("r1", "192.0.2.1", "cudy", password="pw")
 
-        def failing(identifier):
+        def failing(identifier, actor="system"):
             raise AdapterError("router request failed: timed out")
 
         monkeypatch.setattr(workspace, "reboot_device", failing)
@@ -108,14 +108,14 @@ class TestRebootExitCode:
 
     def test_unconfirmed_reboot_exits_nonzero(self, workspace, capsys, monkeypatch):
         workspace.add_device("r1", "192.0.2.1", "cudy", password="pw")
-        monkeypatch.setattr(workspace, "reboot_device", lambda identifier: False)
+        monkeypatch.setattr(workspace, "reboot_device", lambda identifier, actor="system": False)
 
         assert cli.main(["reboot", "r1"]) == 1
         assert "did not confirm" in capsys.readouterr().err
 
     def test_successful_reboot_exits_zero(self, workspace, monkeypatch):
         workspace.add_device("r1", "192.0.2.1", "cudy", password="pw")
-        monkeypatch.setattr(workspace, "reboot_device", lambda identifier: True)
+        monkeypatch.setattr(workspace, "reboot_device", lambda identifier, actor="system": True)
 
         assert cli.main(["reboot", "r1"]) == 0
 

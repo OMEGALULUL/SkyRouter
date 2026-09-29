@@ -41,6 +41,7 @@ IGD = "InternetGatewayDevice"
 DEVICE = make_device_id("202BC1", "BM632w", "000001")
 ENC = quote(DEVICE, safe="")
 JOB = "0123456789abcdef"
+FIRMWARE_NAME = "skybre-fw-0123456789abcdef0123456789abcdef"
 FAULT = quote(f"{DEVICE}:skybre-inform", safe="")
 WIFI_ROUTE = f"/api/acs/devices/{ENC}/wifi"
 
@@ -52,6 +53,7 @@ READS: list[tuple[str, str]] = [
     ("GET", f"/api/acs/devices/{ENC}"),
     ("GET", "/api/acs/jobs"),
     ("GET", f"/api/acs/jobs/{JOB}"),
+    ("GET", "/api/acs/firmware"),
 ]
 WRITES: list[tuple[str, str, dict[str, Any] | None]] = [
     ("POST", f"/api/acs/devices/{ENC}/refresh", {"scope": "wifi"}),
@@ -64,6 +66,9 @@ WRITES: list[tuple[str, str, dict[str, Any] | None]] = [
     ("POST", f"/api/acs/faults/{FAULT}/retry", None),
     ("DELETE", f"/api/acs/faults/{FAULT}", None),
     ("POST", "/api/acs/bootstrap", {"confirm": True}),
+    ("POST", "/api/acs/firmware?version=2.5.26&oui=80AFCA&product_class=AP1300", None),
+    ("DELETE", f"/api/acs/firmware/{FIRMWARE_NAME}", None),
+    ("POST", f"/api/acs/devices/{ENC}/firmware", {"firmware": FIRMWARE_NAME, "confirm": True}),
 ]
 TEMPLATES = {
     ("GET", "/api/acs"),
@@ -81,6 +86,10 @@ TEMPLATES = {
     ("POST", "/api/acs/faults/{fault_id}/retry"),
     ("DELETE", "/api/acs/faults/{fault_id}"),
     ("POST", "/api/acs/bootstrap"),
+    ("GET", "/api/acs/firmware"),
+    ("POST", "/api/acs/firmware"),
+    ("DELETE", "/api/acs/firmware/{name}"),
+    ("POST", "/api/acs/devices/{acs_id}/firmware"),
 }
 
 
@@ -927,7 +936,7 @@ class TestDirectWifiPassword:
     def _record(self, app, monkeypatch, result: Any = True):
         calls: list[tuple[Any, ...]] = []
 
-        def fake(*args: Any) -> Any:
+        def fake(*args: Any, **_: Any) -> Any:
             calls.append(args)
             if isinstance(result, BaseException):
                 raise result

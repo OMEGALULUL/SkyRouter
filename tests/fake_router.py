@@ -63,6 +63,42 @@ def ap1300_wifi_page(iface: str, network: dict) -> bytes:
     return text.encode()
 
 
+# The AP1300's Auto Update page and its update check. The page is reconstructed from
+# the real field list, not captured (see the note at the top of the fixture), and the
+# check's result page has never been seen: tests supply their own guess of one.
+AP1300_AUTOUPGRADE_PATH = "/cgi-bin/luci/admin/system/autoupgrade?nomodal="
+AP1300_UPDATE_CHECK_PATH = "/cgi-bin/luci/admin/system/autoupgrade/updatecheck"
+AP1300_CHECK_STATUS_PATH = "/cgi-bin/luci/admin/system/autoupgrade/checkstatus/000000000000"
+AP1300_CHECK_RESULT_PATH = "/cgi-bin/luci/admin/system/autoupgrade?updatecheck=&nomodal="
+AP1300_AUTOUPGRADE_TOKEN = "5f0c9a3e7b2d4816a9e0c3b75d1f2e84"
+
+
+def ap1300_autoupgrade_page(settings: dict, notice: str = "") -> bytes:
+    """The page for ``settings``: auto_upgrade "0" or "1", upgrade_time "0".."23" or None.
+
+    ``notice`` goes after the Hardware row, which is only a guess at where a check
+    result would appear.
+    """
+    text = (FIXTURES / "ap1300_autoupgrade.html").read_text()
+    text = re.sub(
+        r'(name="cbid\.upgrade\.1\.auto_upgrade" value=")[^"]*(")',
+        lambda match: match.group(1) + settings["auto_upgrade"] + match.group(2),
+        text,
+    )
+    if settings["auto_upgrade"] != "1":
+        text = text.replace("fa-toggle-on ", "fa-toggle-off ")
+    text = text.replace(' selected="selected"', "")
+    hour = settings.get("upgrade_time")
+    if hour is not None:
+        option = f'id="cbi-upgrade-1-upgrade_time-{hour}" value="{hour}"'
+        text = text.replace(option, option + ' selected="selected"')
+    # A fresh clock on every load, as on the router, so a result is never read from
+    # text that merely changed between two loads of the page.
+    text = text.replace("2026-09-28 10:15:42", time.strftime("%Y-%m-%d %H:%M:%S"))
+    marker = '<div class="form-group" id="cbi-rlf-1-firmware">'
+    return text.replace(marker, notice + marker).encode()
+
+
 def make_handler(mode: str):
     class Handler(BaseHTTPRequestHandler):
         state = {
@@ -74,11 +110,65 @@ def make_handler(mode: str):
                 "wlan10": {"ssid": "Example-5G", "key": "old-password-1", "encryption": "psk-mixed"},
             },
             "wifi_posts": [],
+            "autoupgrade": {"auto_upgrade": "1", "upgrade_time": "3"},
+            "autoupgrade_posts": [],
+            # What checkstatus answers on each poll after an updatecheck; the last repeats.
+            "check_sequence": ["checking", "checkdone"],
+            "check_polls": 0,
+            # The ?updatecheck= page: None serves the plain page (nothing recognisable).
+            "check_result_html": None,
+            "update_checks": [],
+            "result_fetches": 0,
         }
         lock = threading.Lock()
 
         def log_message(self, *args):
             return
+
+        def _signed_in(self) -> bool:
+            return self.state["logged_in"] and "sysauth=" in self.headers.get("Cookie", "")
+
+        def _firmware_get(self):
+            if self.path == AP1300_AUTOUPGRADE_PATH:
+                if self.state.get("autoupgrade_missing"):
+                    return self._send(404, b"<html>not found</html>")
+                page = ap1300_autoupgrade_page(self.state["autoupgrade"])
+                if self.state.get("stale_page_token"):
+                    # A page whose token the router no longer accepts.
+                    page = page.replace(AP1300_AUTOUPGRADE_TOKEN.encode(), b"0" * 32)
+                return self._send(200, page)
+            if self.path == AP1300_CHECK_STATUS_PATH:
+                with self.lock:
+                    polls = self.state["check_polls"]
+                    self.state["check_polls"] += 1
+                sequence = self.state["check_sequence"]
+                return self._send(200, sequence[min(polls, len(sequence) - 1)].encode(), ctype="text/plain")
+            self.state["result_fetches"] += 1
+            body = self.state["check_result_html"]
+            if body is None:
+                body = ap1300_autoupgrade_page(self.state["autoupgrade"])
+            return self._send(200, body.encode() if isinstance(body, str) else body)
+
+        def _firmware_post(self, raw: str):
+            posted = parse_qsl(raw, keep_blank_values=True)
+            values = dict(posted)
+            if self.path == AP1300_UPDATE_CHECK_PATH:
+                self.state["update_checks"].append(
+                    {"form": posted, "ajax": self.headers.get("X-Requested-With", "")}
+                )
+                if values.get("token") != AP1300_AUTOUPGRADE_TOKEN:
+                    return self._send(403, b"<html>invalid token</html>")
+                self.state["check_polls"] = 0
+                return self._send(200, b"", ctype="text/plain")
+            self.state["autoupgrade_posts"].append(posted)
+            if values.get("token") != AP1300_AUTOUPGRADE_TOKEN:
+                return self._send(403, b"<html>invalid token</html>")
+            if not self.state.get("ignore_autoupgrade_writes"):
+                settings = self.state["autoupgrade"]
+                settings["auto_upgrade"] = values.get("cbid.upgrade.1.auto_upgrade", settings["auto_upgrade"])
+                if "cbid.upgrade.1.upgrade_time" in values:
+                    settings["upgrade_time"] = values["cbid.upgrade.1.upgrade_time"]
+            return self._send(200, ap1300_autoupgrade_page(self.state["autoupgrade"]))
 
         def _send(self, code, body: bytes, ctype="text/html; charset=utf-8", cookie=None, headers=None):
             self.send_response(code)
@@ -113,6 +203,14 @@ def make_handler(mode: str):
                     b'<input name="token" value="tok-xyz"><input name="salt" value="saltsalt">'
                     b'<input name="luci_username"><input name="password"></form></html>',
                 )
+            if mode == "ap1300" and self.path in {
+                AP1300_AUTOUPGRADE_PATH,
+                AP1300_CHECK_STATUS_PATH,
+                AP1300_CHECK_RESULT_PATH,
+            }:
+                if not self._signed_in():
+                    return self._send(403, AP1300_LOGIN_PAGE)
+                return self._firmware_get()
             if self.path.startswith(AP1300_WIFI_PATH) and mode == "ap1300":
                 iface = self.path[len(AP1300_WIFI_PATH):]
                 if iface not in self.state["wifi"]:
@@ -134,6 +232,10 @@ def make_handler(mode: str):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length).decode()
+            if mode == "ap1300" and self.path in {AP1300_AUTOUPGRADE_PATH, AP1300_UPDATE_CHECK_PATH}:
+                if not self._signed_in():
+                    return self._send(403, AP1300_LOGIN_PAGE)
+                return self._firmware_post(raw)
             if self.path.startswith(AP1300_WIFI_PATH) and mode == "ap1300":
                 iface = self.path[len(AP1300_WIFI_PATH):]
                 posted = parse_qsl(raw, keep_blank_values=True)

@@ -28,7 +28,16 @@ from typing import Any, NoReturn, TypeVar
 from ..adapters import AdapterError
 from ..http_client import HttpError, HttpResponse, HttpSession
 from ..models import ValidationError
-from .tasks import ALLOWED_TASK_NAMES, JOB_RE, STEP_RE, UNIQUE_KEY_RE, Task, validate_task
+from .tasks import (
+    ALLOWED_TASK_NAMES,
+    FIRMWARE_FILE_RE,
+    JOB_RE,
+    STEP_RE,
+    UNIQUE_KEY_RE,
+    Task,
+    validate_firmware_name,
+    validate_task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +123,19 @@ MAX_IN_VALUES = 200
 MAX_PROJECTION = 64
 MAX_QUERY_KEYS = 16
 MAX_SCRIPT_BYTES = 256 * 1024
+MAX_FILE_BYTES = 64 * 1024 * 1024
+# 64 MiB over loopback takes seconds, but GridFS writes it in chunks behind a slow disk.
+FILE_UPLOAD_TIMEOUT = 300.0
+
+# The FileType values TR-069 defines for a Download (Annex A); GenieACS hands the
+# stored one to the router as is, so a typo would only surface as a router fault.
+FILE_TYPES = frozenset(
+    {"1 Firmware Upgrade Image", "2 Web Content", "3 Vendor Configuration File", "4 Tone File", "5 Ringer File"}
+)
+FIRMWARE_FILE_TYPE = "1 Firmware Upgrade Image"
+# File metadata travels as request headers, so CR/LF would split the request, and
+# the NBI stores whatever arrives.
+_METADATA_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9 _.:+/()-]{0,62}[A-Za-z0-9_.:+/()-])?")
 
 
 # --- validation -------------------------------------------------------------------
@@ -252,6 +274,7 @@ _TASK_FIELDS = (
     "skyrouterStep",
     "parameterNames",
     "objectName",
+    "file",
 )
 _FAULT_FIELDS = ("_id", "device", "channel", "timestamp", "code", "message", "detail", "retries", "expiry")
 
@@ -293,6 +316,12 @@ _COLLECTIONS: dict[str, _Collection] = {
         safe_projection=_FAULT_FIELDS,
     ),
     "presets": _Collection({"_id": lambda value: validate_name(value, "preset name")}),
+    # GridFS's fs.files documents: metadata only. The content is never listed, and
+    # SkyRouter only ever looks up its own files by name.
+    "files": _Collection(
+        {"_id": _match(FIRMWARE_FILE_RE, "file name")},
+        safe_projection=("_id", "length", "uploadDate", "metadata"),
+    ),
     "provisions": _Collection({"_id": lambda value: validate_name(value, "provision name")}),
 }
 
@@ -479,6 +508,35 @@ def _redact_fault(doc: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in doc.items() if key != "provisions"}
 
 
+def validate_file_metadata(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not _METADATA_RE.fullmatch(value):
+        raise ValidationError(
+            f"{what} must be 1-64 letters, digits, spaces or _ . : + / ( ) -, starting and ending with neither space"
+        )
+    return value
+
+
+def _file_record(doc: dict[str, Any]) -> dict[str, Any]:
+    raw = doc.get("metadata")
+    metadata: dict[str, Any] = raw if isinstance(raw, dict) else {}
+
+    def text(key: str) -> str | None:
+        value = metadata.get(key)
+        return _printable(value, 64) if isinstance(value, str) and value else None
+
+    length = doc.get("length")
+    uploaded = doc.get("uploadDate")
+    return {
+        "name": doc.get("_id"),
+        "size": length if isinstance(length, int) and not isinstance(length, bool) else None,
+        "uploaded_at": uploaded if isinstance(uploaded, str) else None,
+        "file_type": text("fileType"),
+        "oui": text("oui"),
+        "product_class": text("productClass"),
+        "version": text("version"),
+    }
+
+
 # --- client -------------------------------------------------------------------------
 
 
@@ -500,12 +558,15 @@ class AcsClient:
         body: bytes | None = None,
         content_type: str | None = None,
         timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> HttpResponse:
         # urlencode, because the NBI reads "+" in a query string as a space (F7).
         target = f"{path}?{urllib.parse.urlencode(params)}" if params else path
-        headers = {"Content-Type": content_type} if content_type else None
+        sent = dict(headers or {})
+        if content_type:
+            sent["Content-Type"] = content_type
         try:
-            response = self._session.request(method, target, data=body, headers=headers, timeout=timeout)
+            response = self._session.request(method, target, data=body, headers=sent or None, timeout=timeout)
         except HttpError as exc:
             raise AcsUnavailable(f"ACS unavailable ({method} {path}): {_transport_detail(exc)}") from exc
         self._check_version(response)
@@ -687,6 +748,21 @@ class AcsClient:
                 return script
         return None
 
+    def list_files(self) -> list[dict[str, Any]]:
+        """Every stored file SkyRouter may manage, as metadata: name, size, uploaded_at, file_type, oui, ...
+
+        The NBI only lists GridFS's fs.files documents, so no file content is ever read.
+        """
+        return [_file_record(doc) for doc in self._find_all("files", {}, sort={"_id": 1})]
+
+    def get_file(self, name: str) -> dict[str, Any] | None:
+        """One stored file's metadata, or None."""
+        validate_firmware_name(name)
+        for doc in self.find("files", {"_id": name}, limit=1).items:
+            if doc.get("_id") == name:
+                return _file_record(doc)
+        return None
+
     def get_preset(self, name: str) -> dict[str, Any] | None:
         """The stored preset without its _id, so it compares equal to what put_preset sent."""
         validate_name(name, "preset name")
@@ -827,6 +903,49 @@ class AcsClient:
     def delete_preset(self, name: str) -> None:
         validate_name(name, "preset name")
         self._write("DELETE", f"/presets/{_segment(name)}")
+
+    def put_file(self, name: str, data: bytes, file_type: str, oui: str, product_class: str, version: str) -> None:
+        """Store a file for routers to download (201). GenieACS keeps the metadata from request headers.
+
+        Only SkyRouter's own names are accepted: genieacs-fs serves any stored file,
+        without authentication, to whoever knows its name. A lost reply raises
+        AcsUnavailable with outcome_unknown set, since the file may have been stored.
+        """
+        validate_firmware_name(name)
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise ValidationError("a file needs some content")
+        if len(data) > MAX_FILE_BYTES:
+            raise ValidationError(f"a file can be at most {MAX_FILE_BYTES // (1024 * 1024)} MiB")
+        if file_type not in FILE_TYPES:
+            raise ValidationError(f"file type must be one of {', '.join(sorted(FILE_TYPES))}")
+        headers = {
+            "fileType": file_type,
+            "oui": validate_file_metadata(oui, "OUI"),
+            "productClass": validate_file_metadata(product_class, "product class"),
+            "version": validate_file_metadata(version, "version"),
+        }
+        self._ensure_version()
+        path = f"/files/{_segment(name)}"
+        try:
+            response = self._send(
+                "PUT",
+                path,
+                body=bytes(data),
+                content_type="application/octet-stream",
+                headers=headers,
+                timeout=max(self.timeout, FILE_UPLOAD_TIMEOUT),
+            )
+        except AcsUnavailable as exc:
+            raise AcsUnavailable(
+                f"ACS unavailable while storing {name}; whether it was stored is unknown", outcome_unknown=True
+            ) from exc
+        if response.status != 201:
+            self._fail(response, "PUT", path)
+
+    def delete_file(self, name: str) -> None:
+        """Delete a stored file. AcsNotFound when there is no such file."""
+        validate_firmware_name(name)
+        self._write("DELETE", f"/files/{_segment(name)}")
 
     def _write(self, method: str, path: str, *, body: bytes | None = None, content_type: str | None = None) -> None:
         self._ensure_version()

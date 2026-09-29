@@ -98,6 +98,20 @@ DETAIL_PROJECTION: tuple[str, ...] = (
     ROOT_TR098,
     ROOT_TR181,
 )
+# What firmware_identity() reads: who the router says it is, what it runs, and
+# enough of ManagementServer to tell whether it is still checking in.
+FIRMWARE_PROJECTION: tuple[str, ...] = (
+    "_id",
+    "_deviceId",
+    "_lastInform",
+    "_lastBoot",
+    f"{ROOT_TR098}.DeviceInfo",
+    f"{ROOT_TR098}.ManagementServer",
+    f"{ROOT_TR181}.RootDataModelVersion",
+    f"{ROOT_TR181}.DeviceSummary",
+    f"{ROOT_TR181}.DeviceInfo",
+    f"{ROOT_TR181}.ManagementServer",
+)
 
 # --- secrets -----------------------------------------------------------------------
 
@@ -1170,6 +1184,35 @@ def detail(doc: Mapping[str, Any] | DeviceTree, now: datetime, inform_interval: 
         "clients": _clients(ctx),
         "tags": ctx.tree.tags,
         "refresh_scopes": sorted(_scopes(ctx)),
+    }
+
+
+def firmware_identity(doc: Mapping[str, Any] | DeviceTree, now: datetime, inform_interval: int) -> dict[str, Any]:
+    """What a firmware upgrade is checked against: identity, running version and check-in state.
+
+    Reads only what FIRMWARE_PROJECTION fetches. The OUI and product class come from
+    the DeviceId every Inform carries, which is what GenieACS builds the device ID
+    from and what a stored file's metadata is meant to match; DeviceInfo is only the
+    fallback. SoftwareVersion is a forced Inform parameter, so the router reports it
+    again in the Inform that follows its restart.
+    """
+    now = _check_inputs(now, inform_interval)
+    ctx = _context(doc)
+    info = _info(ctx)
+    checkin = _checkin(ctx, now, inform_interval)
+    tree = ctx.tree
+    return {
+        "acs_id": tree.id,
+        "oui": tree.device_field("_OUI") or info["oui"],
+        "product_class": tree.device_field("_ProductClass") or info["product_class"],
+        "manufacturer": info["manufacturer"],
+        "model": info["model"],
+        "software_version": info["firmware"],
+        "software_version_as_of": info["as_of"]["firmware"],
+        "hardware_version": info["hw"],
+        "online": checkin["online"],
+        "last_inform": checkin["last_inform"],
+        "last_boot": checkin["last_boot"],
     }
 
 

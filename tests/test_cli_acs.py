@@ -754,7 +754,7 @@ def calls(workspace, monkeypatch) -> list[tuple[str, str, str | None]]:
     """Records set_wifi_password instead of contacting a router."""
     seen: list[tuple[str, str, str | None]] = []
 
-    def record(identifier: str, password: str, radio: str | None = None) -> bool:
+    def record(identifier: str, password: str, radio: str | None = None, actor: str = "system") -> bool:
         seen.append((identifier, password, radio))
         return True
 
@@ -819,7 +819,7 @@ class TestWifiPassword:
         assert calls == []
 
     def test_an_unconfirmed_change_exits_nonzero(self, workspace, monkeypatch, capsys):
-        monkeypatch.setattr(workspace, "set_wifi_password", lambda identifier, password, radio=None: False)
+        monkeypatch.setattr(workspace, "set_wifi_password", lambda identifier, password, radio=None, actor="": False)
         unattended(monkeypatch)
         code, _, err = run(["wifi-password", "r1"], capsys)
         assert code == 1
@@ -835,7 +835,7 @@ class TestWifiPassword:
         ],
     )
     def test_router_errors_are_one_line_with_the_passphrase_scrubbed(self, workspace, monkeypatch, capsys, error):
-        def fail(identifier: str, password: str, radio: str | None = None) -> bool:
+        def fail(identifier: str, password: str, radio: str | None = None, actor: str = "system") -> bool:
             raise error
 
         monkeypatch.setattr(workspace, "set_wifi_password", fail)

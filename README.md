@@ -66,11 +66,16 @@ router-manager reboot <id>
 router-manager wifi-password <id> [--radio 2.4G|5G]
 router-manager discover [--subnet 192.168.1.0/24]
 router-manager serve [--host 127.0.0.1] [--port 8091]
-router-manager acs status|devices|dump|bootstrap|wifi|job ...
+router-manager acs status|devices|dump|bootstrap|wifi|job|firmware ...
+router-manager activity [--router ID] [--who NAME] [--kind KIND] [--before ID|TIME] [--limit N] [--csv]
+router-manager firmware status|check <id>
+router-manager firmware auto-update <id> --on|--off [--window HH]
+router-manager maintenance list|show <plan>|run <plan>
 ```
 
 The `acs` commands manage TR-069 routers through GenieACS; see
-[TR-069 through GenieACS](#tr-069-through-genieacs-optional).
+[TR-069 through GenieACS](#tr-069-through-genieacs-optional). `activity`, `firmware`
+and `maintenance` are described under [Maintenance](#maintenance).
 
 `add` prompts for the password with `getpass` so it never appears in shell history or
 in `ps` output. When stdin is not a terminal, `getpass` falls back to reading a line,
@@ -317,6 +322,7 @@ router-manager acs dump <acs_id>
 router-manager acs bootstrap [--remove-seeded]
 router-manager acs wifi <acs_id> --band 2.4GHz|5GHz|6GHz|all [--ssid NAME] [--keep-passphrase] [--wait SECONDS]
 router-manager acs job <job_id> [--wait SECONDS]
+router-manager acs firmware list|add|remove|upgrade ...
 ```
 
 - `status` checks that GenieACS answers, its version, and SkyRouter's bootstrap. It
@@ -333,6 +339,8 @@ router-manager acs job <job_id> [--wait SECONDS]
 - `--wait SECONDS` follows the job until it has a result or the time runs out. It moves
   the job along itself while waiting, so the change finishes even when the server is
   not running.
+- `firmware` keeps the firmware library and installs from it; see
+  [TR-069 firmware upgrades](#tr-069-firmware-upgrades).
 
 Run the `acs` commands with the server's environment: the same `ROUTER_MANAGER_ACS_*`
 values, and as the service user with the same `ROUTER_MANAGER_DATA_DIR`, so the CLI and
@@ -344,14 +352,247 @@ sudo -u skyrouter env ROUTER_MANAGER_DATA_DIR=/var/lib/skyrouter HOME=/var/lib/s
   ROUTER_MANAGER_ACS_URL=http://127.0.0.1:7557 /opt/skyrouter/venv/bin/router-manager acs status
 ```
 
+## Maintenance
+
+Routine work on many routers: an activity log of every change, firmware checks and
+upgrades, and maintenance plans that run them in a chosen window.
+
+### The activity log
+
+Every change to a router is recorded in `activity.jsonl` in the data directory
+(mode `0600`, rotated at 5 MB, three old files kept): when, who, which router, the
+kind of change, the result and one sentence saying what happened. A router is its
+device id, or `acs:<GenieACS ID>` for a TR-069 router.
+
+| Kind | Recorded for |
+| --- | --- |
+| `setup` | adding, editing and removing a router |
+| `credentials` | a new router login password or SNMP community |
+| `wifi` | network name and Wi-Fi password changes |
+| `reboot` | reboots, by hand, by a device's reboot policy or by a plan |
+| `firmware` | update checks, automatic-update settings and firmware upgrades |
+| `maintenance` | a plan holding a router back, or stopping on an error |
+
+The result is `applied`, `queued` (a TR-069 job or plan step sent and not yet
+settled), `refused` (SkyRouter declined: a guard, bad input, an unsupported
+operation, a latched credential), `failed` (the router or the ACS did not do it)
+or `info` (a check, which changes nothing).
+
+Who made the change:
+
+| Actor | Meaning |
+| --- | --- |
+| `Skybre staff` | the dashboard. Everyone signs in with the one password, so there is no individual to name yet. |
+| `cli (<login name>)` | the command line, as the user who ran it |
+| `scheduler` | a device's own reboot policy |
+| `Maintenance: <plan>` | a maintenance plan in its window |
+| `Maintenance: <plan> (run by <actor>)` | a plan someone ran by hand |
+| `system` | anything else |
+
+**Entries never hold a secret.** Detail keys that look like one (`pass`, `key`,
+`secret`, `token`, `psk`) are refused rather than stored, a Wi-Fi password change
+records only the bands it reached, and a router error that quotes the new password
+is withheld. A TR-069 router's own fault text is left out of every entry for a
+Wi-Fi password change, keeping only the fault codes, because it can quote the value
+the router refused. The actor always comes from the session or the login name, never from
+a request.
+
+```bash
+router-manager activity --router cudy1 --limit 20
+router-manager activity --kind firmware --csv > firmware.csv
+```
+
+The dashboard reads the same log through `GET /api/activity` (filters `router`,
+`who`, `kind`, `limit` up to 1000 and `before`, an entry id for the next page or an
+ISO 8601 time) and exports it with `GET /api/activity.csv`. The CSV holds every
+entry still kept unless `limit` is given, and a cell that starts like a formula is
+prefixed with `'` so a spreadsheet shows it rather than runs it.
+
+### Firmware on each kind of router
+
+| Router | Version | Automatic update | Update check | Install |
+| --- | --- | --- | --- | --- |
+| Cudy (web) | Auto Update page | on or off, with its 2-hour window | the router's own check | not supported |
+| TP-Link (11N web UI) | status page | not supported | not supported | not supported |
+| Tenda | status | not supported | not supported | not supported |
+| OpenWrt (SSH) | `/etc/openwrt_release`, board model | none exists | not supported | not supported |
+| TR-069 | reported to GenieACS | not over TR-069 | not over TR-069 | from the firmware library |
+
+```bash
+router-manager firmware status cudy1
+router-manager firmware check cudy1
+router-manager firmware auto-update cudy1 --on --window 3
+router-manager firmware auto-update cudy1 --off
+```
+
+- `check` asks the router whether newer firmware exists, the way its own Auto Update
+  page does. **A check installs nothing.** It takes up to about a minute, during
+  which other requests to that router wait. When the router's answer cannot be read
+  with certainty the result is `available: null` and the note starts with
+  `result not recognised`; SkyRouter never reports an update it has no evidence for.
+  `check` exits `1` when it could not tell.
+- `auto-update --window HH` picks the router's 2-hour window starting at that hour,
+  on the router's own clock. Without `--window` the router keeps the window it has;
+  one with no window set is refused, since the router would otherwise take its first
+  slot, which nobody chose. SkyRouter reads the page back and fails if the router
+  did not keep the change.
+- A TP-Link is never logged in to for these: an unsupported call would still count
+  towards its ten-failure lockout.
+
+The dashboard routes are `GET /api/devices/{id}/firmware`,
+`PUT /api/devices/{id}/firmware/auto-update` with `{"enabled": true,
+"window_start_hour": 3}`, and `POST /api/devices/{id}/firmware/check`.
+
+#### TR-069 firmware upgrades
+
+A TR-069 router installs firmware from SkyRouter's library, which lives on the ACS.
+GenieACS's file server has to be running first; see "Firmware pushes" in
+[deploy/genieacs/README.md](deploy/genieacs/README.md).
+
+```bash
+router-manager acs firmware add AP1300-2.5.26.bin --version 2.5.26-20261001-101010 \
+  --oui 80AFCA --product-class AP1300 --model-hint "Cudy AP1300"
+router-manager acs firmware list
+router-manager acs firmware upgrade <acs_id> <name> [--wait SECONDS]
+router-manager acs firmware remove <name>
+```
+
+- `--version` must be exactly what the router will report as its software version
+  once it runs the image, because that is how the upgrade is verified. `--oui` and
+  `--product-class` are those of the routers it is for.
+- Each file is stored under a random name (`skybre-fw-…`): the file server hands any
+  stored file, without authentication, to whoever knows its name.
+- An upgrade asks first (`ROUTER_MANAGER_ASSUME_YES=1` for unattended use). It is
+  refused while the router is not checking in, when it already runs that version,
+  and when it reports another OUI or product class than the file was stored for,
+  unless `--confirm-model-mismatch` is given.
+- The job is *verified* only when the router reports the file's version after a boot
+  later than the request. The router accepting the download proves nothing yet;
+  it then has an hour to install and come back. A transfer fault rejects the job.
+
+The dashboard routes are `GET /api/acs/firmware`, `POST /api/acs/firmware` (the image
+as the raw `application/octet-stream` body, at most 64 MiB, with `version`, `oui`,
+`product_class`, and optionally `filename` and `model_hint`, as query fields or as
+`X-Firmware-*` headers), `DELETE /api/acs/firmware/{name}` and
+`POST /api/acs/devices/{acs_id}/firmware` with `{"firmware": "<name>", "confirm":
+true}`. A model mismatch answers `409` with both sides, to be sent again with
+`"confirm_model_mismatch": true`.
+
+### Maintenance plans
+
+A plan names its routers, a weekly or monthly window, the actions to take and the
+guards that hold them back. The server runs plans on every scheduler tick, and acts
+on each router at most once per window.
+
+```json
+{
+  "name": "Sunday night",
+  "targets": {"devices": ["cudy1", "cudy2"], "acs_devices": ["80AFCA-AP1300-000001"], "all": false},
+  "schedule": {"days": ["sun"], "start": "02:00", "duration_minutes": 120, "timezone": "Africa/Johannesburg"},
+  "actions": ["firmware_check", "auto_update_on", "firmware_update", "reboot"],
+  "firmware": {"AP1300": "skybre-fw-0123456789abcdef0123456789abcdef"},
+  "guards": {"min_uptime_seconds": 3600, "skip_if_clients_over": 10, "cooldown_hours": 20}
+}
+```
+
+- **Targets**: direct routers by device id, TR-069 routers by GenieACS ID, or
+  `"all": true` for every enabled direct router and every adopted TR-069 router.
+  Keep each router in one inventory. SkyRouter has no link between a direct device
+  and a TR-069 one, so a router in both would be restarted once for each. The one
+  case it recognises is a TR-069 router reporting, as its WAN address, the address
+  a direct device the plan also names is managed at: that router is held back over
+  TR-069 and maintained directly only.
+- **Schedule**: `days` (weekly) or `monthly_day` (1 to 28, so every month has it),
+  never both; `start` in `HH:MM`, `duration_minutes` from 15 to 480 (default 60),
+  and an IANA timezone.
+- **Actions** always run in this order, whatever order they are listed in:
+  `firmware_check` and `auto_update_on` (directly managed routers that support them,
+  which today means Cudy),
+  `firmware_update` (TR-069 routers, using the file chosen for their product class)
+  and `reboot`. A reboot is skipped after a firmware upgrade was queued, or refused
+  because another upgrade is under way, because the upgrade restarts the router
+  itself.
+- `auto_update_on` turns the router's automatic update on in the 2-hour slot that
+  starts at the plan's start hour (`03:30` gives `03:00-05:00`). The router keeps
+  that slot on its own clock, which may not be in the plan's timezone, and from then
+  on installs updates by itself every day, outside SkyRouter's windows and guards. A
+  router whose automatic update is already on is left as it is; when its slot is not
+  the plan's start hour, the result says so.
+- **TR-069 steps** are queued to expire when the window closes. A router that misses
+  the connection request takes the task at its next periodic inform, and one that
+  does not inform before the window ends never takes it. Nothing is queued in the
+  window's last minute. A router that took a firmware download may still be
+  installing it, and restart, up to an hour after the window.
+- **Guards**, checked for every router every time, by hand as well:
+  `min_uptime_seconds` (default 3600; an unreadable uptime holds the router back),
+  `skip_if_clients_over` (off by default) and `cooldown_hours` (default 20). The
+  cooldown counts restarts sent by a maintenance plan and by a device's own reboot
+  policy. It does not count a reboot or firmware upgrade started from the dashboard
+  or the command line; the uptime guard is what holds a router back after one of
+  those. Over TR-069 the client limit uses GenieACS's cached host and station
+  tables, and holds the router back when they are missing or more than two hours
+  old, since an unknown count is not zero. A router that is offline, disabled, not
+  checking in, whose credential was rejected, or that has a TR-069 firmware upgrade
+  under way is held back too. A held-back router is tried again on later ticks while
+  the window lasts, and each reason is logged once per window. A device's own reboot
+  policy likewise waits out its cooldown after a plan restarted the router.
+- **The window and the plan are checked again** before each router is claimed and
+  before each restart, because a pass over a large fleet can outlast its window. A
+  router reached after the window closed, or after the plan was turned off, deleted
+  or changed to leave it out, is held back. Edits to a plan's guards apply to the
+  routers visited after the edit.
+- **Once per window**: a router is marked as reached before anything is sent to it,
+  so a restart of the server, or a request that timed out, never repeats the work.
+
+```bash
+router-manager maintenance list
+router-manager maintenance show <plan>
+router-manager maintenance run <plan>
+```
+
+`run` acts at once, window or not, with the guards still applying. It asks first;
+set `ROUTER_MANAGER_ASSUME_YES=1` for unattended use. It exits `1` when an action on
+any router failed. A router whose only restart was queued over TR-069 is reported as
+`queued` with its job, never as `done`: the job may still fail. It is followed by the
+running server, or by `router-manager acs job <job_id> --wait SECONDS` when no server
+is running, and its outcome is in the activity log.
+
+Plans live in `maintenance.json` and what each window reached in
+`maintenance_state.json`, both in the data directory. A damaged file stops the plans
+with an error naming it rather than being treated as empty, which could run a window
+twice. The dashboard uses `GET` and `POST /api/maintenance/plans`, `GET`, `PUT` and
+`DELETE /api/maintenance/plans/{id}`, `POST /api/maintenance/plans/{id}/run` with
+`{"confirm": true}`, and `GET /api/maintenance/runs` for the latest windows. Changes
+to plans are written to the server log, not the activity log, which is about
+routers; each router a plan acts on is in the activity log under the plan's name.
+
+### What has not been verified on hardware
+
+- **Cudy Auto Update page.** Rebuilt from the field list of a real AP1300 (firmware
+  2.5.25, hardware V1.1), not captured whole. Other Cudy models and firmware may
+  differ; SkyRouter refuses a page without the switch or the chosen hour rather than
+  guess.
+- **Cudy update check result.** The page the router shows after a check has never
+  been seen, so expect `result not recognised` until one is captured. The check
+  itself follows the real page's own script.
+- **TR-069 firmware installs.** GenieACS's side follows its 1.2.16 source and is
+  tested against a fake NBI only. No router has been upgraded through SkyRouter
+  yet, and whether a given router accepts its vendor's image over TR-069 is untested.
+- **OpenWrt firmware information** is tested with recorded command output only.
+- **A router in both inventories.** Recognising one relies on the WAN address it
+  reports over TR-069 being the address SkyRouter manages it at directly, which is
+  expected of an AP1300 on a LAN but has not been seen on a real one.
+- Direct firmware installs are not supported on any router, and TP-Link firmware
+  settings stay excluded.
+
 ## Supported hardware
 
 | Vendor | Transport | Notes |
 | --- | --- | --- |
-| Cudy | Web, LuCI | Login, status, reboot, SSID and Wi-Fi password changes. |
-| Tenda | Web, `/goform/modules` | Login, status, reboot, SSID changes. |
-| Any | SSH via Paramiko | Selected by `transport: ssh`. |
-| Any with TR-069 | CWMP through GenieACS | Optional; see [TR-069 through GenieACS](#tr-069-through-genieacs-optional). |
+| Cudy | Web, LuCI | Login, status, reboot, SSID and Wi-Fi password changes, firmware version, automatic update and update checks. |
+| Tenda | Web, `/goform/modules` | Login, status, reboot, SSID changes, firmware version. |
+| Any | SSH via Paramiko | Selected by `transport: ssh`. Firmware version from OpenWrt's release file. |
+| Any with TR-069 | CWMP through GenieACS | Optional; see [TR-069 through GenieACS](#tr-069-through-genieacs-optional). Firmware upgrades from the library. |
 
 Not supported: the Tenda ME3 Pro BE3600, which uses a separate encrypted API.
 Changing a Wi-Fi SSID over SSH needs `metadata.uci_section`; the CLI can only create
@@ -405,7 +646,9 @@ cudy_manager/
   adapters.py       Cudy, Tenda, and TP-Link adapters
   openwrt.py        SSH/UCI adapter
   manager.py        inventory, secrets, adapters, status
-  scheduler.py      guarded scheduled reboots
+  activity.py       the activity log: who changed what on which router
+  scheduler.py      guarded scheduled reboots, and the tick that runs maintenance plans
+  maintenance.py    maintenance plans, their windows, guards and runner
   discovery.py      bounded opt-in discovery
   web.py            FastAPI service, sessions, CSRF
   cli.py            command line entry point
