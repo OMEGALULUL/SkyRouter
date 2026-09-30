@@ -48,7 +48,8 @@ export ROUTER_MANAGER_PASSWORD='use-a-long-random-password'
 .venv/bin/router-manager serve
 ```
 
-Open <http://127.0.0.1:8091> and log in as `admin`, or set `ROUTER_MANAGER_USERNAME`.
+Open <http://127.0.0.1:8091> and sign in with the passkey, the value of
+`ROUTER_MANAGER_PASSWORD`. There is no username.
 
 `--host` and `--port` override the bind address. Only move off loopback behind a VPN
 or an authenticating reverse proxy. The session cookie carries no `Secure` flag over
@@ -131,10 +132,10 @@ production hardware.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ROUTER_MANAGER_PASSWORD` | none | Web login password. Without it every endpoint returns `503`. |
+| `ROUTER_MANAGER_PASSWORD` | none | The dashboard passkey, the only thing the sign-in page asks for. Without it every endpoint returns `503`. |
 | `AUTH_PASSWORD` | none | Fallback read when the above is unset. |
-| `ROUTER_MANAGER_USERNAME` | `admin` | Web login username. |
-| `AUTH_USERNAME` | `admin` | Fallback read when the above is unset. |
+| `ROUTER_MANAGER_USERNAME` | unused | No longer checked: the passkey alone signs in. A `username` sent to `POST /login` is ignored. |
+| `AUTH_USERNAME` | unused | As above. |
 | `ROUTER_MANAGER_CONFIG` | `<package>/cudy_devices.yaml` | Device inventory path. |
 | `ROUTER_MANAGER_DATA_DIR` | `~/.local/state/skybre-router-manager` | Key, vault, scheduler state. |
 | `ROUTER_MANAGER_SCHEDULER_INTERVAL` | `30` | Scheduler tick in seconds, minimum `15`. |
@@ -150,8 +151,8 @@ The `ROUTER_MANAGER_ACS_*` variables are described under
 ## Resetting a password
 
 If a router password is wrong, mistyped, or changed on the device itself, replace the
-stored copy. From the dashboard, use the **Password** button on the device card: enter
-it twice, then save. The result tells you whether the router accepted it.
+stored copy. From the dashboard, open the router, choose **More**, then **Router admin
+password**: enter it twice, then save. The result tells you whether the router accepted it.
 
 From the command line:
 
@@ -295,8 +296,9 @@ appear when they first check in and live in GenieACS's database, never in the de
 config. Routers added by hand keep working exactly as before.
 
 **The feature is off unless `ROUTER_MANAGER_ACS_URL` is set.** Without it the server
-behaves exactly as it did before: the dashboard's **Managed (TR-069)** tab does not
-appear, and every `/api/acs` route returns `503`.
+behaves exactly as it did before: the dashboard lists direct routers only, without
+the **Managed** filter or the Setup page's TR-069 choice, and every `/api/acs` route
+returns `503`.
 
 Installing GenieACS, MongoDB and the firewall rules is covered by the operator
 runbook in [deploy/genieacs/README.md](deploy/genieacs/README.md).
@@ -307,11 +309,12 @@ runbook in [deploy/genieacs/README.md](deploy/genieacs/README.md).
 | `ROUTER_MANAGER_ACS_ALLOW_REMOTE` | `0` | Set to `1` to accept an NBI address that is not loopback. The NBI has no authentication, so do this only when something else protects it. |
 | `ROUTER_MANAGER_ACS_INFORM_INTERVAL` | `300` | Seconds between router check-ins, `60` to `86400`. The bootstrap pushes it to every router. |
 | `ROUTER_MANAGER_ACS_SCRUB_SECRETS` | `1` | After a Wi-Fi passphrase change is acknowledged, read the passphrase back so the plaintext copy GenieACS keeps in MongoDB becomes empty. |
+| `ROUTER_MANAGER_ACS_CWMP_URL` | unset | The ACS address the Setup page tells technicians to type into each router, for example `http://10.10.0.2:7547/`: GenieACS's CWMP service as the routers reach it. SkyRouter never connects to it. `http` or `https` only, with no credentials, query or fragment. |
 
 An invalid `ROUTER_MANAGER_ACS_*` value stops the server from starting, with an error
 naming the variable, instead of falling back to a default. The interval is pushed to
 every router, and a mistyped remote URL would expose the unauthenticated NBI. While
-`ROUTER_MANAGER_ACS_URL` is unset the other three are ignored.
+`ROUTER_MANAGER_ACS_URL` is unset the others are ignored.
 
 From the command line:
 
@@ -341,6 +344,14 @@ router-manager acs firmware list|add|remove|upgrade ...
   not running.
 - `firmware` keeps the firmware library and installs from it; see
   [TR-069 firmware upgrades](#tr-069-firmware-upgrades).
+
+A router that checks in for the first time is tagged `skybre_new` and listed on the
+dashboard as a new router to adopt. Adopting it (`POST /api/acs/devices/{id}/adopt`
+with an optional `{"customer": "#1080 Customer A"}`, 1 to 120 characters) removes the
+tag and links it to that Vexar customer, which the router list shows and searches.
+GenieACS has nowhere to keep the customer, so SkyRouter keeps it in
+`acs_adoptions.json` in its data directory. Adoptions and firmware library changes are
+in the activity log.
 
 Run the `acs` commands with the server's environment: the same `ROUTER_MANAGER_ACS_*`
 values, and as the service user with the same `ROUTER_MANAGER_DATA_DIR`, so the CLI and
@@ -497,6 +508,9 @@ on each router at most once per window.
 
 - **Targets**: direct routers by device id, TR-069 routers by GenieACS ID, or
   `"all": true` for every enabled direct router and every adopted TR-069 router.
+  `"groups"` names whole groups instead, worked out each time the plan runs:
+  `direct` (every enabled direct router), `managed` (every adopted TR-069 router)
+  and `cudy` (both kinds, Cudy only). A router named twice is visited once.
   Keep each router in one inventory. SkyRouter has no link between a direct device
   and a TR-069 one, so a router in both would be restarted once for each. The one
   case it recognises is a TR-069 router reporting, as its WAN address, the address

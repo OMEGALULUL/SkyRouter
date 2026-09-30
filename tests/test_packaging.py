@@ -170,3 +170,35 @@ def test_the_sdist_ships_the_provisions_but_not_the_inventory(built):
     for name in REQUIRED_PROVISIONS:
         assert f"cudy_manager/acs/provisions/{name}" in sdist
     assert not [name for name in sdist if "cudy_devices.yaml" in name]
+
+
+# --- the images the web app serves ---------------------------------------------------------
+
+
+def _served_images() -> list[str]:
+    from cudy_manager.web import PUBLIC_ASSETS
+
+    return sorted(PUBLIC_ASSETS.values())
+
+
+def test_every_image_the_web_app_serves_is_on_disk_and_package_data():
+    """static/ is not a package, so nothing but package-data puts it in a wheel."""
+    shipped = _setuptools_config().get("package-data", {}).get("cudy_manager", [])
+    assert _served_images() == ["favicon.png", "skybre-icon.png"]
+    for name in _served_images():
+        assert (PACKAGE / "static" / name).read_bytes().startswith(b"\x89PNG\r\n\x1a\n"), name
+        assert any(fnmatch(f"static/{name}", pattern) for pattern in shipped), f"package-data drops static/{name}"
+
+
+def test_the_sdist_manifest_includes_the_images():
+    commands = [
+        line.split() for line in (PROJECT / "MANIFEST.in").read_text().splitlines() if line.strip()[:1] not in ("", "#")
+    ]
+    assert ["recursive-include", "cudy_manager/static", "*.png"] in commands
+
+
+def test_the_wheel_and_the_sdist_ship_the_images(built):
+    wheel, sdist, _ = built
+    for name in _served_images():
+        assert f"cudy_manager/static/{name}" in wheel
+        assert f"cudy_manager/static/{name}" in sdist

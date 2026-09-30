@@ -267,7 +267,47 @@ class TestSettings:
     def test_acs_variables_are_ignored_while_the_feature_is_off(self, monkeypatch):
         monkeypatch.setenv("ROUTER_MANAGER_ACS_INFORM_INTERVAL", "junk")
         monkeypatch.setenv("ROUTER_MANAGER_ACS_ALLOW_REMOTE", "junk")
-        assert Settings.from_env().acs_url is None
+        monkeypatch.setenv("ROUTER_MANAGER_ACS_CWMP_URL", "junk")
+        settings = Settings.from_env()
+        assert settings.acs_url is None and settings.acs_cwmp_url is None
+
+    def test_the_address_routers_check_in_to_is_read_and_shown_with_the_health(self, tmp_path: Path, monkeypatch, nbi):
+        monkeypatch.setenv("ROUTER_MANAGER_ACS_URL", "http://127.0.0.1:7557")
+        assert Settings.from_env().acs_cwmp_url is None
+        monkeypatch.setenv("ROUTER_MANAGER_ACS_CWMP_URL", "  https://acs.example.net:7547/  ")
+        assert Settings.from_env().acs_cwmp_url == "https://acs.example.net:7547/"
+        client, _ = signed_in(make_app(tmp_path, nbi, acs_cwmp_url="http://10.10.0.2:7547/"))
+        assert client.get("/api/acs").json()["cwmp_url"] == "http://10.10.0.2:7547/"
+        client, _ = signed_in(make_app(tmp_path / "unset", nbi))
+        assert client.get("/api/acs").json()["cwmp_url"] is None
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "ftp://10.10.0.2:7547/",
+            "10.10.0.2:7547",
+            "http://",
+            "http://10.10.0.2:7547/?x=1",
+            "http://10.10.0.2:7547/#top",
+            "http://10.10.0.2:0/",
+            "http://10.10.0.2:99999/",
+            "http://[::1/",
+            "http://10.10.0.2 :7547/",
+            "http://10.10.0.2:7547/" + "a" * 250,
+        ],
+    )
+    def test_a_bad_address_for_the_routers_stops_startup(self, monkeypatch, value):
+        monkeypatch.setenv("ROUTER_MANAGER_ACS_URL", "http://127.0.0.1:7557")
+        monkeypatch.setenv("ROUTER_MANAGER_ACS_CWMP_URL", value)
+        with pytest.raises(ValueError, match="ROUTER_MANAGER_ACS_CWMP_URL must be the plain http"):
+            Settings.from_env()
+
+    def test_credentials_in_the_routers_address_are_refused_without_being_repeated(self, monkeypatch):
+        monkeypatch.setenv("ROUTER_MANAGER_ACS_URL", "http://127.0.0.1:7557")
+        monkeypatch.setenv("ROUTER_MANAGER_ACS_CWMP_URL", "http://cpe:hunter2-secret@10.10.0.2:7547/")
+        with pytest.raises(ValueError) as refused:
+            Settings.from_env()
+        assert "credentials" in str(refused.value) and "hunter2-secret" not in str(refused.value)
 
     def test_create_app_builds_the_service_from_settings(self, tmp_path: Path, nbi):
         app = make_app(tmp_path, acs_url=nbi.url, acs_inform_interval=900, acs_scrub_secrets=False)
@@ -449,12 +489,13 @@ class TestReads:
         assert client.get("/api/acs/devices?tag=skybre_new").json()["total"] == 1
         assert client.post(f"{path}/tags/shop_42", headers=headers).json()["tags"] == ["skybre_new", "shop_42"]
         adopted = client.post(f"{path}/adopt", headers=headers)
-        assert adopted.status_code == 200 and adopted.json() == {"acs_id": router, "tags": ["shop_42"]}
+        assert adopted.status_code == 200
+        assert adopted.json() == {"acs_id": router, "tags": ["shop_42"], "customer": None}
         assert client.get("/api/acs/devices?tag=skybre_new").json()["total"] == 0
         removed = client.delete(f"{path}/tags/shop_42", headers=headers)
         assert removed.json() == {"acs_id": router, "tags": []}
 
-    def test_a_route_without_a_body_refuses_one(self, tmp_path: Path, nbi):
+    def test_adopt_refuses_any_field_but_the_customer(self, tmp_path: Path, nbi):
         router = tr181_router(nbi, tags=("skybre_new",))
         client, headers = signed_in(make_app(tmp_path, nbi))
         response = client.post(
@@ -1060,6 +1101,10 @@ class TestDirectWifiPassword:
 
 
 # --- the dashboard -----------------------------------------------------------------------------
+#
+# These drive the approved design: one router list with a side panel, dialogs and toasts.
+# Managed (TR-069) routers sit in that list beside the direct ones, so where the old page
+# had a Managed tab of cards these open the router's side panel instead.
 
 
 def run_page(tmp_path: Path, scenario: str, setup: str = "") -> dict:
@@ -1084,10 +1129,12 @@ def run_page(tmp_path: Path, scenario: str, setup: str = "") -> dict:
     return outcome
 
 
-# A configured ACS with one router on two bands, the 5 GHz one only inferred.
+# A configured ACS with one router on two bands, the 5 GHz one only inferred. The list
+# names a managed router after its sticker, model and serial: NAME.
 ACS_SETUP = r"""
 const minutesAgo = m => new Date(Date.now() - m * 60000).toISOString();
 const todayAt = (h, m) => { const d = new Date(); d.setUTCHours(h, m, 0, 0); return d.toISOString(); };
+const NAME = 'AX3000 · AB-1';
 const router = {
   acs_id: '202BC1-BM632w-AB%2D1', manufacturer: 'Acme', model: 'AX3000', serial: 'AB-1', firmware: '1.2.3',
   data_model: 'tr181', profile: 'generic-tr181', online: true, last_inform: minutesAgo(3),
@@ -1097,88 +1144,94 @@ const router = {
     {band: '5GHz', band_source: 'guessed', ssid: 'Home-5G', enabled: true, as_of: minutesAgo(10)},
   ],
 };
-harness.acs = {
-  health: {configured: true, reachable: true, version: '1.2.16+20260329', error: null,
-           bootstrap: {installed: true, drift: [], seeded_presets: []}, channel_faults: [], problems: [],
-           jobs: {active: 0}},
-  devices: [router], inbox: [], jobs: [],
-};
+harness.db.acs = {configured: true, reachable: true, version: '1.2.16+20260329', error: null,
+                  bootstrap: {installed: true, drift: [], seeded_presets: []}, channel_faults: [], problems: [],
+                  jobs: {active: 0}};
+harness.db.acsDevices = [router];
 const makeJob = (state, extra = {}) => Object.assign({
   id: 'a1b2c3d4e5f60718', acs_id: router.acs_id, kind: 'wifi', state, message: '', expected_by: null,
   cr_attempts: [], last_error: null,
   terminal: !['queued', 'contacting_router', 'waiting_for_checkin'].includes(state),
   done: !['queued', 'contacting_router', 'waiting_for_checkin'].includes(state),
 }, extra);
-harness.acsReply = () => undefined;
-harness.handler = (path, options, record) => {
-  const custom = harness.acsReply(path, options, record);
-  if (custom) return custom;
-  if (path === '/api/acs') return {status: 200, body: harness.acs.health};
-  if (path.startsWith('/api/acs/devices?tag=skybre_new')) {
-    return {status: 200, body: {devices: harness.acs.inbox, total: harness.acs.inbox.length}};
-  }
-  if (path.startsWith('/api/acs/devices?')) {
-    return {status: 200, body: {devices: harness.acs.devices, total: harness.acs.devices.length}};
-  }
-  if (path.startsWith('/api/acs/jobs?')) return {status: 200, body: {jobs: harness.acs.jobs}};
-};
+const managedRouter0 = () => routerByKey('acs:' + router.acs_id);
 """
+NAME = "AX3000 · AB-1"
+# The ID as it appears in a request path: encodeURIComponent turns its % into %25.
+ACS_PATH = "/api/acs/devices/202BC1-BM632w-AB%252D1"
+DIRECT_ROUTER = (
+    "harness.db.devices = [{id: 'r1', vendor: 'cudy', host: 'h', transport: '%s', status: {online: true},"
+    " metadata: %s}];"
+)
 
 
 def sent(outcome: dict, suffix: str, method: str = "POST") -> list[Any]:
     return [item["body"] for item in outcome["requests"] if item["method"] == method and item["path"].endswith(suffix)]
 
 
+def csrf_of(outcome: dict, suffix: str) -> list[Any]:
+    return [item["headers"].get("X-CSRF-Token") for item in outcome["requests"] if item["path"].endswith(suffix)]
+
+
 @needs_node
 class TestDashboardAcs:
-    def test_the_managed_tab_stays_hidden_while_the_acs_is_off(self, tmp_path: Path):
+    def test_the_tr069_parts_stay_hidden_while_the_acs_is_off(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            harness.handler = path => (path === '/api/acs'
-              ? {status: 503, body: {detail: 'off', configured: false}} : undefined);
-            await initAcs();
             return {
-              tabs: document.getElementById('tabs').hidden,
-              direct: document.getElementById('direct-view').hidden,
-              acs: document.getElementById('acs-view').hidden,
-              notice: document.getElementById('notice').textContent,
+              kindSeg: byId('kind-seg').hidden, routers: byId('view-routers').hidden,
+              acsOnly: document.querySelectorAll('.acs-only').every((node) => node.hidden),
+              pill: byId('new-pill').hidden, state: byId('acs-state').hidden, pager: byId('acs-pager').hidden,
+              notes: [byId('routers-notes').hidden, byId('routers-notes').textContent],
+              chips: byId('status-chips').children.map((chip) => chip.dataset.status),
             };
             """,
+            setup="harness.handler = (req) => (req.path === '/api/acs'"
+            " ? {status: 503, body: {detail: 'off', configured: false}} : undefined);",
         )
-        assert outcome["result"] == {"tabs": True, "direct": False, "acs": True, "notice": ""}
+        assert outcome["result"] == {
+            "kindSeg": True, "routers": False, "acsOnly": True, "pill": True, "state": True, "pager": True,
+            "notes": [True, ""], "chips": ["all", "online", "offline", "attention"],
+        }
         assert not [item for item in outcome["requests"] if item["path"].startswith("/api/acs/")]
 
-    def test_the_managed_tab_shows_the_fleet(self, tmp_path: Path):
+    def test_a_managed_router_shows_its_details_beside_the_list(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
-            const view = document.getElementById('acs-view');
-            const cardNode = document.getElementById('acs-devices').querySelector('article');
+            const rows = harness.rows();
+            await harness.open(NAME);
+            const shown = (root) => root.querySelectorAll('button')
+              .filter((b) => !b.hidden && !b.closest('[hidden]')).map((b) => b.textContent.trim());
+            const actions = shown(document.querySelector('.drawer-actions'));
+            await harness.press(byId('d-more'));
+            const menu = shown(byId('d-menu'));
+            const text = [byId('d-name'), byId('d-sub'), byId('d-badges'), byId('p-overview')]
+              .map((node) => node.textContent).join(' | ');
             return {
-              tabs: document.getElementById('tabs').hidden, acs: view.hidden,
-              direct: document.getElementById('direct-view').hidden,
-              selected: document.getElementById('tab-acs').getAttribute('aria-selected'),
-              addHidden: document.getElementById('add-button').hidden,
-              text: cardNode.textContent, buttons: harness.buttons(cardNode),
-              health: document.getElementById('acs-health').textContent,
-              page: document.getElementById('acs-page').textContent,
-              inboxHidden: document.getElementById('acs-inbox').hidden,
+              rows, actions, menu, text,
+              kind: [byId('kind-seg').hidden, byId('kind-seg').querySelector('[aria-pressed=true]').dataset.kind],
+              state: [byId('acs-state').hidden, byId('acs-state').textContent],
+              pager: [byId('acs-pager').hidden, byId('acs-page').textContent],
+              pill: byId('new-pill').hidden,
             };
             """,
             setup=ACS_SETUP,
         )
         result = outcome["result"]
-        assert (result["tabs"], result["acs"], result["direct"], result["selected"]) == (False, False, True, "true")
-        assert result["addHidden"] is True, "Add device is for direct routers only"
-        for expected in ("AX3000", "Acme", "serial AB-1", "online", "1.2.3", "3 min ago", "TR-181", "Wi-Fi 2.4 GHz",
-                         "Home", "Wi-Fi 5 GHz", "Home-5G", "as of 10 min ago", "band inferred", "shop"):
+        assert result["rows"][0][:3] == [f"{NAME}  Acme", "—", "Online"]
+        # The design lists every router at once: All is chosen, and Managed narrows it down.
+        assert result["kind"] == [False, "all"]
+        for expected in ("AX3000", "Acme", "AB-1", "Online", "1.2.3", "3 min ago", "TR-181", "2.4 GHz", "Home",
+                         "5 GHz", "Home-5G", "as of 10 min ago", "band inferred", "shop", "Managed · TR-069"):
             assert expected in result["text"], expected
-        assert result["buttons"] == ["Refresh", "Change Wi-Fi", "Reboot", "Tags"]
-        assert "GenieACS 1.2.16+20260329 is connected" in result["health"]
-        assert result["page"] == "1–1 of 1"
-        assert result["inboxHidden"] is True
+        assert result["actions"] == ["Change Wi-Fi", "Refresh", "Reboot", "More"]
+        assert result["menu"] == ["Tags"], "the admin login and Remove are for direct routers only"
+        assert result["state"] == [False, "GenieACS 1.2.16+20260329 is connected"]
+        # Everything fits on one page, so there is nothing to page through.
+        assert result["pager"] == [True, "1–1 of 1 managed router"]
+        assert result["pill"] is True
 
     def test_actions_are_disabled_with_a_reason_where_they_cannot_work(self, tmp_path: Path):
         outcome = run_page(
@@ -1186,142 +1239,160 @@ class TestDashboardAcs:
             """
             const out = {};
             for (const model of ['tr181-issue1', 'unknown', 'tr098']) {
-              const node = acsCard(Object.assign({}, router, {data_model: model}));
-              const wifi = harness.button(node, 'Change Wi-Fi');
-              const refresh = harness.button(node, 'Refresh');
-              out[model] = [wifi.disabled, Boolean(wifi.title), refresh.disabled];
+              harness.db.acsDevices = [Object.assign({}, router, {data_model: model})];
+              await loadRouters();
+              await harness.open(NAME);
+              const state = (id) => [byId(id).disabled, Boolean(byId(id).title)];
+              out[model] = [...state('d-wifi'), ...state('d-refresh'), ...state('d-reboot')];
+              if (!byId('d-refresh').disabled) {
+                await harness.press(byId('d-refresh'));
+                const scope = byId('refresh-scope');
+                out[model].push(scope.options.map((option) => option.value), scope.value);
+                byId('refresh-dialog').close();
+              }
             }
             return out;
             """,
             setup=ACS_SETUP,
         )
         assert outcome["result"] == {
-            "tr181-issue1": [True, True, False],
-            "unknown": [True, True, True],
-            "tr098": [False, False, False],
+            # The first TR-181 edition has no Wi-Fi tree, but can still report the rest.
+            "tr181-issue1": [True, True, False, False, False, False, ["info", "all"], "info"],
+            "unknown": [True, True, True, True, False, False],
+            "tr098": [False, False, False, False, False, False, ["wifi", "hosts", "wan", "info", "all"], "wifi"],
         }
+        assert sent(outcome, "/refresh") == []
 
     def test_change_wifi_sends_one_request_and_forgets_the_password(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
-            """
-            await harness.flush();
-            harness.acsReply = (path, options) => (path.endsWith('/wifi') && options.method === 'POST'
-              ? {status: 202, body: {job: makeJob('queued')}} : undefined);
-            const cardNode = document.getElementById('acs-devices').querySelector('article');
-            harness.button(cardNode, 'Change Wi-Fi').click();
-            const dialog = document.getElementById('acs-wifi-dialog');
-            const form = document.getElementById('acs-wifi-form');
-            const bands = form.elements.band.options.map(option => [option.value, option.textContent]);
-            const warning = dialog.querySelector('.warning').textContent;
-            form.elements.band.value = '2.4GHz';
-            form.elements.ssid.value = ' New-Home ';
-            form.elements.passphrase.value = 'zq-Wifi-Passphrase-7731';
-            form.elements.repeat.value = 'zq-Wifi-Passphrase-7731';
-            await harness.submit(form);
-            await harness.flush();
-            return {
-              bands, warning, open: dialog.open, left: form.elements.passphrase.value + form.elements.repeat.value,
-              toast: document.getElementById('toasts').textContent,
-              notice: document.getElementById('notice').textContent,
-            };
+            f"""
+            harness.handler = (req) => (req.path.endsWith('/wifi') && req.method === 'POST'
+              ? {{status: 202, body: {{job: makeJob('queued')}}}} : undefined);
+            await harness.open(NAME);
+            await harness.press(byId('d-wifi'));
+            const seg = byId('band-seg');
+            const bands = seg.children.map((b) => [b.dataset.band, b.textContent, b.disabled, b.title]);
+            await harness.press(seg.querySelector('[data-band="5"]'));
+            const five = [byId('band-hint').hidden, byId('band-hint').textContent, byId('ssid-hint').textContent];
+            await harness.press(seg.querySelector('[data-band="2.4"]'));
+            const two = [byId('band-hint').hidden, byId('ssid-hint').textContent];
+            const warning = byId('wifi-dialog').querySelector('.warnbox').textContent;
+            const note = byId('wifi-note').textContent;
+            byId('w-ssid').value = ' New-Home ';
+            byId('w-pw1').value = {json.dumps(PASS)};
+            byId('w-pw2').value = {json.dumps(PASS)};
+            await harness.press(byId('wifi-send'));
+            return {{bands, five, two, warning, note, open: byId('wifi-dialog').open,
+                     left: byId('w-pw1').value + byId('w-pw2').value, toasts: harness.toasts(),
+                     status: harness.row(NAME).children[2].textContent, page: document.body.textContent}};
             """,
             setup=ACS_SETUP,
         )
         result = outcome["result"]
         assert result["bands"] == [
-            ["all", "All bands"],
-            ["2.4GHz", "2.4 GHz — Home"],
-            ["5GHz", "5 GHz — Home-5G (band inferred)"],
+            ["both", "Both bands", False, ""],
+            ["2.4", "2.4 GHz", False, 'Now "Home"'],
+            ["5", "5 GHz", False, 'Now "Home-5G" (band inferred)'],
         ]
-        assert "will be disconnected" in result["warning"]
+        assert result["five"] == [
+            False,
+            'SkyRouter inferred from its channel that "Home-5G" is the 5 GHz network, so it asks before writing to it.',
+            '(empty keeps "Home-5G")',
+        ]
+        assert result["two"] == [True, '(empty keeps "Home")']
+        assert "disconnects and must reconnect" in result["warning"]
+        assert result["note"] == "If the router cannot be reached right now, the change waits for its next check-in."
         assert sent(outcome, "/wifi") == [{"band": "2.4GHz", "ssid": "New-Home", "passphrase": PASS}]
         [post] = [item for item in outcome["requests"] if item["path"].endswith("/wifi")]
-        assert post["path"] == "/api/acs/devices/202BC1-BM632w-AB%252D1/wifi"
+        assert post["path"] == f"{ACS_PATH}/wifi" and post["headers"]["X-CSRF-Token"] == "t1"
         assert result["open"] is False and result["left"] == ""
-        assert "Wi-Fi change · AX3000 · AB-1" in result["toast"]
-        assert "Queued — sending it to the router now." in result["toast"]
-        assert PASS not in result["toast"] + result["notice"]
+        assert result["toasts"] == [{"kind": "queued", "title": "Queued", "text": f"Sending it to {NAME} now."}]
+        assert result["status"] == "Change waiting"
+        assert PASS not in result["page"]
 
     @pytest.mark.parametrize(
         ("ssid", "passphrase", "repeat", "expected"),
         [
-            ("", "", "", "Enter a new network name, a new Wi-Fi password, or both"),
+            ("", "", "", "Enter a new Wi-Fi name, a new password, or both."),
             ("", "zq-Wifi-Passphrase-7731", "zq-Wifi-Passphrase-7732", "do not match"),
             ("", "short", "short", "8 to 63 characters"),
-            ("", "café-passphrase", "café-passphrase", "8 to 63 characters"),
+            ("", "café-passphrase", "café-passphrase", "no accents or emoji"),
         ],
     )
     def test_change_wifi_checks_the_form_before_sending(self, tmp_path: Path, ssid, passphrase, repeat, expected):
         outcome = run_page(
             tmp_path,
             f"""
-            await harness.flush();
-            showAcsWifi(router);
-            const form = document.getElementById('acs-wifi-form');
-            form.elements.ssid.value = {json.dumps(ssid)};
-            form.elements.passphrase.value = {json.dumps(passphrase)};
-            form.elements.repeat.value = {json.dumps(repeat)};
-            await harness.submit(form);
-            return [document.getElementById('notice').textContent, document.getElementById('acs-wifi-dialog').open];
+            await harness.open(NAME);
+            await harness.press(byId('d-wifi'));
+            byId('w-ssid').value = {json.dumps(ssid)};
+            byId('w-pw1').value = {json.dumps(passphrase)};
+            byId('w-pw2').value = {json.dumps(repeat)};
+            await harness.press(byId('wifi-send'));
+            return [byId('wifi-error').textContent, byId('wifi-dialog').open];
             """,
             setup=ACS_SETUP,
         )
-        notice, still_open = outcome["result"]
-        assert expected in notice and still_open is True
+        error, still_open = outcome["result"]
+        assert expected in error and still_open is True
         assert sent(outcome, "/wifi") == []
         if passphrase:
-            assert passphrase not in notice
+            assert passphrase not in error
 
-    @pytest.mark.parametrize("answer", [True, False])
+    @pytest.mark.parametrize("answer", ["ok", "cancel"])
     def test_an_inferred_band_is_confirmed_before_it_is_written(self, tmp_path: Path, answer):
         outcome = run_page(
             tmp_path,
             f"""
-            await harness.flush();
-            harness.answers.confirm.push({json.dumps(answer)});
-            harness.acsReply = (path, options, record) => {{
-              if (!path.endsWith('/wifi')) return undefined;
-              if (!record.body.confirm_guessed_band) {{
+            harness.handler = (req) => {{
+              if (!req.path.endsWith('/wifi')) return undefined;
+              if (!req.body.confirm_guessed_band) {{
                 return {{status: 409, body: {{detail: 'SkyRouter inferred 5GHz.', plan: {{band_guessed: true}}}}}};
               }}
               return {{status: 202, body: {{job: makeJob('queued')}}}};
             }};
-            showAcsWifi(router);
-            const form = document.getElementById('acs-wifi-form');
-            form.elements.band.value = '5GHz';
-            form.elements.ssid.value = 'Upstairs';
-            await harness.submit(form);
+            await harness.open(NAME);
+            await harness.press(byId('d-wifi'));
+            await harness.press(byId('band-seg').querySelector('[data-band="5"]'));
+            byId('w-ssid').value = 'Upstairs';
+            const sending = byId('wifi-send').click();
             await harness.flush();
-            return [document.getElementById('notice').textContent, document.getElementById('acs-wifi-dialog').open];
+            const asked = [byId('confirm-dialog').open, byId('confirm-text').textContent];
+            await harness.press(byId('confirm-{answer}'));
+            await sending;
+            await harness.flush();
+            return [asked, byId('wifi-error').textContent, byId('wifi-dialog').open];
             """,
             setup=ACS_SETUP,
         )
+        asked, error, still_open = outcome["result"]
+        assert asked == [True, "SkyRouter inferred 5GHz."]
         bodies = sent(outcome, "/wifi")
-        if answer:
+        if answer == "ok":
             assert bodies == [
                 {"band": "5GHz", "ssid": "Upstairs"},
                 {"band": "5GHz", "ssid": "Upstairs", "confirm_guessed_band": True},
             ]
-            assert outcome["result"][1] is False
+            assert still_open is False
         else:
             assert bodies == [{"band": "5GHz", "ssid": "Upstairs"}]
-            assert outcome["result"] == ["Nothing was changed", True]
+            assert [error, still_open] == ["Nothing was changed.", True]
 
     def test_a_job_toast_explains_each_state_and_polls_on_the_briefs_schedule(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
             let reply = makeJob('waiting_for_checkin', {
               expected_by: todayAt(10, 5), cr_attempts: [{at: todayAt(10, 0), ok: false, result: 'Device is offline'}],
             });
-            harness.acsReply = path => (path.startsWith('/api/acs/jobs/')
+            harness.handler = (req) => (req.path.startsWith('/api/acs/jobs/')
               ? {status: 200, body: {job: reply}} : undefined);
-            trackJob(reply, router);
-            const toasts = document.getElementById('toasts');
-            const waiting = toasts.textContent;
+            trackJob(reply, managedRouter0());
+            const toasts = byId('toasts');
+            const waiting = [harness.toasts()[0], toasts.textContent];
             const buttons = harness.buttons(toasts);
+            const status = harness.row(NAME).children[2].textContent;
             const polls = () => harness.requests.filter(r => r.path === '/api/acs/jobs/a1b2c3d4e5f60718').length;
             await harness.advance(180000);
             const fast = polls();
@@ -1331,390 +1402,548 @@ class TestDashboardAcs:
               message: 'The router accepted the new password. It cannot be read back to double-check.',
             });
             await harness.advance(15000);
-            const done = toasts.textContent;
+            const done = harness.toasts()[0];
             const doneButtons = harness.buttons(toasts);
             const after = polls();
             await harness.advance(60000);
             const stopped = polls() === after;
-            return {waiting, buttons, fast, slow, done, doneButtons, stopped, left: toasts.textContent};
+            return {waiting, buttons, status, fast, slow, done, doneButtons, stopped, left: toasts.textContent,
+                    now: harness.row(NAME).children[2].textContent};
             """,
             setup=ACS_SETUP,
         )
         result = outcome["result"]
-        assert "Queued — the router will pick this up at its next check-in, expected around 10:05." in result["waiting"]
-        assert "Not reachable right now: Device is offline" in result["waiting"]
-        assert result["buttons"] == ["Cancel"]
+        toast, text = result["waiting"]
+        assert toast == {"kind": "queued", "title": "Queued",
+                         "text": f"{NAME} picks this up at its next check-in, around 10:05."}
+        assert "Not reachable right now: Device is offline." in text
+        assert result["buttons"] == ["×", "Cancel change"]
+        assert result["status"] == "Change waiting"
         assert result["fast"] == 90, "every 2 s for the first three minutes"
         assert result["slow"] == 4, "then every 15 s"
-        assert "The router accepted the new password. It cannot be read back to double-check." in result["done"]
-        assert result["doneButtons"] == ["Dismiss"]
+        assert result["done"] == {
+            "kind": "applied", "title": "Applied",
+            "text": f"{NAME}: The router accepted the new password. It cannot be read back to double-check.",
+        }
+        assert result["doneButtons"] == ["×"]
         assert result["stopped"] is True, "polling went on after done"
         assert result["left"] == "", "a successful toast should clear itself"
+        assert result["now"] == "Online"
 
-    def test_an_accepted_change_still_being_read_back_can_be_dismissed_and_refreshes_the_card(self, tmp_path: Path):
+    def test_an_accepted_change_still_being_read_back_can_be_dismissed_and_refreshes_the_list(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
             const lists = () => harness.requests.filter(r => r.path.startsWith('/api/acs/devices?skip')).length;
             const before = lists();
             const watching = makeJob('acknowledged', {done: false, watch: 'scrub', message: 'The router accepted it.'});
-            harness.acsReply = path => (path.startsWith('/api/acs/jobs/')
+            harness.handler = (req) => (req.path.startsWith('/api/acs/jobs/')
               ? {status: 200, body: {job: watching}} : undefined);
-            trackJob(watching, router);
+            trackJob(watching, managedRouter0());
             await harness.flush();
-            const buttons = harness.buttons(document.getElementById('toasts'));
+            const buttons = harness.buttons(byId('toasts'));
             const reloaded = lists() - before;
             const polls = () => harness.requests.filter(r => r.path.startsWith('/api/acs/jobs/')).length;
             await harness.advance(4000);
             const polled = polls();
-            harness.button(document.getElementById('toasts'), 'Dismiss').click();
+            await harness.press(harness.button(byId('toasts'), '×'));
             await harness.advance(60000);
-            return {buttons, reloaded, polled, after: polls(), left: document.getElementById('toasts').textContent};
+            return {buttons, reloaded, polled, after: polls(), left: byId('toasts').textContent};
             """,
             setup=ACS_SETUP,
         )
         result = outcome["result"]
-        assert result["buttons"] == ["Dismiss"]
-        assert result["reloaded"] == 1, "the card should show the accepted change straight away"
+        assert result["buttons"] == ["×"]
+        assert result["reloaded"] == 1, "the list should show the accepted change straight away"
         assert result["polled"] == 2, "a job still being read back is still followed"
         assert result["after"] == result["polled"] and result["left"] == ""
 
+    def test_an_answer_that_arrives_after_dismissing_is_dropped(self, tmp_path: Path):
+        outcome = run_page(
+            tmp_path,
+            """
+            const watching = makeJob('acknowledged', {done: false, watch: 'scrub', message: 'The router accepted it.'});
+            const gate = harness.deferred();
+            harness.handler = (req) => (req.path.startsWith('/api/acs/jobs/') ? gate.promise : undefined);
+            trackJob(watching, managedRouter0());
+            await harness.advance(2000);
+            await harness.press(harness.button(byId('toasts'), '×'));
+            gate.resolve({status: 200, body: {job: watching}});
+            await harness.advance(60000);
+            const polls = harness.requests.filter(r => r.path.startsWith('/api/acs/jobs/')).length;
+            return [harness.toasts().length, polls];
+            """,
+            setup=ACS_SETUP,
+        )
+        assert outcome["result"] == [0, 1], "a dismissed change came back"
+
+    def test_a_pending_toast_closed_early_still_reports_the_outcome(self, tmp_path: Path):
+        outcome = run_page(
+            tmp_path,
+            """
+            let reply = makeJob('waiting_for_checkin');
+            harness.handler = (req) => (req.path.startsWith('/api/acs/jobs/')
+              ? {status: 200, body: {job: reply}} : undefined);
+            trackJob(reply, managedRouter0());
+            await harness.press(harness.button(byId('toasts'), '×'));
+            await harness.advance(10000);
+            const hidden = [harness.toasts().length, harness.row(NAME).children[2].textContent];
+            reply = makeJob('rejected', {message: 'The router refused the change: cwmp.9007 Invalid value'});
+            await harness.advance(2000);
+            return [hidden, harness.toasts()];
+            """,
+            setup=ACS_SETUP,
+        )
+        hidden, shown = outcome["result"]
+        assert hidden == [0, "Change waiting"], "closing the toast does not forget the change"
+        assert shown == [{"kind": "refused", "title": "Refused",
+                          "text": f"{NAME}: The router refused the change: cwmp.9007 Invalid value"}]
+
     @pytest.mark.parametrize(
-        ("state", "extra", "expected"),
+        ("state", "extra", "expected", "kind"),
         [
-            ("queued", {}, "Queued — sending it to the router now."),
-            ("contacting_router", {}, "The router answered — waiting for it to check in and take the change."),
-            ("waiting_for_checkin", {}, "Queued — the router will pick this up at its next check-in."),
-            ("rejected", {"message": "The router refused the change: cwmp.9007 Invalid value"}, "cwmp.9007"),
-            ("expired", {}, "did not check in in time"),
-            ("cancelled", {}, "Cancelled."),
+            ("queued", {}, f"Sending it to {NAME} now.", ["queued", "Queued"]),
+            ("contacting_router", {}, f"{NAME} answered; waiting for it to check in and take the change.",
+             ["queued", "Queued"]),
+            ("waiting_for_checkin", {}, f"{NAME} picks this up at its next check-in.", ["queued", "Queued"]),
+            ("rejected", {"message": "The router refused the change: cwmp.9007 Invalid value"}, "cwmp.9007",
+             ["refused", "Refused"]),
+            ("expired", {}, "did not check in in time", ["info", "Not applied"]),
+            ("cancelled", {}, f"Cancelled: nothing was changed on {NAME}.", ["info", "Not applied"]),
         ],
     )
-    def test_job_state_text(self, tmp_path: Path, state, extra, expected):
-        scenario = f"return jobText(makeJob({json.dumps(state)}, {json.dumps(extra)}));"
+    def test_job_state_text(self, tmp_path: Path, state, extra, expected, kind):
+        scenario = f"return jobView({{job: makeJob({json.dumps(state)}, {json.dumps(extra)}), router: null}});"
         outcome = run_page(tmp_path, scenario, setup=ACS_SETUP)
-        assert expected in outcome["result"]
+        assert outcome["result"][:2] == kind
+        assert expected in outcome["result"][2]
 
     def test_cancelling_a_job_asks_first_and_shows_a_busy_router(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
-            harness.acsReply = (path, options) => (options.method === 'DELETE'
+            harness.handler = (req) => (req.method === 'DELETE'
               ? {status: 409, body: {detail: 'the router is mid-session; try again'}} : undefined);
-            trackJob(makeJob('waiting_for_checkin'), router);
-            harness.answers.confirm.push(false);
-            harness.button(document.getElementById('toasts'), 'Cancel').click();
-            await harness.flush();
+            trackJob(makeJob('waiting_for_checkin'));
+            const cancel = () => harness.button(byId('toasts'), 'Cancel change');
+            await harness.press(cancel());
+            const asked = byId('confirm-title').textContent;
+            await harness.press(byId('confirm-cancel'));
             const declined = harness.requests.filter(r => r.method === 'DELETE').length;
-            harness.button(document.getElementById('toasts'), 'Cancel').click();
-            await harness.flush();
-            return [declined, document.getElementById('notice').textContent];
+            await harness.press(cancel());
+            await harness.press(byId('confirm-ok'));
+            return [asked, declined, harness.toasts()];
             """,
             setup=ACS_SETUP,
         )
-        assert outcome["result"] == [0, "the router is mid-session; try again"]
+        asked, declined, toasts = outcome["result"]
+        assert asked == "Cancel this change?" and declined == 0
         assert [item["path"] for item in outcome["requests"] if item["method"] == "DELETE"] == [
             "/api/acs/jobs/a1b2c3d4e5f60718"
         ]
+        # The refusal says why, and the change it could not cancel is still followed.
+        assert toasts[0] == {"kind": "refused", "title": "Not cancelled",
+                             "text": "the router is mid-session; try again"}
+        assert [toast["title"] for toast in toasts[1:]] == ["Queued"]
 
     def test_jobs_in_progress_are_picked_up_after_a_reload(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
-            """
-            await harness.flush();
-            return document.getElementById('toasts').textContent;
-            """,
-            setup=ACS_SETUP + "harness.acs.jobs = [makeJob('contacting_router', {kind: 'reboot'})];",
+            "return {toasts: harness.toasts(), status: harness.row(NAME).children[2].textContent};",
+            setup=ACS_SETUP + "harness.db.jobs = [makeJob('contacting_router', {kind: 'reboot'})];",
         )
-        # Named as on its card, although the job itself only carries the ACS ID.
-        assert "Reboot · AX3000 · AB-1" in outcome["result"]
-        assert any(item["path"] == "/api/acs/jobs?active=true" for item in outcome["requests"])
+        # Named as in the list, although the job itself only carries the ACS ID.
+        assert outcome["result"] == {
+            "toasts": [{"kind": "queued", "title": "Reboot queued",
+                        "text": f"{NAME} answered; waiting for it to check in and restart."}],
+            "status": "Change waiting",
+        }
+        paths = [item["path"] for item in outcome["requests"]]
+        assert "/api/acs/jobs?active=true" in paths
+        assert paths.index("/api/acs/jobs?active=true") > paths.index("/api/acs/devices?skip=0&limit=200")
 
-    def test_reboot_refresh_tags_and_adopt(self, tmp_path: Path):
+    def test_reboot_refresh_and_tags(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
-            harness.acsReply = (path, options) => {
-              if (/\\/(reboot|refresh)$/.test(path)) {
+            harness.handler = (req) => {
+              if (/\\/(reboot|refresh)$/.test(req.path)) {
                 return {status: 202, body: {job: makeJob('queued', {kind: 'reboot'})}};
               }
-              if (path.includes('/tags/')) {
-                const tag = decodeURIComponent(path.split('/tags/')[1]);
-                return {status: 200, body: {tags: options.method === 'POST' ? ['shop', tag] : []}};
+              if (req.path.includes('/tags/')) {
+                const tag = decodeURIComponent(req.path.split('/tags/')[1]);
+                return {status: 200, body: {tags: req.method === 'POST' ? ['shop', tag] : []}};
               }
             };
-            const cardNode = document.getElementById('acs-devices').querySelector('article');
-            harness.answers.confirm.push(false);
-            harness.button(cardNode, 'Reboot').click();
-            await harness.flush();
-            harness.button(cardNode, 'Reboot').click();
-            await harness.flush();
-            harness.button(cardNode, 'Refresh').click();
-            const refreshForm = document.getElementById('acs-refresh-form');
-            const scopes = refreshForm.elements.scope.options.map(option => option.value);
-            const preselected = refreshForm.elements.scope.value;
-            await harness.submit(refreshForm);
-            await harness.flush();
-            harness.button(cardNode, 'Tags').click();
-            const tagsForm = document.getElementById('acs-tags-form');
-            tagsForm.elements.tag.value = 'Not A Tag';
-            await harness.submit(tagsForm);
-            const refused = document.getElementById('notice').textContent;
-            tagsForm.elements.tag.value = ' Shop_42 ';
-            await harness.submit(tagsForm);
-            await harness.flush();
-            const chips = document.getElementById('acs-tags-list').textContent;
-            harness.button(document.getElementById('acs-tags-list'), '×').click();
-            await harness.flush();
-            return {scopes, preselected, refused, chips, after: document.getElementById('acs-tags-list').textContent};
+            await harness.open(NAME);
+            await harness.press(byId('d-reboot'));
+            await harness.press(byId('reboot-cancel'));
+            await harness.press(byId('d-reboot'));
+            await harness.press(byId('reboot-ok'));
+            await harness.press(byId('d-refresh'));
+            const scopes = byId('refresh-scope').options.map((option) => [option.value, option.textContent]);
+            const preselected = byId('refresh-scope').value;
+            await harness.press(byId('refresh-send'));
+            await harness.press(byId('d-more'));
+            await harness.press(byId('d-tags'));
+            const listed = byId('tags-list').textContent;
+            byId('tag-input').value = 'Not A Tag';
+            await harness.press(byId('tags-add'));
+            const refused = byId('tags-error').textContent;
+            byId('tag-input').value = ' Shop_42 ';
+            await harness.press(byId('tags-add'));
+            const chips = byId('tags-list').textContent;
+            const badges = byId('d-badges').textContent;
+            const typed = byId('tag-input').value;
+            await harness.press(harness.button(byId('tags-list'), '×'));
+            return {scopes, preselected, listed, refused, chips, badges, typed, open: byId('tags-dialog').open,
+                    after: byId('tags-list').textContent, refreshOpen: byId('refresh-dialog').open};
             """,
             setup=ACS_SETUP,
         )
         result = outcome["result"]
         assert sent(outcome, "/reboot") == [{"confirm": True}], "a declined reboot was sent"
-        assert result["scopes"] == ["wifi", "hosts", "wan", "info", "all"] and result["preselected"] == "wifi"
-        assert sent(outcome, "/refresh") == [{"scope": "wifi"}]
-        assert "lowercase" in result["refused"]
-        assert [item["path"] for item in outcome["requests"] if "/tags/" in item["path"]] == [
-            "/api/acs/devices/202BC1-BM632w-AB%252D1/tags/shop_42",
-            "/api/acs/devices/202BC1-BM632w-AB%252D1/tags/shop",
+        assert result["scopes"] == [
+            ["wifi", "Wi-Fi settings"], ["hosts", "Connected devices"], ["wan", "Internet connection"],
+            ["info", "Router information"], ["all", "Everything (slow on some routers)"],
         ]
-        assert "shop_42" in result["chips"] and result["after"] == "No tags yet"
+        assert result["preselected"] == "wifi" and result["refreshOpen"] is False
+        assert sent(outcome, "/refresh") == [{"scope": "wifi"}]
+        assert result["listed"] == "shop×"
+        assert "lowercase" in result["refused"]
+        tags = [(item["method"], item["path"]) for item in outcome["requests"] if "/tags/" in item["path"]]
+        assert tags == [("POST", f"{ACS_PATH}/tags/shop_42"), ("DELETE", f"{ACS_PATH}/tags/shop")]
+        assert set(csrf_of(outcome, "/shop_42") + csrf_of(outcome, "/tags/shop")) == {"t1"}
+        assert "shop_42" in result["chips"] and "shop_42" in result["badges"] and result["typed"] == ""
+        assert result["after"] == "No tags yet" and result["open"] is True
 
-    def test_the_new_devices_inbox_adopts(self, tmp_path: Path):
+    def test_the_new_routers_inbox_adopts(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
-            const inbox = document.getElementById('acs-inbox');
-            const shown = [inbox.hidden, inbox.textContent];
-            harness.acs.inbox = [];
-            harness.button(inbox, 'Adopt').click();
-            await harness.flush();
-            return {shown, after: inbox.hidden, notice: document.getElementById('notice').textContent};
+            const pill = byId('new-pill');
+            const shown = [pill.hidden, pill.textContent];
+            await harness.press(pill);
+            const list = byId('new-list');
+            const label = list.querySelector('label span').textContent;
+            list.querySelector('input').value = ' #1080 Customer E ';
+            harness.db.acsNew = [];
+            await harness.press(harness.button(list, 'Adopt'));
+            return {shown, label, after: pill.hidden, left: list.textContent, toast: harness.toasts()[0],
+                    rows: harness.rows().map((row) => row[0])};
             """,
-            setup=ACS_SETUP + "harness.acs.inbox = [Object.assign({}, router, {tags: ['skybre_new']})];",
+            setup=ACS_SETUP + """
+            harness.db.acsNew = [Object.assign({}, router, {acs_id: '202BC1-BM632w-NEW1', serial: 'NEW1',
+                                                            tags: ['skybre_new']})];
+            """,
         )
         result = outcome["result"]
-        assert result["shown"][0] is False and "AX3000 · AB-1" in result["shown"][1]
-        assert sent(outcome, "/adopt") == [None]
-        assert result["after"] is True and result["notice"] == "AX3000 · AB-1 adopted"
+        assert result["shown"] == [False, "1 new router to adopt"]
+        assert result["label"] == "AX3000 · serial NEW1"
+        assert result["rows"] == [f"{NAME}  Acme"], "a router waiting to be adopted is not in the list"
+        # The approved design links an adopted router to its Vexar customer.
+        assert sent(outcome, "/adopt") == [{"customer": "#1080 Customer E"}]
+        assert result["after"] is True and result["left"] == "No new routers waiting."
+        assert result["toast"] == {"kind": "applied", "title": "Adopted",
+                                   "text": "AX3000 · serial NEW1 is linked to #1080 Customer E."}
 
     def test_installing_the_provisioning_asks_before_removing_seeded_presets(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
-            harness.acsReply = (path, options, record) => {
-              if (path !== '/api/acs/bootstrap') return undefined;
-              if (!record.body.remove_seeded) {
-                return {status: 409, body: {detail: 'GenieACS has seeded presets', seeded: ['default']}};
+            harness.handler = (req) => {
+              if (req.path !== '/api/acs/bootstrap') return undefined;
+              if (!req.body.remove_seeded) {
+                return {status: 409, body: {detail: 'GenieACS has seeded presets.', seeded: ['default']}};
               }
               return {status: 200, body: {writes: 7}};
             };
-            harness.answers.confirm.push(true, true);
-            harness.button(document.getElementById('acs-health'), 'Install provisioning').click();
-            await harness.flush();
-            return document.getElementById('notice').textContent;
+            const notes = byId('routers-notes');
+            const warned = notes.textContent;
+            await harness.press(harness.button(notes, 'Install provisioning'));
+            const first = byId('confirm-title').textContent;
+            await harness.press(byId('confirm-ok'));
+            const second = [byId('confirm-title').textContent, byId('confirm-text').textContent];
+            harness.db.acs.bootstrap = {installed: true, drift: [], seeded_presets: []};
+            await harness.press(byId('confirm-ok'));
+            return {warned, first, second, toast: harness.toasts()[0], after: notes.textContent};
             """,
-            setup=ACS_SETUP + "harness.acs.health.bootstrap = {installed: false, drift: [{}, {}], seeded_presets: []};",
+            setup=ACS_SETUP + "harness.db.acs.bootstrap = {installed: false, drift: [{}, {}], seeded_presets: []};",
         )
+        result = outcome["result"]
+        assert "SkyRouter's provisioning is not installed in GenieACS (2 parts missing or changed)" in result["warned"]
+        assert result["first"] == "Install SkyRouter's provisioning?"
+        assert result["second"] == ["Remove GenieACS's default presets?",
+                                    "GenieACS has seeded presets. Remove default and install?"]
         assert sent(outcome, "/api/acs/bootstrap") == [
             {"confirm": True, "remove_seeded": False},
             {"confirm": True, "remove_seeded": True},
         ]
-        assert outcome["result"] == "Provisioning installed (7 change(s) written)"
+        assert result["toast"] == {"kind": "applied", "title": "Provisioning installed",
+                                   "text": "7 changes written to GenieACS."}
+        assert "not installed" not in result["after"], "the banner is read again afterwards"
+
+    def test_declining_to_remove_the_seeded_presets_installs_nothing(self, tmp_path: Path):
+        outcome = run_page(
+            tmp_path,
+            """
+            harness.handler = (req) => (req.path === '/api/acs/bootstrap'
+              ? {status: 409, body: {detail: 'GenieACS has seeded presets.', seeded: ['default']}} : undefined);
+            await harness.press(harness.button(byId('routers-notes'), 'Install provisioning'));
+            await harness.press(byId('confirm-ok'));
+            await harness.press(byId('confirm-cancel'));
+            return byId('confirm-dialog').open;
+            """,
+            setup=ACS_SETUP + "harness.db.acs.bootstrap = {installed: false, drift: [], seeded_presets: []};",
+        )
+        assert outcome["result"] is False
+        assert sent(outcome, "/api/acs/bootstrap") == [{"confirm": True, "remove_seeded": False}]
 
     def test_health_problems_and_faults_are_shown(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
-            harness.acsReply = path => (path.endsWith('/retry')
+            harness.handler = (req) => (req.path.endsWith('/retry')
               ? {status: 200, body: {connection_request: {ok: false, reason: 'Device is offline'}}} : undefined);
-            const health = document.getElementById('acs-health');
-            const text = health.textContent;
-            harness.button(health, 'Retry').click();
-            await harness.flush();
-            return [text, document.getElementById('notice').textContent];
+            const notes = byId('routers-notes');
+            const text = notes.textContent;
+            await harness.press(harness.button(notes, 'Retry'));
+            const retried = harness.toasts()[0];
+            await harness.press(harness.button(notes, 'Clear'));
+            const asked = byId('confirm-title').textContent;
+            await harness.press(byId('confirm-ok'));
+            return {text, retried, asked, cleared: harness.toasts()[0]};
             """,
             setup=ACS_SETUP
             + """
-            harness.acs.health.problems = ['SKYROUTER_CR_SECRET is unset on the GenieACS host'];
-            harness.acs.health.channel_faults = [{id: router.acs_id + ':skybre-inform', device: router.acs_id,
+            harness.db.acs.problems = ['SKYROUTER_CR_SECRET is unset on the GenieACS host'];
+            harness.db.acs.channel_faults = [{id: router.acs_id + ':skybre-inform', device: router.acs_id,
               channel: 'skybre-inform', code: 'ext.Error', message: 'secret unset'}];
             """,
         )
-        text, notice = outcome["result"]
-        assert "SKYROUTER_CR_SECRET is unset" in text and "skybre-inform on 202BC1-BM632w-AB%2D1: ext.Error" in text
-        assert [item["path"] for item in outcome["requests"] if item["path"].endswith("/retry")] == [
-            "/api/acs/faults/202BC1-BM632w-AB%252D1%3Askybre-inform/retry"
-        ]
-        assert "next check-in (Device is offline)" in notice
+        result = outcome["result"]
+        assert "SKYROUTER_CR_SECRET is unset" in result["text"]
+        assert f"Provisioning step skybre-inform failed on {NAME}: ext.Error secret unset" in result["text"]
+        fault = "/api/acs/faults/202BC1-BM632w-AB%252D1%3Askybre-inform"
+        assert [item["path"] for item in outcome["requests"] if item["method"] == "POST"] == [f"{fault}/retry"]
+        assert "next check-in (Device is offline)" in result["retried"]["text"]
+        assert result["asked"] == "Clear this fault?"
+        assert [item["path"] for item in outcome["requests"] if item["method"] == "DELETE"] == [fault]
+        assert result["cleared"]["title"] == "Fault cleared"
 
     def test_an_unreachable_acs_says_so(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
-            "await harness.flush(); return document.getElementById('acs-health').textContent;",
+            "return [byId('routers-notes').textContent, byId('acs-state').hidden];",
             setup=ACS_SETUP
-            + "Object.assign(harness.acs.health, {reachable: false, version: null, error: 'ACS unavailable'});",
+            + "Object.assign(harness.db.acs, {reachable: false, version: null, error: 'ACS unavailable'});",
         )
-        assert "SkyRouter cannot reach GenieACS: ACS unavailable" in outcome["result"]
+        text, state_hidden = outcome["result"]
+        assert "SkyRouter cannot reach GenieACS: ACS unavailable" in text and state_hidden is True
+
+    def test_an_acs_that_goes_away_while_the_page_is_open_says_so(self, tmp_path: Path):
+        outcome = run_page(
+            tmp_path,
+            """
+            const before = byId('acs-state').textContent;
+            harness.handler = (req) => (req.path === '/api/acs'
+              ? {status: 502, body: {detail: 'ACS unavailable'}} : undefined);
+            await harness.advance(30000);
+            return [before, byId('routers-notes').textContent, byId('acs-state').hidden];
+            """,
+            setup=ACS_SETUP,
+        )
+        before, text, state_hidden = outcome["result"]
+        assert before.startswith("GenieACS 1.2.16")
+        assert "SkyRouter cannot reach GenieACS: ACS unavailable" in text and state_hidden is True
 
     def test_search_and_paging(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
-            harness.acsReply = path => (path.startsWith('/api/acs/devices?skip')
-              ? {status: 200, body: {devices: [router], total: 30}} : undefined);
-            const form = document.getElementById('acs-search');
-            form.elements.q.value = ' AB-1 ';
-            form.elements.tag.value = 'Shop';
-            await harness.submit(form);
-            document.getElementById('acs-next').click();
-            await harness.flush();
-            return document.getElementById('acs-page').textContent;
+            harness.handler = (req) => (req.path.startsWith('/api/acs/devices?skip')
+              ? {status: 200, body: {devices: [router], total: 230}} : undefined);
+            await loadRouters();
+            const pager = () => [byId('acs-pager').hidden, byId('acs-page').textContent,
+                                 byId('acs-prev').disabled, byId('acs-next').disabled];
+            const first = pager();
+            byId('acs-q').value = ' AB-1 ';
+            byId('acs-tag').value = 'Shop';
+            await harness.press(byId('acs-find'));
+            await harness.press(byId('acs-next'));
+            const next = pager();
+            const reads = harness.requests.length;
+            byId('acs-q').value = 'two words';
+            await harness.press(byId('acs-find'));
+            const refused = [byId('acs-search-error').textContent, harness.requests.length - reads];
+            await harness.type(byId('search'), 'shop');
+            const byTag = harness.rows().map((row) => row[0]);
+            await harness.type(byId('search'), 'acme');
+            return {first, next, refused, byTag, byMaker: harness.rows().map((row) => row[0])};
             """,
             setup=ACS_SETUP,
         )
+        result = outcome["result"]
         listed = [item["path"] for item in outcome["requests"] if item["path"].startswith("/api/acs/devices?skip")]
         assert listed[-2:] == [
-            "/api/acs/devices?skip=0&limit=24&q=AB-1&tag=shop",
-            "/api/acs/devices?skip=24&limit=24&q=AB-1&tag=shop",
+            "/api/acs/devices?skip=0&limit=200&q=AB-1&tag=shop",
+            "/api/acs/devices?skip=200&limit=200&q=AB-1&tag=shop",
         ]
-        assert outcome["result"] == "25–25 of 30"
+        assert result["first"] == [False, "1–1 of 230 managed routers", True, False]
+        assert result["next"][:3] == [False, "201–201 of 230 managed routers", False]
+        assert "letters, digits" in result["refused"][0] and result["refused"][1] == 0
+        # The list's own search also finds a router by its tags and its maker.
+        assert result["byTag"] == [f"{NAME}  Acme"] and result["byMaker"] == [f"{NAME}  Acme"]
 
-    def test_switching_tabs_and_leaving_direct_routers_alone_meanwhile(self, tmp_path: Path):
+    def test_direct_routers_are_left_alone_while_only_managed_ones_are_shown(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
-            await harness.flush();
             const direct = () => harness.requests.filter(r => r.path.startsWith('/api/devices?')).length;
-            const before = direct();
+            const managed = () => harness.requests.filter(r => r.path.startsWith('/api/acs/devices?skip')).length;
+            await harness.press(byId('kind-seg').querySelector('[data-kind=managed]'));
+            const before = [direct(), managed()];
             await harness.advance(60000);
-            const whileManaged = direct() - before;
-            await chooseTab('direct');
-            return {whileManaged, after: direct() - before, acs: document.getElementById('acs-view').hidden,
-                    add: document.getElementById('add-button').hidden};
+            const whileManaged = [direct() - before[0], managed() - before[1]];
+            const rows = harness.rows().map((row) => row[0]);
+            await harness.press(byId('kind-seg').querySelector('[data-kind=direct]'));
+            const switched = direct() - before[0];
+            await harness.advance(30000);
+            return {whileManaged, rows, switched, after: direct() - before[0],
+                    shown: harness.rows().map((row) => row[0])};
             """,
-            setup=ACS_SETUP,
+            setup=ACS_SETUP + DIRECT_ROUTER % ("web", "{name: 'Shop'}"),
         )
-        assert outcome["result"] == {"whileManaged": 0, "after": 1, "acs": True, "add": False}
+        assert outcome["result"] == {
+            "whileManaged": [0, 2], "rows": [f"{NAME}  Acme"], "switched": 1, "after": 2, "shown": ["Shop  Cudy"],
+        }
 
 
 @needs_node
 class TestDashboardDirectWifiPassword:
-    def test_the_buttons_are_renamed_and_offered_where_they_can_work(self, tmp_path: Path):
+    def test_the_password_is_offered_only_where_it_can_work(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             """
             const out = {};
             const pairs = [['cudy', 'web'], ['cudy', 'ssh'], ['tplink', 'ssh'], ['tenda', 'web'], ['tplink', 'web']];
             for (const [vendor, transport] of pairs) {
-              const node = card({id: 'r1', vendor, host: 'h', transport, status: {}});
-              const wifi = harness.button(node, 'Wi-Fi password');
-              out[vendor + '/' + transport] = [wifi.disabled, wifi.title || ''];
-              out.labels = harness.buttons(node);
+              harness.db.devices = [{id: 'r1', vendor, host: 'h', transport, status: {online: true}, metadata: {}}];
+              await loadRouters();
+              await harness.open('r1');
+              const key = vendor + '/' + transport;
+              if (byId('d-wifi').disabled) { out[key] = ['dialog', true, byId('d-wifi').title]; continue; }
+              await harness.press(byId('d-wifi'));
+              const note = byId('wifi-note');
+              out[key] = ['password', byId('w-pw1').disabled, note.hidden ? '' : note.textContent];
+              byId('wifi-dialog').close();
             }
+            await harness.press(byId('d-more'));
+            out.labels = byId('d-menu').querySelectorAll('button').filter((b) => !b.hidden).map((b) => b.textContent);
             return out;
             """,
         )
         result = outcome["result"]
-        assert "Admin login" in result["labels"] and "Password" not in result["labels"]
+        assert result["labels"] == ["Router admin password", "Remove from SkyRouter"]
         for supported in ("cudy/web", "cudy/ssh", "tplink/ssh"):
-            assert result[supported] == [False, ""], supported
+            assert result[supported] == ["password", False, ""], supported
         for refused in ("tenda/web", "tplink/web"):
-            disabled, title = result[refused]
-            assert disabled is True and "SSH" in title, refused
+            _, disabled, why = result[refused]
+            assert disabled is True and "SSH" in why, refused
+        assert result["tenda/web"][0] == "password", "a Tenda can still be renamed"
+        assert result["tplink/web"][0] == "dialog", "the older TP-Link page can change neither"
 
     def test_the_dialog_sends_the_password_once_with_confirm(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             f"""
-            const node = card({{id: 'r1', vendor: 'cudy', host: 'h', transport: 'ssh', status: {{}}, metadata: {{}}}});
-            harness.button(node, 'Wi-Fi password').click();
-            const dialog = document.getElementById('wifi-password-dialog');
-            const form = document.getElementById('wifi-password-form');
-            const radios = form.elements.radio.options.map(option => [option.value, option.textContent]);
-            const warning = dialog.querySelector('.warning').textContent;
-            form.elements.password.value = {json.dumps(PASS)};
-            form.elements.repeat.value = {json.dumps(PASS)};
-            await harness.submit(form);
-            await harness.flush();
-            return {{radios, warning, open: dialog.open, left: form.elements.password.value,
-                    notice: document.getElementById('notice').textContent}};
+            await harness.open('r1');
+            await harness.press(byId('d-wifi'));
+            const bands = byId('band-seg').children
+              .map((b) => [b.dataset.band, b.textContent, b.getAttribute('aria-checked')]);
+            const warning = byId('wifi-dialog').querySelector('.warnbox').textContent;
+            byId('w-pw1').value = {json.dumps(PASS)};
+            byId('w-pw2').value = {json.dumps(PASS)};
+            await harness.press(byId('wifi-send'));
+            return {{bands, warning, open: byId('wifi-dialog').open, left: byId('w-pw1').value,
+                     toast: harness.toasts()[0], page: document.body.textContent}};
             """,
+            setup=DIRECT_ROUTER % ("ssh", "{}"),
         )
         result = outcome["result"]
-        assert result["radios"] == [["", "All bands"], ["2.4G", "2.4 GHz only"], ["5G", "5 GHz only"]]
-        assert "will be disconnected" in result["warning"]
+        assert result["bands"] == [["both", "Both bands", "true"], ["2.4", "2.4 GHz", "false"], ["5", "5 GHz", "false"]]
+        assert "disconnects and must reconnect" in result["warning"]
         assert sent(outcome, "/wifi-password") == [{"password": PASS, "confirm": True}]
+        assert csrf_of(outcome, "/wifi-password") == ["t1"] and sent(outcome, "/ssid") == []
         assert result["open"] is False and result["left"] == ""
-        assert "Wi-Fi password changed on r1" in result["notice"] and PASS not in result["notice"]
+        assert result["toast"] == {"kind": "applied", "title": "Applied", "text": "r1 accepted the change."}
+        assert PASS not in result["page"]
 
     def test_an_ssh_router_with_a_configured_section_names_it_and_a_band_can_be_chosen(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             f"""
-            const metadata = {{uci_section: 'wireless.guest'}};
-            showWifiPassword({{id: 'r2', vendor: 'cudy', transport: 'ssh', metadata}});
-            const form = document.getElementById('wifi-password-form');
-            const first = form.elements.radio.options[0].textContent;
-            form.elements.radio.value = '5G';
-            form.elements.password.value = {json.dumps(PASS)};
-            form.elements.repeat.value = {json.dumps(PASS)};
-            await harness.submit(form);
-            return first;
+            await harness.open('r1');
+            await harness.press(byId('d-wifi'));
+            const first = [byId('band-seg').children[0].textContent, byId('band-hint').textContent];
+            await harness.press(byId('band-seg').querySelector('[data-band="5"]'));
+            const hint = byId('band-hint').hidden;
+            byId('w-pw1').value = {json.dumps(PASS)};
+            byId('w-pw2').value = {json.dumps(PASS)};
+            await harness.press(byId('wifi-send'));
+            return {{first, hint}};
             """,
+            setup=DIRECT_ROUTER % ("ssh", "{uci_section: 'wireless.guest'}"),
         )
-        assert outcome["result"] == "The configured network (wireless.guest)"
+        assert outcome["result"] == {"first": ["Its configured network", "Its configured network is wireless.guest."],
+                                     "hint": True}
         assert sent(outcome, "/wifi-password") == [{"password": PASS, "radio": "5G", "confirm": True}]
 
     @pytest.mark.parametrize(
         ("password", "repeat", "expected"),
-        [("", "", "Enter the new Wi-Fi password"), (PASS, PASS + "x", "do not match"), ("short", "short", "8 to 63")],
+        [("", "", "Enter a new Wi-Fi name, a new password, or both."), (PASS, PASS + "x", "do not match"),
+         ("short", "short", "8 to 63")],
     )
     def test_the_dialog_checks_before_sending(self, tmp_path: Path, password, repeat, expected):
         outcome = run_page(
             tmp_path,
             f"""
-            showWifiPassword({{id: 'r1', vendor: 'cudy', transport: 'ssh'}});
-            const form = document.getElementById('wifi-password-form');
-            form.elements.password.value = {json.dumps(password)};
-            form.elements.repeat.value = {json.dumps(repeat)};
-            await harness.submit(form);
-            const dialog = document.getElementById('wifi-password-dialog');
-            return [document.getElementById('notice').textContent, dialog.open];
+            await harness.open('r1');
+            await harness.press(byId('d-wifi'));
+            byId('w-pw1').value = {json.dumps(password)};
+            byId('w-pw2').value = {json.dumps(repeat)};
+            await harness.press(byId('wifi-send'));
+            return [byId('wifi-error').textContent, byId('wifi-dialog').open];
             """,
+            setup=DIRECT_ROUTER % ("ssh", "{}"),
         )
-        notice, still_open = outcome["result"]
-        assert expected in notice and still_open is True
+        error, still_open = outcome["result"]
+        assert expected in error and still_open is True
         assert sent(outcome, "/wifi-password") == []
+        if password:
+            assert password not in error
 
     def test_a_refusal_is_shown_and_the_dialog_stays_open(self, tmp_path: Path):
         outcome = run_page(
             tmp_path,
             f"""
-            harness.handler = path => (path.endsWith('/wifi-password')
+            harness.handler = (req) => (req.path.endsWith('/wifi-password')
               ? {{status: 501, body: {{detail: 'Smart Connect joins both bands into one network'}}}} : undefined);
-            showWifiPassword({{id: 'r1', vendor: 'cudy', transport: 'web'}});
-            const form = document.getElementById('wifi-password-form');
-            form.elements.radio.value = '5G';
-            form.elements.password.value = {json.dumps(PASS)};
-            form.elements.repeat.value = {json.dumps(PASS)};
-            await harness.submit(form);
-            await harness.flush();
-            const dialog = document.getElementById('wifi-password-dialog');
-            const openAfter = dialog.open;
-            dialog.close();
-            return [document.getElementById('notice').textContent, openAfter, form.elements.password.value];
+            await harness.open('r1');
+            await harness.press(byId('d-wifi'));
+            await harness.press(byId('band-seg').querySelector('[data-band="5"]'));
+            byId('w-pw1').value = {json.dumps(PASS)};
+            byId('w-pw2').value = {json.dumps(PASS)};
+            await harness.press(byId('wifi-send'));
+            const openAfter = byId('wifi-dialog').open;
+            const error = byId('wifi-error').textContent;
+            byId('wifi-dialog').close();
+            return [error, openAfter, byId('w-pw1').value, byId('w-pw2').value];
             """,
+            setup=DIRECT_ROUTER % ("web", "{}"),
         )
-        assert outcome["result"] == ["Smart Connect joins both bands into one network", True, ""]
+        assert outcome["result"] == ["Smart Connect joins both bands into one network", True, "", ""]
+        assert sent(outcome, "/wifi-password") == [{"password": PASS, "radio": "5G", "confirm": True}]
 
 
 class TestDashboardMarkup:
@@ -1726,15 +1955,18 @@ class TestDashboardMarkup:
         assert not re.search(r"""\son[a-z]+\s*=\s*["']""", body), "inline event handler would be blocked"
         assert "innerHTML" not in body and "insertAdjacentHTML" not in body and "eval(" not in body
         for control in (
-            "tab-acs",
-            "tab-direct",
+            "kind-seg",
+            "search",
+            "new-pill",
             "acs-search",
             "acs-prev",
             "acs-next",
-            "acs-wifi-cancel",
-            "acs-refresh-cancel",
-            "acs-tags-close",
-            "wifi-password-cancel",
+            "d-tags",
+            "wifi-cancel",
+            "refresh-cancel",
+            "refresh-form",
+            "tags-close",
+            "tags-form",
         ):
             assert f'id="{control}"' in body
             assert f"'{control}'" in body

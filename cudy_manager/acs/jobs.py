@@ -17,7 +17,9 @@ and the job only keeps the vault reference. A firmware job keeps the stored file
 name and checksum, never its content.
 
 The firmware library's index (FirmwareIndex) lives beside the jobs, in
-data_dir/acs_firmware.json, under the same locking and atomic-rename rules.
+data_dir/acs_firmware.json, and the customer each adopted router was linked to
+(AdoptionIndex) in data_dir/acs_adoptions.json, under the same locking and
+atomic-rename rules.
 """
 
 import contextlib
@@ -334,21 +336,25 @@ class JobStore:
             return len(stale)
 
 
-# --- the firmware library ---------------------------------------------------------------
+# --- the firmware library and the adoptions ----------------------------------------------
 
 FIRMWARE_FILE = "acs_firmware.json"
+ADOPTIONS_FILE = "acs_adoptions.json"
 
 
-class FirmwareIndex:
-    """What SkyRouter knows about the firmware files it stored on the ACS.
+class _RecordFile:
+    """One JSON object of records by key, written whole under an flock like the jobs.
 
-    GenieACS keeps only fileType, oui, productClass and version with a file, so the
-    checksum, size, original file name and upload time are kept here. A record never
-    holds the file's content.
+    A damaged file is never started afresh: each subclass is the only copy of what
+    it records.
     """
 
+    FILE = ""
+    SECTION = ""
+    LABEL = ""
+
     def __init__(self, data_dir: str | Path):
-        self.path = Path(data_dir).expanduser() / FIRMWARE_FILE
+        self.path = Path(data_dir).expanduser() / self.FILE
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._lock_path = self.path.with_name(self.path.name + ".lock")
         self._lock = threading.RLock()
@@ -359,19 +365,17 @@ class FirmwareIndex:
         except FileNotFoundError:
             return {}
         except OSError as exc:
-            raise JobStoreError("ACS firmware index is unreadable") from exc
+            raise JobStoreError(f"{self.LABEL} is unreadable") from exc
         try:
             data = json.loads(raw)
         except ValueError as exc:
-            # Never start afresh over it: it is the only record of which stored files
-            # are SkyRouter's and what their checksums are.
-            raise JobStoreError(f"ACS firmware index {self.path} is corrupt") from exc
-        files = data.get("files") if isinstance(data, dict) else None
-        if not isinstance(files, dict) or not all(
-            isinstance(key, str) and isinstance(value, dict) for key, value in files.items()
+            raise JobStoreError(f"{self.LABEL} {self.path} is corrupt") from exc
+        records = data.get(self.SECTION) if isinstance(data, dict) else None
+        if not isinstance(records, dict) or not all(
+            isinstance(key, str) and isinstance(value, dict) for key, value in records.items()
         ):
-            raise JobStoreError(f"ACS firmware index {self.path} has an invalid format")
-        return files
+            raise JobStoreError(f"{self.LABEL} {self.path} has an invalid format")
+        return records
 
     @contextlib.contextmanager
     def _exclusive(self) -> Iterator[dict[str, dict[str, Any]]]:
@@ -379,11 +383,11 @@ class FirmwareIndex:
             handle = os.open(self._lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX)
-                files = self._load()
-                before = json.dumps(files, sort_keys=True)
-                yield files
-                if json.dumps(files, sort_keys=True) != before:
-                    payload = {"version": FORMAT_VERSION, "files": files}
+                records = self._load()
+                before = json.dumps(records, sort_keys=True)
+                yield records
+                if json.dumps(records, sort_keys=True) != before:
+                    payload = {"version": FORMAT_VERSION, self.SECTION: records}
                     _write_whole(self.path, json.dumps(payload, indent=2, sort_keys=True).encode())
             finally:
                 os.close(handle)
@@ -391,8 +395,22 @@ class FirmwareIndex:
     def all(self) -> dict[str, dict[str, Any]]:
         return self._load()
 
-    def get(self, name: str) -> dict[str, Any] | None:
-        return self._load().get(name)
+    def get(self, key: str) -> dict[str, Any] | None:
+        return self._load().get(key)
+
+
+class FirmwareIndex(_RecordFile):
+    """What SkyRouter knows about the firmware files it stored on the ACS.
+
+    GenieACS keeps only fileType, oui, productClass and version with a file, so the
+    checksum, size, original file name and upload time are kept here. A record never
+    holds the file's content. It is the only record of which stored files are
+    SkyRouter's and what their checksums are.
+    """
+
+    FILE = FIRMWARE_FILE
+    SECTION = "files"
+    LABEL = "ACS firmware index"
 
     def add(self, record: dict[str, Any]) -> None:
         with self._exclusive() as files:
@@ -403,3 +421,23 @@ class FirmwareIndex:
     def remove(self, name: str) -> dict[str, Any] | None:
         with self._exclusive() as files:
             return files.pop(name, None)
+
+
+class AdoptionIndex(_RecordFile):
+    """The Vexar customer each adopted TR-069 router was linked to, by ACS ID.
+
+    GenieACS has nowhere to keep it: a tag cannot hold "#1080 Customer A", and a
+    parameter would be the router's own to overwrite. Holds no secret.
+    """
+
+    FILE = ADOPTIONS_FILE
+    SECTION = "routers"
+    LABEL = "ACS adoption record"
+
+    def put(self, acs_id: str, record: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Store ``record`` for the router, or drop its entry for None; returns what it replaced."""
+        with self._exclusive() as routers:
+            previous = routers.pop(acs_id, None)
+            if record is not None:
+                routers[acs_id] = copy.deepcopy(record)
+            return previous

@@ -935,6 +935,18 @@ class TestAdapterLifecycle:
             manager.add_device(vendor, "192.168.1.1", vendor, password="p", transport="ssh")
             assert isinstance(manager.adapter_for(manager.get_device(vendor)), OpenWrtAdapter), vendor
 
+    def test_last_seen_moves_only_when_the_router_answers(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        # The dashboard's "Last seen": a check that found the router offline is not a sighting of it.
+        manager = build_manager(tmp_path)
+        manager.add_device("r1", "192.168.1.1", "cudy", password="p")
+        outcomes = iter([{"online": True}, AdapterError("timed out"), {"online": False}, {}])
+        monkeypatch.setattr(manager, "adapter_for", lambda device: _FakeAdapter(next(outcomes)))
+        answered = manager.get_status("r1")
+        assert manager.devices["r1"].last_seen == answered["checked_at"]
+        for _ in range(3):
+            assert manager.get_status("r1")["online"] is False
+        assert manager.devices["r1"].last_seen == answered["checked_at"]
+
 
 class TestVerifyCredentialsReasons:
     @pytest.mark.parametrize(

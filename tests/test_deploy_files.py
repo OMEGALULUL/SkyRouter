@@ -848,3 +848,117 @@ def test_readme_refers_only_to_files_that_exist():
                 assert list(PROJECT.glob(path)), path
             else:
                 assert (PROJECT / path).exists(), path
+
+
+# --- deploy/skyrouter/update.sh ---------------------------------------------
+
+UPDATE = SKYROUTER / "update.sh"
+ROUTER_MANAGER_UNIT = SKYROUTER / "router-manager.service"
+HEALTHY = '{"status":"ok","authentication_configured":true}'
+
+
+def _fake_command(directory: Path, name: str, body: str = "") -> None:
+    command = directory / name
+    command.write_text(f'#!/usr/bin/env bash\necho "{name} $*" >> "$CALLS"\n{body}')
+    command.chmod(0o755)
+
+
+def _update(
+    tmp_path: Path, *, uid: int = 0, pull_status: int = 0, healthy: bool = True, installed_unit: str | None = None
+) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
+    """Run update.sh with git, pip, systemctl and curl replaced by recorders."""
+    fakes = tmp_path / "bin"
+    venv = tmp_path / "venv"
+    fakes.mkdir()
+    (venv / "bin").mkdir(parents=True)
+    calls = tmp_path / "calls"
+    calls.touch()
+    unit_file = tmp_path / "router-manager.service"
+    unit_file.write_text(ROUTER_MANAGER_UNIT.read_text() if installed_unit is None else installed_unit)
+    _fake_command(fakes, "id", f"echo {uid}\n")
+    # HEAD moves once the pull has run, so the report can name both commits.
+    _fake_command(
+        fakes,
+        "git",
+        'if [[ $1 == pull ]]; then touch "$CALLS.pulled"; exit "$PULL_STATUS"; fi\n'
+        '[[ -e "$CALLS.pulled" ]] && echo bbb2222 || echo aaa1111\n',
+    )
+    _fake_command(venv / "bin", "pip")
+    _fake_command(fakes, "systemctl")
+    _fake_command(fakes, "curl", f"[[ $HEALTHY == 1 ]] && echo '{HEALTHY}' && exit 0\nexit 7\n")
+    _fake_command(fakes, "sleep")
+    done = subprocess.run(
+        ["bash", str(UPDATE)],
+        env=_clean_env(
+            PATH=f"{fakes}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            CALLS=str(calls),
+            PULL_STATUS=str(pull_status),
+            HEALTHY="1" if healthy else "0",
+            SKYROUTER_SRC=str(PROJECT),
+            SKYROUTER_VENV=str(venv),
+            SKYROUTER_UNIT_FILE=str(unit_file),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    recorded = [line for line in calls.read_text().splitlines() if not line.startswith(("id ", "sleep "))]
+    return done, recorded, unit_file
+
+
+@needs_bash
+def test_update_script_parses():
+    assert subprocess.run(["bash", "-n", str(UPDATE)], capture_output=True).returncode == 0
+
+
+@needs_bash
+def test_update_refuses_to_run_without_root(tmp_path: Path):
+    done, recorded, _ = _update(tmp_path, uid=1000)
+    assert done.returncode == 1
+    assert "Run this with sudo." in done.stderr
+    assert recorded == []
+
+
+@needs_bash
+def test_update_pulls_reinstalls_restarts_and_waits_for_the_dashboard(tmp_path: Path):
+    done, recorded, _ = _update(tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert recorded == [
+        "git rev-parse --short HEAD",
+        "git pull --ff-only",
+        "git rev-parse --short HEAD",
+        f"pip install --quiet --disable-pip-version-check {PROJECT}",
+        "systemctl restart router-manager",
+        "curl -fsS --max-time 2 http://127.0.0.1:8091/healthz",
+    ]
+    assert f"SkyRouter aaa1111 -> bbb2222 is running: {HEALTHY}" in done.stdout
+
+
+@needs_bash
+def test_update_installs_a_changed_unit_before_restarting(tmp_path: Path):
+    done, recorded, unit_file = _update(tmp_path, installed_unit="[Service]\nExecStart=/bin/false\n")
+    assert done.returncode == 0, done.stderr
+    assert unit_file.read_text() == ROUTER_MANAGER_UNIT.read_text()
+    assert recorded.index("systemctl daemon-reload") < recorded.index("systemctl restart router-manager")
+    assert "Service unit updated." in done.stdout
+
+
+@needs_bash
+def test_update_stops_before_installing_when_the_pull_cannot_fast_forward(tmp_path: Path):
+    done, recorded, _ = _update(tmp_path, pull_status=128)
+    assert done.returncode != 0
+    assert not [call for call in recorded if call.startswith(("pip ", "systemctl ", "curl "))]
+
+
+@needs_bash
+def test_update_reports_a_dashboard_that_does_not_come_back(tmp_path: Path):
+    done, recorded, _ = _update(tmp_path, healthy=False)
+    assert done.returncode == 1
+    assert len([call for call in recorded if call.startswith("curl ")]) == 30
+    assert "sudo journalctl -u router-manager" in done.stderr
+
+
+def test_the_router_manager_unit_serves_where_update_checks():
+    port = re.search(r"--port (\d+)", ROUTER_MANAGER_UNIT.read_text())
+    assert port is not None
+    assert f"http://127.0.0.1:{port.group(1)}/healthz" in UPDATE.read_text()

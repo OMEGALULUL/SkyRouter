@@ -1673,3 +1673,220 @@ class TestEndToEnd:
             (task,) = nbi.tasks
             closes = opens.replace(second=0, microsecond=0) + timedelta(minutes=30)
             assert abs((parse_iso(task["expiry"]) - closes).total_seconds()) <= 2
+
+
+# --- router groups ------------------------------------------------------------------------
+
+
+def cudy_acs(acs: FakeAcs, acs_id: str = ACS_ID, *, manufacturer: str = "Cudy", **values: Any) -> str:
+    """A TR-069 router whose fleet summary names its make, as params.summarize reports it."""
+    acs.add(acs_id, **values)
+    acs.fleet[-1].update(manufacturer=manufacturer, model="AP1300")
+    return acs_id
+
+
+def tplink(identifier: str) -> Device:
+    return make_device(identifier, vendor="tplink", host=f"192.0.2.{len(identifier) + 50}")
+
+
+class TestPlanGroups:
+    def test_groups_are_validated_normalised_and_round_trip_through_the_store(self, tmp_path: Path):
+        store = MaintenanceStore(tmp_path, clock=lambda: AT)
+        created = store.create(plan_data(targets={"groups": ["Cudy", " direct", "cudy"]}))
+        # Case and order do not matter; each group is kept once, in a fixed order.
+        assert created["targets"] == {"all": False, "devices": [], "acs_devices": [], "groups": ["direct", "cudy"]}
+        assert store.get(created["id"])["targets"]["groups"] == ["direct", "cudy"]
+        changed = store.update(created["id"], {"targets": {"groups": ["managed"], "devices": ["r1"]}})
+        assert changed["targets"]["groups"] == ["managed"] and changed["targets"]["devices"] == ["r1"]
+        assert MaintenanceStore(tmp_path).get(created["id"]) == changed
+
+    def test_a_plan_saved_before_groups_existed_still_loads(self, tmp_path: Path):
+        store = MaintenanceStore(tmp_path, clock=lambda: AT)
+        created = store.create(plan_data())
+        saved = json.loads(store.path.read_text())
+        del saved["plans"][created["id"]]["targets"]["groups"]
+        store.path.write_text(json.dumps(saved))
+        assert store.get(created["id"])["targets"]["groups"] == []
+
+    @pytest.mark.parametrize(
+        "targets,message",
+        [
+            ({"groups": ["everyone"]}, "targets.groups may only hold direct, managed, cudy"),
+            ({"groups": [1]}, "targets.groups may only hold direct, managed, cudy"),
+            ({"groups": "cudy"}, "targets.groups must be a list"),
+            ({"groups": []}, "at least one router or group"),
+        ],
+    )
+    def test_invalid_groups_are_refused(self, targets, message):
+        with pytest.raises(ValidationError) as caught:
+            MaintenancePlan.from_dict(plan_data(targets=targets), plan_id="0123456789ab")
+        assert message in str(caught.value)
+
+    @pytest.mark.parametrize("groups,allowed", [(["managed"], True), (["cudy"], True), (["direct"], False)])
+    def test_a_firmware_install_needs_a_group_that_can_hold_tr069_routers(self, groups, allowed):
+        data = plan_data(targets={"groups": groups}, actions=["firmware_update"], firmware={"AP1300": FIRMWARE})
+        if allowed:
+            assert MaintenancePlan.from_dict(data, plan_id="0123456789ab").targets.groups == tuple(groups)
+        else:
+            with pytest.raises(ValidationError, match="only sent to TR-069 routers"):
+                MaintenancePlan.from_dict(data, plan_id="0123456789ab")
+
+    def test_the_direct_group_is_every_enabled_direct_router_including_ones_added_later(self, tmp_path: Path):
+        acs = FakeAcs()
+        acs.add()
+        manager = FakeManager(make_device("a"), tplink("tp"), make_device("off", enabled=False))
+        store, _, runner = build(tmp_path, manager, acs)
+        created = store.create(plan_data(targets={"groups": ["direct"]}))
+        # Added after the plan was saved: the group is resolved when the plan runs.
+        manager.devices["late"] = make_device("late")
+        results = runner.run_now(created["id"], "alice")
+        assert sorted(result["target"] for result in results) == ["direct:a", "direct:late", "direct:tp"]
+        assert acs.reboots == []
+
+    def test_the_managed_group_is_every_adopted_tr069_router_including_ones_adopted_later(self, tmp_path: Path):
+        acs = FakeAcs()
+        acs.add(ACS_ID)
+        acs.add(ACS_OTHER, tags=("skybre_new",))
+        manager = FakeManager()
+        store, _, runner = build(tmp_path, manager, acs)
+        created = store.create(plan_data(targets={"groups": ["managed"]}))
+        later = acs.add("80AFCA-AP1300-000003")
+        results = runner.run_now(created["id"], "alice")
+        assert sorted(result["target"] for result in results) == [f"acs:{ACS_ID}", f"acs:{later}"]
+        assert manager.reboots == []
+
+    def test_the_cudy_group_is_every_cudy_of_either_kind(self, tmp_path: Path):
+        acs = FakeAcs()
+        cudy_acs(acs, ACS_ID)
+        cudy_acs(acs, ACS_OTHER, manufacturer="Acme")
+        manager = FakeManager(make_device("c1"), tplink("tp"))
+        store, _, runner = build(tmp_path, manager, acs)
+        created = store.create(plan_data(targets={"groups": ["cudy"]}))
+        results = runner.run_now(created["id"], "alice")
+        assert sorted(result["target"] for result in results) == [f"acs:{ACS_ID}", "direct:c1"]
+        assert [identifier for identifier, _ in manager.reboots] == ["c1"]
+        assert [acs_id for acs_id, _ in acs.reboots] == [ACS_ID]
+
+    def test_a_router_named_both_ways_is_visited_once(self, tmp_path: Path):
+        acs = FakeAcs()
+        acs.add(ACS_ID)
+        manager = FakeManager(make_device("r1"), make_device("r2"))
+        store, _, runner = build(tmp_path, manager, acs)
+        created = store.create(
+            plan_data(targets={"devices": ["r1"], "acs_devices": [ACS_ID], "groups": ["direct", "managed", "cudy"]})
+        )
+        reads: list[str] = []
+        detail = acs.device_detail
+        acs.device_detail = lambda acs_id: reads.append(acs_id) or detail(acs_id)  # type: ignore[method-assign]
+        results = runner.run_now(created["id"], "alice")
+        assert sorted(result["target"] for result in results) == [f"acs:{ACS_ID}", "direct:r1", "direct:r2"]
+        assert sorted(identifier for identifier, _ in manager.reboots) == ["r1", "r2"]
+        assert len(acs.reboots) == 1
+        # Read once each, too: every extra read of a direct router is another login to it.
+        assert sorted(identifier for identifier, _ in manager.ops("status")) == ["r1", "r2"]
+        assert reads == [ACS_ID]
+
+    def test_the_managed_group_without_tr069_management_is_reported_once_per_window(self, tmp_path: Path):
+        manager = FakeManager()
+        store, log, runner = build(tmp_path, manager, None)
+        store.create(plan_data(targets={"groups": ["managed", "direct"]}))
+        results = {result["target"]: result for result in runner.run_once(AT)}
+        assert results["acs:*"]["status"] == "skipped"
+        assert results["acs:*"]["reason"] == "TR-069 management is off, so the managed group has no routers"
+        # The direct routers still go ahead.
+        assert results["direct:r1"]["status"] == "done"
+        assert runner.run_once(AT + timedelta(minutes=1)) == []
+        assert [entry["router"] for entry in entries(log) if "TR-069 management is off" in entry["what"]] == ["acs:*"]
+
+    def test_an_edit_during_a_pass_is_judged_by_the_groups_each_router_is_in(self, tmp_path: Path):
+        acs = FakeAcs()
+        cudy_acs(acs, ACS_ID)
+        cudy_acs(acs, ACS_OTHER, manufacturer="Acme")
+        manager = FakeManager(make_device("c1"))
+        store, _, runner = build(tmp_path, manager, acs)
+        created = store.create(plan_data(targets={"groups": ["managed"], "devices": ["c1"]}))
+
+        def edit(identifier: str) -> None:
+            # From every TR-069 router to every Cudy, while c1 is being read.
+            store.update(created["id"], {"targets": {"groups": ["cudy"]}})
+
+        manager.status_hook = edit
+        results = {result["target"]: result for result in runner.run_now(created["id"], "alice")}
+        # c1 is a Cudy and the Cudy TR-069 router still is one, though the plan chose it as managed.
+        assert results["direct:c1"]["status"] == "done"
+        assert results[f"acs:{ACS_ID}"]["status"] == "queued"
+        assert results[f"acs:{ACS_OTHER}"]["reason"] == "the plan no longer names this router"
+        assert [acs_id for acs_id, _ in acs.reboots] == [ACS_ID]
+
+    def test_a_router_named_by_id_and_by_group_stays_named_when_the_id_is_dropped(self, tmp_path: Path):
+        acs = FakeAcs()
+        acs.add(ACS_ID)
+        manager = FakeManager(make_device("r1"))
+        store, _, runner = build(tmp_path, manager, acs)
+        created = store.create(plan_data(targets={"devices": ["r1"], "acs_devices": [ACS_ID], "groups": ["managed"]}))
+        # The id is dropped while r1 is read; the group still covers the TR-069 router.
+        manager.status_hook = lambda identifier: store.update(
+            created["id"], {"targets": {"devices": ["r1"], "groups": ["managed"]}}
+        )
+        results = {result["target"]: result for result in runner.run_now(created["id"], "alice")}
+        assert results[f"acs:{ACS_ID}"]["status"] == "queued"
+        assert [acs_id for acs_id, _ in acs.reboots] == [ACS_ID]
+
+    def test_a_direct_router_dropped_from_the_cudy_group_by_an_edit_is_not_restarted(self, tmp_path: Path):
+        manager = FakeManager(make_device("c1"), make_device("c2"))
+        store, _, runner = build(tmp_path, manager)
+        created = store.create(plan_data(targets={"groups": ["cudy"]}))
+
+        def edit(identifier: str) -> None:
+            if identifier == "c1":
+                # c2 becomes a TP-Link in SkyRouter's records while c1 is read.
+                manager.devices["c2"] = make_device("c2", vendor="tplink")
+
+        manager.status_hook = edit
+        results = {result["device"]: result for result in runner.run_now(created["id"], "alice")}
+        assert results["c2"]["reason"] == "the plan no longer names this router"
+        assert [identifier for identifier, _ in manager.reboots] == ["c1"]
+
+    def test_a_group_router_removed_during_a_pass_is_reported_as_gone(self, tmp_path: Path):
+        manager = FakeManager(make_device("c1"), make_device("c2"))
+        store, _, runner = build(tmp_path, manager)
+        created = store.create(plan_data(targets={"groups": ["cudy"]}))
+        manager.status_hook = lambda identifier: manager.devices.pop("c2", None) if identifier == "c1" else None
+        results = {result["device"]: result for result in runner.run_now(created["id"], "alice")}
+        assert results["c2"]["reason"] == "the router is no longer managed by SkyRouter"
+
+    def test_a_group_twin_leaves_the_restart_to_the_direct_visit(self, tmp_path: Path):
+        acs = FakeAcs()
+        # The same Cudy, managed directly at the address it reports to the ACS.
+        cudy_acs(acs, ACS_ID, wan_ip="192.0.2.1")
+        manager = FakeManager()
+        store, _, runner = build(tmp_path, manager, acs)
+        created = store.create(plan_data(targets={"groups": ["cudy"]}))
+        results = {result["target"]: result for result in runner.run_now(created["id"], "alice")}
+        assert results["direct:r1"]["status"] == "done"
+        assert results[f"acs:{ACS_ID}"]["reason"].startswith("the same router is managed directly as r1")
+        assert acs.reboots == []
+
+    def test_the_cudy_group_reads_the_make_from_a_real_acs_summary(self, tmp_path: Path):
+        from fake_nbi import FakeNbi, build_device, iso
+
+        with FakeNbi() as nbi:
+            svc, log, (cudy,) = TestEndToEnd.acs_fleet(nbi, tmp_path, "000001")
+            other = build_device(
+                oui="202BC1",
+                product_class="BM632w",
+                serial="000002",
+                manufacturer="Acme",
+                leaves={"Device.ManagementServer.PeriodicInformInterval": 300},
+                last_inform=nbi.now(),
+            )
+            other["_lastBoot"] = iso(nbi.now() - timedelta(hours=3))
+            nbi.add_device(other)
+            store = MaintenanceStore(tmp_path)
+            runner = MaintenanceRunner(FakeManager(make_device("tp", vendor="tplink")), svc, store, log, clock=nbi.now)
+            plan = store.create(plan_data(name="Cudy reboot", targets={"groups": ["cudy"]}))
+
+            results = runner.run_now(plan["id"], "alice")
+
+            assert [(result["target"], result["status"]) for result in results] == [(f"acs:{cudy}", "queued")]
+            assert [task["device"] for task in nbi.tasks] == [cudy]

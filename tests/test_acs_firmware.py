@@ -66,6 +66,11 @@ class Recorder:
         self.entries.append(entry)
         return entry
 
+    @property
+    def jobs(self) -> list[dict[str, Any]]:
+        """The routers' entries. Adding a file to the library is logged too, under library:<name>."""
+        return [entry for entry in self.entries if entry["router"].startswith("acs:")]
+
 
 @pytest.fixture
 def nbi():
@@ -655,18 +660,18 @@ def test_verified_once_the_router_boots_into_the_new_version(nbi, svc, router, r
     job = accepted(nbi, svc, router)
     # The Download being accepted proves nothing yet.
     assert "accepted the download" in job["message"] and not job["done"]
-    assert recorder.entries == []
+    assert recorder.jobs == []
     report = nbi.run_session(router, cr=False)
     assert "1 BOOT" in report["events"] and nbi.software_version(router) == NEW
     job = poll(svc, job)
     assert job["state"] == VERIFIED and NEW in job["message"] and job["done"]
     assert job["result"]["running"] == NEW
-    [entry] = recorder.entries
+    [entry] = recorder.jobs
     assert entry["who"] == "alice" and entry["router"] == f"acs:{router}"
     assert entry["kind"] == "firmware" and entry["result"] == "applied"
     assert entry["details"]["version"] == NEW and entry["details"]["from_version"] == OLD
     poll(svc, job, times=2)
-    assert len(recorder.entries) == 1
+    assert len(recorder.jobs) == 1
 
 
 def test_verified_in_the_same_session_when_the_router_installs_at_once(nbi, svc, router):
@@ -696,7 +701,7 @@ def test_a_transfer_fault_in_a_later_session_rejects_it(nbi, svc, router, record
     assert job["fault"]["code"] == "cwmp.9010" and "Download failure" in job["message"]
     # Cleared, so GenieACS does not offer the Download again.
     assert nbi.faults == {} and nbi.tasks == []
-    [entry] = recorder.entries
+    [entry] = recorder.jobs
     assert entry["result"] == "refused" and entry["details"]["fault_code"] == "cwmp.9010"
 
 
@@ -718,7 +723,7 @@ def test_a_router_that_never_checks_in_expires(nbi, svc, router, recorder):
     nbi.advance(60 + EXPIRY_GRACE.total_seconds())
     job = poll(svc, job)
     assert job["state"] == EXPIRED and nbi.tasks == []
-    assert recorder.entries[0]["result"] == "failed"
+    assert recorder.jobs[0]["result"] == "failed"
 
 
 def test_a_task_genieacs_dropped_as_expired_is_not_taken_for_accepted(nbi, svc, router):
@@ -775,7 +780,7 @@ def test_cancelling_before_the_router_takes_it_deletes_the_task(nbi, svc, router
     job = svc.cancel_job(job["id"], actor="bob")
     assert job["state"] == CANCELLED and job["message"].startswith("Cancelled before")
     assert nbi.tasks == []
-    [entry] = recorder.entries
+    [entry] = recorder.jobs
     assert entry["who"] == "alice" and entry["result"] == "info" and entry["details"]["cancelled_by"] == "bob"
 
 
@@ -794,7 +799,7 @@ def test_a_failed_start_is_logged_as_failed(nbi, svc, router, recorder, monkeypa
     monkeypatch.setattr(svc.client, "queue_task", refuse)
     job = svc.firmware_upgrade(router, record["name"])
     assert job["state"] == ERROR and "could not be queued" in job["message"]
-    [entry] = recorder.entries
+    [entry] = recorder.jobs
     assert entry["result"] == "failed" and entry["kind"] == "firmware"
 
 
@@ -835,9 +840,12 @@ def test_the_real_activity_log_takes_firmware_and_wifi_outcomes_without_secrets(
     nbi.run_session(device)
     poll(service, wifi, times=2)
 
-    entries = log.list(limit=10)
+    entries = [entry for entry in log.list(limit=10) if entry["router"].startswith("acs:")]
     by_kind = {entry["kind"]: entry for entry in entries}
     assert set(by_kind) == {"firmware", "wifi"} and len(entries) == 2
+    # The file itself went into the library first, which is logged apart from the router.
+    [library] = [entry for entry in log.list(limit=10) if entry["router"].startswith("library:")]
+    assert library["kind"] == "firmware" and library["what"].startswith("Added Cudy AP1300")
     assert by_kind["firmware"]["who"] == "alice" and by_kind["firmware"]["result"] == "applied"
     assert by_kind["wifi"]["who"] == "carol" and by_kind["wifi"]["result"] == "applied"
     assert by_kind["wifi"]["details"]["changed"] == ["ssid", "passphrase"]

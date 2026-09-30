@@ -1,10 +1,14 @@
-import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
+# The dashboard's script is exercised in test_dashboard_ui.py. test_web_acs.py still
+# imports these names from here, so they are re-exported.
+from test_dashboard_ui import HARNESS as DASHBOARD_HARNESS  # noqa: F401
+from test_dashboard_ui import NODE as NODE
+from test_dashboard_ui import dashboard_markup as _dashboard_markup  # noqa: F401
+from test_dashboard_ui import needs_node as needs_node
 
 from cudy_manager.manager import DeviceManager
 from cudy_manager.secrets import SecretStore
@@ -95,9 +99,12 @@ class TestAuthentication:
         client = build_client(tmp_path)
         assert client.post("/login", json={"username": "admin", "password": "wrong"}).status_code == 401
 
-    def test_login_rejects_bad_username(self, tmp_path: Path):
+    def test_nothing_but_the_passkey_signs_in(self, tmp_path: Path):
+        # Sign-in is by passkey alone, so the username that older clients send proves nothing.
         client = build_client(tmp_path)
-        assert client.post("/login", json={"username": "root", "password": PASSWORD}).status_code == 401
+        assert client.post("/login", json={"username": "admin"}).status_code == 401
+        assert client.post("/login", json={"username": "admin", "password": ""}).status_code == 401
+        assert client.post("/login", json={"username": "admin", "passkey": "wrong"}).status_code == 401
 
     def test_login_sets_httponly_cookie(self, tmp_path: Path):
         client = build_client(tmp_path)
@@ -663,8 +670,11 @@ class TestLoginLimiter:
 
 
 class TestLoginTiming:
-    def test_username_is_always_compared(self, tmp_path: Path, monkeypatch):
-        """A wrong username must still run the password comparison."""
+    @pytest.mark.parametrize(
+        "body", [{"username": "wrong", "password": PASSWORD}, {"username": "wrong"}, {}, {"passkey": "x" * 64}]
+    )
+    def test_every_attempt_runs_one_constant_time_comparison(self, tmp_path: Path, monkeypatch, body):
+        """No body shape may skip the comparison, or its timing would tell a probe what the server checks."""
         import hmac
 
         app = build_app(tmp_path)
@@ -677,9 +687,9 @@ class TestLoginTiming:
 
         monkeypatch.setattr("cudy_manager.web.hmac.compare_digest", counting)
         with TestClient(app) as client:
-            client.post("/login", json={"username": "wrong", "password": PASSWORD})
+            client.post("/login", json=body)
 
-        assert len(calls) == 2, "password comparison was skipped for a bad username"
+        assert len(calls) == 1, "the passkey comparison was skipped or repeated"
 
 
 class TestSettingsFromEnv:
@@ -758,13 +768,22 @@ class TestContentSecurityPolicy:
         assert not re.search(r"""\son[a-z]+\s*=\s*["']""", body), "inline event handler would be blocked"
         # Every control must therefore be wired up from script instead.
         controls = (
-            "refresh-button",
-            "add-button",
-            "discover-button",
-            "logout-button",
-            "add-cancel",
-            "password-cancel",
-            "ssid-cancel",
+            "theme-toggle",
+            "signout",
+            "d-close",
+            "d-wifi",
+            "d-refresh",
+            "d-reboot",
+            "d-more",
+            "wifi-cancel",
+            "pw-cancel",
+            "plan-cancel",
+            "auto-cancel",
+            "new-close",
+            "new-plan",
+            "check-all",
+            "fw-upload",
+            "activity-more",
         )
         for control in controls:
             assert f'id="{control}"' in body
@@ -894,7 +913,7 @@ class TestRemoveDevice:
         login(client)
         body = client.get("/").text
         assert "removeDevice" in body
-        assert "method:'DELETE'" in body
+        assert "`/api/devices/${enc(r.id)}`, { method: 'DELETE' }" in body
 
 
 class TestConfigLocation:
@@ -1260,596 +1279,6 @@ class TestDiscoverRoute:
             assert first["status"] == 200
             # The guard is released once the scan finishes.
             assert client.post("/api/discover", json={"subnet": "192.0.2.0/24"}, headers=headers).status_code == 200
-
-
-# The dashboard's behaviour lives in its script, so these tests run that script
-# under Node against a small fake DOM built from the page's own markup.
-DASHBOARD_HARNESS = r"""
-const vm = require('vm');
-const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-
-function simple(selector) {
-  const match = selector.match(/^([a-zA-Z0-9]+)?(.*)$/);
-  const tag = match[1] ? match[1].toUpperCase() : null;
-  const parts = match[2].match(/#[\w-]+|\.[\w-]+|\[[^\]]+\]/g) || [];
-  return el => {
-    if (tag && el.tagName !== tag) return false;
-    return parts.every(part => {
-      if (part[0] === '#') return el.id === part.slice(1);
-      if (part[0] === '.') return String(el.className).split(/\s+/).includes(part.slice(1));
-      const inner = part.slice(1, -1);
-      const eq = inner.indexOf('=');
-      if (eq < 0) return inner in el.attrs;
-      const key = inner.slice(0, eq);
-      const wanted = inner.slice(eq + 1).replace(/^["']|["']$/g, '');
-      const actual = key === 'name' ? el.name : key === 'type' ? el.type : el.attrs[key];
-      return actual === wanted;
-    });
-  };
-}
-
-class El {
-  constructor(tag, attrs = {}) {
-    this.tagName = tag.toUpperCase();
-    this.attrs = Object.assign({}, attrs);
-    this.childNodes = [];
-    this.parent = null;
-    this.listeners = {};
-    this.style = {};
-    this.id = this.attrs.id || '';
-    this.className = this.attrs.class || '';
-    this.name = this.attrs.name || '';
-    this.type = this.attrs.type || '';
-    this.disabled = 'disabled' in this.attrs;
-    this.defaultValue = this.attrs.value !== undefined ? this.attrs.value : '';
-    this._value = this.defaultValue;
-    this.defaultChecked = 'checked' in this.attrs;
-    this.checked = this.defaultChecked;
-    this.open = false;
-  }
-  get value() {
-    if (this.tagName === 'SELECT') {
-      const options = this.options;
-      const hit = options.find(option => option.value === this._value);
-      return hit ? hit.value : (options[0] ? options[0].value : '');
-    }
-    if (this.tagName === 'OPTION' && this.attrs.value === undefined && !this._valueSet) return this.textContent;
-    return this._value;
-  }
-  set value(value) { this._value = String(value); this._valueSet = true; }
-  get options() { return this.descendants().filter(node => node.tagName === 'OPTION'); }
-  get children() { return this.childNodes.filter(node => node instanceof El); }
-  get textContent() { return this.childNodes.map(node => typeof node === 'string' ? node : node.textContent).join(''); }
-  set textContent(value) { this.childNodes = [String(value)]; }
-  append(...nodes) {
-    for (const node of nodes) {
-      if (node instanceof El) { node.parent = this; this.childNodes.push(node); }
-      else { this.childNodes.push(String(node)); }
-    }
-  }
-  replaceChildren(...nodes) { this.childNodes = []; this.append(...nodes); }
-  setAttribute(key, value) { this.attrs[key] = String(value); }
-  getAttribute(key) { return key in this.attrs ? this.attrs[key] : null; }
-  addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); }
-  fire(type) {
-    const event = {
-      type, target: this, currentTarget: this, defaultPrevented: false,
-      preventDefault() { this.defaultPrevented = true; },
-    };
-    const results = [];
-    for (const fn of (this.listeners[type] || []).slice()) results.push(fn(event));
-    if (typeof this['on' + type] === 'function') results.push(this['on' + type](event));
-    return { event, results };
-  }
-  descendants() {
-    const out = [];
-    const walk = node => { for (const child of node.children) { out.push(child); walk(child); } };
-    walk(this);
-    return out;
-  }
-  closest(tag) { let node = this; while (node && node.tagName !== tag.toUpperCase()) node = node.parent; return node; }
-  querySelectorAll(selector) {
-    return selector.split(',').flatMap(group => {
-      const steps = group.trim().split(/\s+/).map(simple);
-      return this.descendants().filter(el => {
-        if (!steps[steps.length - 1](el)) return false;
-        let index = steps.length - 2;
-        for (let node = el.parent; index >= 0 && node; node = node.parent) if (steps[index](node)) index--;
-        return index < 0;
-      });
-    });
-  }
-  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
-  get elements() {
-    const form = this;
-    return new Proxy({}, { get: (_, name) => form.descendants().find(node => node.name === name) });
-  }
-  reset() {
-    for (const node of this.descendants()) {
-      if (!['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)) continue;
-      node._value = node.defaultValue;
-      node.checked = node.defaultChecked;
-    }
-  }
-  showModal() { if (this.open) throw new Error('InvalidStateError: the dialog is already open'); this.open = true; }
-  close() { if (this.open) { this.open = false; this.fire('close'); } }
-  focus() { document.activeElement = this; }
-  click() {
-    if (this.disabled) return [];
-    const { results } = this.fire('click');
-    const form = this.closest('form');
-    if (this.tagName === 'BUTTON' && form && (this.type || 'submit') === 'submit') results.push(harness.submit(form));
-    return results;
-  }
-}
-
-function build(node) {
-  const el = new El(node.tag, node.attrs);
-  for (const child of node.children) el.append(typeof child === 'string' ? child : build(child));
-  return el;
-}
-
-const body = build(input.tree);
-const document = {
-  body,
-  activeElement: null,
-  getElementById: id => body.descendants().find(node => node.id === id) || null,
-  querySelector: selector => body.querySelector(selector),
-  querySelectorAll: selector => body.querySelectorAll(selector),
-  createElement: tag => new El(tag),
-};
-
-class FormData {
-  constructor(form) {
-    this.entries = [];
-    for (const node of form.descendants()) {
-      if (!node.name || node.disabled) continue;
-      if (node.tagName === 'INPUT' && node.type === 'checkbox') {
-        if (node.checked) this.entries.push([node.name, node.attrs.value || 'on']);
-      } else if (['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)) this.entries.push([node.name, node.value]);
-    }
-  }
-  get(name) { const entry = this.entries.find(item => item[0] === name); return entry ? entry[1] : null; }
-  has(name) { return this.entries.some(item => item[0] === name); }
-  [Symbol.iterator]() { return this.entries[Symbol.iterator](); }
-}
-
-let now = 0;
-let timerSeq = 0;
-const timers = new Map();
-const flush = async () => { for (let i = 0; i < 30; i++) await new Promise(resolve => setImmediate(resolve)); };
-const requests = [];
-const errors = [];
-const location = { href: '/' };
-process.on('unhandledRejection', error => errors.push(String(error && error.stack || error)));
-
-const harness = {
-  state: { csrf: 't1', devices: [] },
-  answers: { confirm: [], prompt: [] },
-  handler: () => undefined,
-  requests,
-  errors,
-  flush,
-  deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; },
-  async advance(ms) {
-    const target = now + ms;
-    for (;;) {
-      let next = null;
-      for (const [id, timer] of timers) if (timer.at <= target && (!next || timer.at < next[1].at)) next = [id, timer];
-      if (!next) break;
-      timers.delete(next[0]);
-      now = next[1].at;
-      next[1].fn();
-      await flush();
-    }
-    now = target;
-  },
-  submit(form) {
-    const { event, results } = form.fire('submit');
-    const dialog = form.closest('dialog');
-    if (!event.defaultPrevented && form.attrs.method === 'dialog' && dialog) dialog.close();
-    return Promise.all(results);
-  },
-  escape(dialog) {
-    const { event } = dialog.fire('cancel');
-    if (!event.defaultPrevented) dialog.close();
-  },
-  buttons: node => node.querySelectorAll('button').map(button => button.textContent),
-  button: (node, label) => node.querySelectorAll('button').find(button => button.textContent === label),
-};
-
-function defaultReply(path) {
-  if (path === '/api/csrf') return { status: 200, body: { csrf_token: harness.state.csrf } };
-  if (path.startsWith('/api/devices?')) {
-    const devices = harness.state.devices;
-    return { status: 200, body: { devices, summary: { online: 0, offline: devices.length } } };
-  }
-  return { status: 200, body: {} };
-}
-
-async function fetch(path, options = {}) {
-  const record = {
-    path,
-    method: options.method || 'GET',
-    headers: options.headers || {},
-    body: options.body ? JSON.parse(options.body) : null,
-  };
-  requests.push(record);
-  const reply = (await harness.handler(path, options, record)) || defaultReply(path);
-  const status = reply.status || 200;
-  return {
-    status,
-    ok: status >= 200 && status < 300,
-    json: async () => { if (reply.body === undefined) throw new SyntaxError('not JSON'); return reply.body; },
-  };
-}
-
-const context = vm.createContext({
-  document, fetch, location, FormData, harness, console,
-  setTimeout: (fn, ms = 0) => { const id = ++timerSeq; timers.set(id, { at: now + ms, fn }); return id; },
-  clearTimeout: id => { timers.delete(id); },
-  confirm: () => (harness.answers.confirm.length ? harness.answers.confirm.shift() : true),
-  prompt: () => (harness.answers.prompt.length ? harness.answers.prompt.shift() : null),
-});
-
-(async () => {
-  if (input.setup) vm.runInContext(input.setup, context);
-  vm.runInContext(input.script, context);
-  await flush();
-  const result = await vm.runInContext('(async () => {' + input.scenario + '\n})()', context);
-  await flush();
-  const outcome = { result: result === undefined ? null : result, requests, errors, href: location.href };
-  process.stdout.write(JSON.stringify(outcome));
-})().catch(error => { process.stderr.write(String(error && error.stack || error)); process.exit(1); });
-"""
-
-NODE = shutil.which("node")
-needs_node = pytest.mark.skipif(NODE is None, reason="node is needed to run the dashboard script")
-
-
-def _dashboard_markup() -> tuple[dict, str]:
-    """Parse dashboard.html's body into a plain tree, and pull out its script."""
-    from html.parser import HTMLParser
-
-    void = {"input", "meta", "br", "img", "link", "hr"}
-
-    class Builder(HTMLParser):
-        def __init__(self):
-            super().__init__(convert_charrefs=True)
-            self.root: dict = {"tag": "body", "attrs": {}, "children": []}
-            self.stack = [self.root]
-            self.in_body = False
-            self.in_script = False
-            self.script: list[str] = []
-
-        def handle_starttag(self, tag, attrs):
-            if tag == "body":
-                self.in_body = True
-            elif tag == "script":
-                self.in_script = True
-            elif self.in_body:
-                node = {"tag": tag, "attrs": {key: value or "" for key, value in attrs}, "children": []}
-                self.stack[-1]["children"].append(node)
-                if tag not in void:
-                    self.stack.append(node)
-
-        def handle_endtag(self, tag):
-            if tag == "script":
-                self.in_script = False
-            elif self.in_body and tag not in void and tag != "body":
-                while len(self.stack) > 1 and self.stack.pop()["tag"] != tag:
-                    pass
-
-        def handle_data(self, data):
-            if self.in_script:
-                self.script.append(data)
-            elif self.in_body:
-                self.stack[-1]["children"].append(data)
-
-    builder = Builder()
-    builder.feed((Path(__file__).resolve().parents[1] / "cudy_manager" / "dashboard.html").read_text(encoding="utf-8"))
-    return builder.root, "".join(builder.script)
-
-
-def run_dashboard(tmp_path: Path, scenario: str, setup: str = "") -> dict:
-    tree, script = _dashboard_markup()
-    harness = tmp_path / "dashboard_harness.js"
-    harness.write_text(DASHBOARD_HARNESS, encoding="utf-8")
-    payload = json.dumps({"tree": tree, "script": script, "setup": setup, "scenario": scenario})
-    assert NODE is not None
-    completed = subprocess.run(
-        [NODE, str(harness)], input=payload, capture_output=True, text=True, timeout=60, check=False
-    )
-    assert completed.returncode == 0, completed.stderr
-    outcome = json.loads(completed.stdout)
-    assert outcome["errors"] == [], outcome["errors"]
-    return outcome
-
-
-@needs_node
-class TestDashboardBehaviour:
-    def test_harness_renders_devices(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            "return document.getElementById('devices').textContent",
-            setup="harness.state.devices = [{id: 'r1', vendor: 'cudy', host: '192.0.2.1', transport: 'web'}]",
-        )
-        assert "192.0.2.1" in outcome["result"]
-
-    def test_a_new_notice_is_not_wiped_by_an_older_timer(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const node = document.getElementById('notice');
-            notice('first');
-            await harness.advance(2000);
-            notice('second');
-            await harness.advance(3500);
-            const shown = node.textContent;
-            await harness.advance(2000);
-            return [shown, node.textContent];
-            """,
-        )
-        assert outcome["result"] == ["second", ""]
-
-    def test_null_uptime_falls_back_to_the_text_form(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const status = {online: true, uptime_seconds: null, uptime_text: '3h 20m'};
-            return card({id: 'r1', vendor: 'tenda', host: 'h', transport: 'web', status}).textContent;
-            """,
-        )
-        assert "3h 20m" in outcome["result"]
-        assert "null" not in outcome["result"]
-
-    def test_change_ssid_is_offered_only_where_it_can_work(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const offered = {};
-            const pairs = [['cudy', 'web'], ['tplink', 'web'], ['tplink', 'ssh'], ['tenda', 'web'], ['cudy', 'ssh']];
-            for (const [vendor, transport] of pairs) {
-              const node = card({id: 'r1', vendor, host: 'h', transport, status: {}});
-              offered[vendor + '/' + transport] = harness.buttons(node).includes('Change SSID');
-            }
-            return offered;
-            """,
-        )
-        assert outcome["result"] == {
-            # CudyAdapter.set_ssid posts the router's own Wi-Fi form, as the Wi-Fi password button does.
-            "cudy/web": True,
-            "tplink/web": False,
-            # Transport first, as in DeviceManager.adapter_for: an OpenWrt-flashed TP-Link is an SSH device.
-            "tplink/ssh": True,
-            "tenda/web": True,
-            "cudy/ssh": True,
-        }
-
-    def test_the_operator_picks_the_radio_for_a_tenda(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const node = card({id: 'r1', vendor: 'tenda', host: 'h', transport: 'web', status: {}, metadata: {}});
-            harness.button(node, 'Change SSID').click();
-            const dialog = document.getElementById('ssid-dialog');
-            const form = document.getElementById('ssid-form');
-            const options = form.elements.radio.options.map(option => option.value);
-            const preselected = form.elements.radio.value;
-            form.elements.ssid.value = 'Home';
-            form.elements.radio.value = '5G';
-            await harness.submit(form);
-            await harness.flush();
-            return {open: dialog.open, options, preselected, notice: document.getElementById('notice').textContent};
-            """,
-        )
-        sent = [item for item in outcome["requests"] if item["path"].endswith("/ssid")]
-        assert [(item["path"], item["method"], item["body"]) for item in sent] == [
-            ("/api/devices/r1/ssid", "POST", {"ssid": "Home", "radio": "5G"})
-        ]
-        assert outcome["result"]["options"] == ["2.4G", "5G"]
-        assert outcome["result"]["preselected"] == "2.4G"
-        assert outcome["result"]["open"] is False
-        assert "5G" in outcome["result"]["notice"]
-
-    def test_a_tenda_preselects_its_configured_radio(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const device = {id: 'r1', vendor: 'tenda', host: 'h', transport: 'web', metadata: {radio: '5G'}};
-            const node = card(device);
-            harness.button(node, 'Change SSID').click();
-            return document.getElementById('ssid-form').elements.radio.value;
-            """,
-        )
-        assert outcome["result"] == "5G"
-
-    def test_an_ssh_device_can_keep_its_configured_section(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const node = card({id: 'r2', vendor: 'cudy', host: 'h', transport: 'ssh', status: {}, metadata: {}});
-            harness.button(node, 'Change SSID').click();
-            const form = document.getElementById('ssid-form');
-            const options = form.elements.radio.options.map(option => option.value);
-            form.elements.ssid.value = 'Office';
-            await harness.submit(form);
-            return options;
-            """,
-        )
-        assert outcome["result"] == ["", "2.4G", "5G"]
-        sent = [item["body"] for item in outcome["requests"] if item["path"].endswith("/ssid")]
-        assert sent == [{"ssid": "Office"}]
-
-    def test_a_cudy_on_the_web_ui_renames_every_band_unless_one_is_picked(self, tmp_path: Path):
-        # No radio means both bands to CudyAdapter; it has no uci_section to fall back on.
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const node = card({id: 'r3', vendor: 'cudy', host: 'h', transport: 'web', status: {}, metadata: {}});
-            harness.button(node, 'Change SSID').click();
-            const form = document.getElementById('ssid-form');
-            const options = form.elements.radio.options.map(option => [option.value, option.textContent]);
-            const preselected = form.elements.radio.value;
-            form.elements.ssid.value = 'Shop';
-            await harness.submit(form);
-            return {options, preselected};
-            """,
-        )
-        assert outcome["result"]["options"] == [["", "All bands"], ["2.4G", "2.4 GHz"], ["5G", "5 GHz"]]
-        assert outcome["result"]["preselected"] == ""
-        sent = [item["body"] for item in outcome["requests"] if item["path"].endswith("/ssid")]
-        assert sent == [{"ssid": "Shop"}]
-
-    def test_sign_out_retries_with_a_fresh_csrf_token(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            harness.state.csrf = 't2';
-            harness.handler = (path, options) => {
-              if (path === '/logout' && options.headers['X-CSRF-Token'] !== 't2') {
-                return {status: 403, body: {detail: 'CSRF validation failed'}};
-              }
-            };
-            await logout();
-            """,
-        )
-        tokens = [item["headers"].get("X-CSRF-Token") for item in outcome["requests"] if item["path"] == "/logout"]
-        assert tokens == ["t1", "t2"]
-        assert outcome["href"] == "/login"
-
-    def test_a_failed_sign_out_does_not_pretend_to_succeed(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            harness.handler = path => {
-              if (path === '/logout') return {status: 403, body: {detail: 'CSRF validation failed'}};
-            };
-            await logout();
-            return document.getElementById('notice').textContent;
-            """,
-        )
-        assert outcome["href"] == "/", "the page went to /login although the session is still valid"
-        assert "Sign out failed" in outcome["result"]
-
-    def test_the_password_dialog_is_locked_while_saving(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const reply = harness.deferred();
-            harness.handler = path => (path.endsWith('/password') ? reply.promise : undefined);
-            showPassword('A');
-            const dialog = document.getElementById('password-dialog');
-            const form = document.getElementById('password-form');
-            form.elements.password.value = 'n3w';
-            form.elements.confirm.value = 'n3w';
-            const pending = harness.submit(form);
-            await harness.flush();
-            harness.submit(form);
-            await harness.flush();
-            const save = form.querySelector('button.primary');
-            const during = {saveDisabled: save.disabled};
-            harness.escape(dialog);
-            during.openAfterEscape = dialog.open;
-            reply.resolve({status: 200, body: {password_updated: true, verified: {ok: true}}});
-            await pending;
-            await harness.flush();
-            const notice = document.getElementById('notice').textContent;
-            return {during, open: dialog.open, saveDisabled: save.disabled, notice};
-            """,
-        )
-        posts = [item for item in outcome["requests"] if item["path"].endswith("/password")]
-        assert len(posts) == 1, "a second click sent the password again"
-        assert outcome["result"]["during"] == {"saveDisabled": True, "openAfterEscape": True}
-        assert outcome["result"]["open"] is False
-        assert outcome["result"]["saveDisabled"] is False
-        assert outcome["result"]["notice"] == "Password saved and verified for A"
-
-    def test_a_late_password_result_does_not_touch_another_devices_dialog(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const reply = harness.deferred();
-            harness.handler = path => (path.endsWith('/password') ? reply.promise : undefined);
-            showPassword('A');
-            const dialog = document.getElementById('password-dialog');
-            const form = document.getElementById('password-form');
-            form.elements.password.value = 'n3w';
-            form.elements.confirm.value = 'n3w';
-            const pending = harness.submit(form);
-            await harness.flush();
-            // A browser may still force the dialog shut (a second Escape).
-            dialog.close();
-            showPassword('B');
-            form.elements.password.value = 'typing';
-            reply.resolve({status: 200, body: {password_updated: true, verified: {ok: true}}});
-            await pending;
-            await harness.flush();
-            const notice = document.getElementById('notice').textContent;
-            return {open: dialog.open, typed: form.elements.password.value, notice};
-            """,
-        )
-        assert outcome["result"]["notice"] == "Password saved and verified for A"
-        assert outcome["result"]["open"] is True, "B's dialog was closed by A's result"
-        assert outcome["result"]["typed"] == "typing", "B's form was wiped by A's result"
-
-    def test_scan_button_is_disabled_while_a_scan_runs(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const reply = harness.deferred();
-            harness.handler = path => (path === '/api/discover' ? reply.promise : undefined);
-            harness.answers.prompt.push('192.0.2.0/24');
-            const button = document.getElementById('discover-button');
-            const running = discover();
-            await harness.flush();
-            const during = button.disabled;
-            reply.resolve({status: 200, body: {devices: []}});
-            await running;
-            return [during, button.disabled];
-            """,
-        )
-        assert outcome["result"] == [True, False]
-
-    def test_add_dialog_can_configure_https(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            const form = document.getElementById('add-form');
-            form.elements.id.value = 'r1';
-            form.elements.host.value = '192.0.2.1';
-            form.elements.password.value = 'pw';
-            form.elements.https.checked = true;
-            form.elements.verify_tls.checked = false;
-            await harness.submit(form);
-            """,
-        )
-        sent = [item["body"] for item in outcome["requests"] if item["method"] == "POST"]
-        assert len(sent) == 1
-        assert sent[0]["https"] is True
-        assert sent[0]["verify_tls"] is False
-        assert sent[0]["http_port"] == "443"
-
-    def test_plain_http_to_a_public_address_needs_confirmation(self, tmp_path: Path):
-        outcome = run_dashboard(
-            tmp_path,
-            """
-            harness.answers.confirm.push(false);
-            const form = document.getElementById('add-form');
-            form.elements.id.value = 'r1';
-            form.elements.host.value = '203.0.113.9';
-            form.elements.password.value = 'pw';
-            await harness.submit(form);
-            const refused = harness.requests.filter(item => item.method === 'POST').length;
-            form.elements.host.value = '10.8.0.2';
-            await harness.submit(form);
-            return refused;
-            """,
-        )
-        assert outcome["result"] == 0, "the password went out over plain HTTP without asking"
-        sent = [item["body"] for item in outcome["requests"] if item["method"] == "POST"]
-        assert len(sent) == 1 and sent[0]["host"] == "10.8.0.2"
-        assert "http_port" not in sent[0]
 
 
 class TestSchedulerOutcomesAreLogged:

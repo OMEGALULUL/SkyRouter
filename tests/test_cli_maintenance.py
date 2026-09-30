@@ -373,6 +373,24 @@ class TestMaintenanceCommand:
         assert (answer == "") == ("\nerror: " in err)
         assert router.state["login_posts"] == 0 and logged(data) == []
 
+    @pytest.mark.parametrize(
+        ("targets", "reach"),
+        [
+            ({"groups": ["cudy"]}, "on groups: cudy now?"),
+            ({"devices": ["r1"], "groups": ["direct", "cudy"]}, "on 1 router(s) and groups: direct, cudy now?"),
+            ({"all": True}, "on every router now?"),
+        ],
+    )
+    def test_the_question_names_a_plans_groups_rather_than_counting_them(
+        self, data, router, monkeypatch, capsys, targets, reach
+    ):
+        add_router(data, router)
+        created = plan(data, targets=targets)
+        monkeypatch.setattr("sys.stdin", Terminal("n\n"))
+        code, _, err = run(["maintenance", "run", created["id"]], capsys)
+        assert code == 1 and f'Run maintenance plan "Weekly check" (firmware_check) {reach} [y/N]' in err
+        assert "0 router(s)" not in err
+
     def test_a_confirmed_run_checks_the_router_under_the_plans_name(self, data, router, monkeypatch, capsys):
         add_router(data, router)
         created = plan(data)
@@ -487,6 +505,15 @@ class TestAcsFirmwareCommand:
         assert nbi.files == {}
         code, _, err = run(["acs", "firmware", "remove", name], capsys)
         assert code == 1 and "No such firmware" in one_error_line(err)
+
+    def test_adding_and_removing_a_file_are_logged_as_the_cli_user(self, nbi, image, data, capsys):
+        name = json.loads(add_image(image, capsys, "--model-hint", "Cudy AP1300")[1])["name"]
+        assert run(["acs", "firmware", "remove", name], capsys)[0] == 0
+        entries = logged(data, kind="firmware")
+        assert [(entry["who"], entry["router"], entry["what"]) for entry in entries] == [
+            (ACTOR, f"library:{name}", f"Removed Cudy AP1300 {NEW} from the library"),
+            (ACTOR, f"library:{name}", f"Added Cudy AP1300 {NEW} to the library"),
+        ]
 
     def test_an_upgrade_asks_first(self, nbi, image, monkeypatch, capsys):
         acs_id = cudy(nbi)

@@ -976,7 +976,9 @@ class DeviceManager:
             logger.exception("status check for %s raised an unexpected error", device.identifier)
             status = {"online": False, "error": str(exc)[:200], "checked_at": checked_at}
         device.status = status
-        device.last_seen = checked_at
+        # When the router last answered: a check that found it offline is not a sighting.
+        if status.get("online") is True:
+            device.last_seen = checked_at
         return status
 
     def get_all_statuses(self) -> dict[str, dict[str, Any]]:

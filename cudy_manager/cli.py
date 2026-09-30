@@ -476,14 +476,20 @@ def _acs_firmware(acs: "AcsService", args: argparse.Namespace, held: list[str]) 
         with open(args.path, "rb") as handle:
             data = handle.read(MAX_FIRMWARE_BYTES + 1)
         record = acs.add_firmware(
-            data, os.path.basename(args.path), args.model_hint, args.version, args.oui, args.product_class
+            data,
+            os.path.basename(args.path),
+            args.model_hint,
+            args.version,
+            args.oui,
+            args.product_class,
+            actor=_actor(),
         )
         # The record, never the file: an image can embed default credentials.
         _print(record)
         print(f"stored as {record['name']}; install it with 'router-manager acs firmware upgrade'", file=sys.stderr)
         return 0
     if action == "remove":
-        _print(acs.remove_firmware(args.name))
+        _print(acs.remove_firmware(args.name, actor=_actor()))
         return 0
     acs_id = validate_device_id(args.acs_id)
     chosen = acs.firmware.get(validate_firmware_name(args.name))
@@ -711,7 +717,11 @@ def _maintenance(args: argparse.Namespace) -> int:
                 return 0
             targets = plan.targets.to_dict()
             named = len(targets["devices"]) + len(targets["acs_devices"])
-            reach = "every router" if targets["all"] else f"{named} router(s)"
+            # A group is worked out when the plan runs, so it is named rather than counted.
+            groups = f"groups: {', '.join(targets['groups'])}" if targets["groups"] else ""
+            reach = "every router" if targets["all"] else " and ".join(
+                part for part in (f"{named} router(s)" if named else "", groups) if part
+            )
             question = f'Run maintenance plan "{plan.name}" ({", ".join(plan.actions)}) on {reach} now?'
             if not _confirm(question):
                 return 1

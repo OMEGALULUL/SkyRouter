@@ -27,7 +27,9 @@ packages = ["cudy_manager", "cudy_manager.acs"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-cudy_manager = ["*.html"]
+# static/ holds the Skybre logo and favicon the login page and dashboard load; it is
+# not a package, so only this line puts it in a wheel.
+cudy_manager = ["*.html", "static/*.png"]
 # The provisions are read through importlib.resources and installed into GenieACS
 # by the bootstrap, so a wheel without them cannot bootstrap anything.
 "cudy_manager.acs" = ["provisions/*.js"]

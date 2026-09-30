@@ -445,7 +445,8 @@ def test_one_odd_document_does_not_hide_the_fleet(nbi, svc, monkeypatch):
     monkeypatch.setattr(service_module.params, "summarize", summarize)
     devices = {device["acs_id"]: device for device in svc.list_devices()["devices"]}
     assert devices[good]["model"] == "AX3000"
-    assert devices[bad] == {"acs_id": bad, "error": "SkyRouter could not read this router's document"}
+    # Its customer is SkyRouter's own record, so it still shows beside the error.
+    assert devices[bad] == {"acs_id": bad, "error": "SkyRouter could not read this router's document", "customer": None}
 
 
 def test_device_detail_includes_pending_jobs_and_faults_and_no_secret(nbi, svc):

@@ -465,6 +465,18 @@ stop the old server and copy everything in its data directory
 into `/var/lib/skyrouter`, owned by `skyrouter` and keeping the 0600 modes.
 Without `master.key` the vault cannot be decrypted.
 
+**Updating a server installed from a clone** (the code in `/opt/skyrouter/src`
+and the venv in `/opt/skyrouter/venv`, as the VPS guide sets it up):
+
+```bash
+cd /opt/skyrouter/src && sudo git pull --ff-only && sudo bash deploy/skyrouter/update.sh
+```
+
+`update.sh` reinstalls the checkout into the venv, installs the unit again if it
+changed, restarts the service and waits for `/healthz`. It stops if the pull
+cannot fast-forward (code edited on the server), and it never touches the env
+file or `/var/lib/skyrouter`.
+
 ## Verify the GenieACS package
 
 `VERSION` records the npm integrity of `genieacs-1.2.16.tgz` as it was checked on

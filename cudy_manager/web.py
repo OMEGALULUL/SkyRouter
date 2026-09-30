@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -46,11 +47,25 @@ from .manager import DeviceManager, ManagerError, default_config_path, default_d
 from .models import ValidationError
 from .scheduler import RebootScheduler
 from .secrets import SecretStoreError
+from .setup_records import MODELS as SETUP_MODELS
+from .setup_records import RecordNotFound, SetupRecords, SetupRecordsError
 
 logger = logging.getLogger(__name__)
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = PACKAGE_DIR / "dashboard.html"
+STATIC_DIR = PACKAGE_DIR / "static"
+# The only files served from STATIC_DIR, by exact path: nothing is looked up from
+# the URL, so no path can reach any other file. Public, like /login, which shows them.
+PUBLIC_ASSETS = {
+    "/assets/skybre-icon.png": "skybre-icon.png",
+    "/favicon.ico": "favicon.png",
+}
+# They change with a release, not per request, so browsers may keep them for a week.
+ASSET_CACHE = "public, max-age=604800"
+# How this session was signed in: with the passkey, here. A sign-in handed over
+# from Vexar will be the other mode.
+SESSION_MODE = "standalone"
 # Write-only credential inputs such as "password" and "snmp_community" are accepted
 # and converted to vault references before anything is written to disk. These names
 # are rejected because they either name a secret directly, or are legacy aliases
@@ -155,11 +170,46 @@ def _acs_from_env() -> dict[str, Any]:
         "acs_allow_remote": allow_remote,
         "acs_inform_interval": interval,
         "acs_scrub_secrets": _flag("ROUTER_MANAGER_ACS_SCRUB_SECRETS", True),
+        "acs_cwmp_url": _cwmp_url(os.environ.get("ROUTER_MANAGER_ACS_CWMP_URL", "")),
     }
+
+
+def _cwmp_url(raw: str) -> str | None:
+    """The ACS address a technician types into each router, which the Setup page shows.
+
+    GenieACS's CWMP service, as the routers reach it, and nothing SkyRouter itself
+    connects to. Refused at startup when it is not a plain http(s) address, because
+    every router set up from a wrong one checks in nowhere.
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+        usable = (
+            parts.scheme in ("http", "https")
+            and bool(parts.hostname)
+            and (parts.port is None or parts.port > 0)
+            and "@" not in parts.netloc
+            and not parts.query
+            and not parts.fragment
+        )
+    except ValueError:
+        # A malformed IPv6 host, or a port out of range.
+        usable = False
+    if not usable or len(text) > 256 or any(char.isspace() or not char.isprintable() for char in text):
+        # The value is not repeated: it is going into a log, and may carry a password.
+        raise ValueError(
+            "ROUTER_MANAGER_ACS_CWMP_URL must be the plain http(s) address routers reach GenieACS on, "
+            "with no credentials, query or fragment, e.g. http://10.10.0.2:7547/"
+        )
+    return text
 
 
 @dataclass
 class Settings:
+    # No longer checked: the passkey (password) alone signs in. Kept so existing
+    # environment files and callers still construct Settings unchanged.
     username: str
     password: str
     secure_cookie: bool
@@ -171,6 +221,8 @@ class Settings:
     acs_allow_remote: bool = False
     acs_inform_interval: int = acs_bootstrap.DEFAULT_INFORM_INTERVAL
     acs_scrub_secrets: bool = True
+    # What routers are told to check in to; None leaves the Setup page without one.
+    acs_cwmp_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -286,50 +338,116 @@ class LoginLimiter:
             self._values.pop(key, None)
 
 
+# The approved Skybre design's sign-in view: its colour tokens, light and dark, so
+# the page matches the dashboard, and one passkey field that the server checks.
+# The light focus ring is the deep logo blue, as on the dashboard: the design's sky
+# blue is under 3:1 on white.
 LOGIN_PAGE_TEMPLATE = """<!doctype html>
 <html lang=en><head><meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1'>
-<title>Router Manager Login</title>
-<style>
-body{font-family:system-ui,sans-serif;background:#10131a;color:#edf0f5;display:grid;place-items:center;min-height:100vh;margin:0}
-main{background:#191e28;padding:32px;border:1px solid #303847;border-radius:12px;width:min(380px,90vw)}
-h1{margin:0 0 24px;font-size:22px}
-label{display:block;margin:14px 0 6px}
-input{box-sizing:border-box;width:100%;padding:11px;border-radius:7px;
-      border:1px solid #465064;background:#10131a;color:#fff}
-button{margin-top:22px;width:100%;padding:11px;border:0;border-radius:7px;background:#4778e8;color:#fff;font-weight:700;cursor:pointer}
-.error{color:#ff8e8e}
-</style></head>
-<body><main><h1>Router Manager</h1>{notice}
-<form id=login method=post action=/login>
-<label>Username<input name=username autocomplete=username required></label>
-<label>Password<input name=password type=password autocomplete=current-password required></label>
-<button>Sign in</button>
-</form>
-<p id=message></p></main>
+<title>Skybre Router Manager</title>
+<link rel=icon type=image/png href=/favicon.ico>
 <script nonce="{nonce}">
-document.getElementById('login').addEventListener('submit', async event => {
+// The theme chosen on the dashboard, before the page paints. Storage can be blocked.
+try {
+  const saved = localStorage.getItem('skybre-theme');
+  if (saved === 'dark' || saved === 'light') document.documentElement.dataset.theme = saved;
+} catch (_) { /* follow the system */ }
+</script>
+<style>
+:root {
+  --bg: #F9F9F7; --surface: #FFFFFF; --line: #E1E0D9; --control: #C3C2B7;
+  --ink: #161616; --muted: #595853;
+  --accent: #1070B0; --accent-soft: #E8F3FA; --on-accent: #FFFFFF; --focus: #1070B0;
+  --bad-ink: #9A2626;
+  --font: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131312; --surface: #1C1C1A; --line: #35342F; --control: #4A4942;
+    --ink: #F3F2EF; --muted: #B8B6AE;
+    --accent: #5AA8DE; --accent-soft: #15293A; --on-accent: #06121C; --focus: #3FBDE6;
+    --bad-ink: #F09A9A;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131312; --surface: #1C1C1A; --line: #35342F; --control: #4A4942;
+  --ink: #F3F2EF; --muted: #B8B6AE;
+  --accent: #5AA8DE; --accent-soft: #15293A; --on-accent: #06121C; --focus: #3FBDE6;
+  --bad-ink: #F09A9A;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--font); }
+button, input { font: inherit; color: inherit; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; border-radius: 6px; }
+.login { min-height: 100%; display: grid; place-items: center; padding: 24px 16px;
+  background: radial-gradient(ellipse at top, var(--accent-soft), transparent 60%), var(--bg); }
+#login { width: min(380px, 100%); padding: 28px; display: flex; flex-direction: column; gap: 14px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+#login img { align-self: center; }
+h1 { margin: 0; font-size: 20px; text-align: center; letter-spacing: -0.01em; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field > span { font-weight: 600; font-size: 13px; }
+input { height: 38px; padding: 0 10px; border: 1px solid var(--control); border-radius: 8px;
+  background: var(--surface); color: var(--ink); }
+.btn { height: 44px; padding: 0 18px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent);
+  color: var(--on-accent); font-weight: 600; cursor: pointer; display: inline-flex; align-items: center;
+  justify-content: center; }
+.btn:hover { filter: brightness(1.08); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.error { color: var(--bad-ink); font-weight: 600; min-height: 1.2em; }
+.hint { font-size: 13px; color: var(--muted); text-align: center; margin: 0; }
+</style></head>
+<body><main class=login aria-labelledby=login-title>
+<form id=login method=post action=/login>
+<img src=/assets/skybre-icon.png width=72 height=72 alt="">
+<h1 id=login-title>Skybre Router Manager</h1>
+<label class=field><span>Passkey</span><input type=password id=login-pass name=passkey inputmode=numeric \
+autocomplete=current-password autofocus></label>
+<div class=error id=login-error role=alert>{notice}</div>
+<button class=btn type=submit>Sign in</button>
+<p class=hint>Enter the Skybre passkey. Names for the history log come from Vexar later.</p>
+<noscript><p class=hint>Signing in needs JavaScript.</p></noscript>
+</form></main>
+<script nonce="{nonce}">
+'use strict';
+const form = document.getElementById('login');
+const field = document.getElementById('login-pass');
+const message = document.getElementById('login-error');
+form.addEventListener('submit', async event => {
   event.preventDefault();
-  const form = new FormData(event.target);
-  const message = document.getElementById('message');
+  const passkey = field.value;
+  if (!passkey) { message.textContent = 'Enter the passkey.'; field.focus(); return; }
+  const button = form.querySelector('button');
+  button.disabled = true;
   try {
     const response = await fetch('/login', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(Object.fromEntries(form))
+      body: JSON.stringify({passkey})
     });
     if (response.ok) { location.href = '/'; return; }
-    message.textContent = (await response.json().catch(() => ({}))).detail || 'Login failed';
+    const detail = (await response.json().catch(() => ({}))).detail;
+    message.textContent =
+      response.status === 401 ? 'That passkey is not right.' : detail || 'Signing in failed. Try again.';
+    field.select();
   } catch (error) {
-    message.textContent = 'The server could not be reached';
+    message.textContent = 'The server could not be reached.';
+  } finally {
+    button.disabled = false;
   }
 });
 </script></body></html>"""
+# The one refusal a wrong passkey gets, from the server and in the page alike.
+WRONG_PASSKEY = "That passkey is not right."
 
 
 def _login_page(message: str = "", nonce: str = "") -> str:
-    notice = f"<p class=error>{html.escape(message)}</p>" if message else ""
-    return LOGIN_PAGE_TEMPLATE.replace("{notice}", notice).replace("{nonce}", nonce)
+    return LOGIN_PAGE_TEMPLATE.replace("{notice}", html.escape(message)).replace("{nonce}", nonce)
 
 
 def _nonce() -> str:
@@ -476,6 +594,7 @@ _ERROR_STATUS: tuple[tuple[type[BaseException], int], ...] = (
     (MaintenanceBusy, 409),
     (AcsNotFound, 404),
     (PlanNotFound, 404),
+    (RecordNotFound, 404),
     (AcsUnavailable, 502),
     (AcsRejected, 502),
     (UnsupportedOperation, 501),
@@ -496,17 +615,19 @@ async def _run_on[T](pool: ThreadPoolExecutor, func: Callable[..., T], *args: An
     return await asyncio.get_running_loop().run_in_executor(pool, call)
 
 
-async def _call_with_secret[T](secret: str | None, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+async def _call_with_secret[T](secret: Any, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Run a blocking call that is handed a secret, keeping the secret out of any error it raises.
 
     Nothing is meant to put it there, but an error's text goes back to the browser
-    and can reach the log, so it is checked rather than trusted.
+    and can reach the log, so it is checked rather than trusted. ``secret`` may be a
+    tuple of them; a value that is not a non-empty string is not a secret to look for.
     """
     try:
         return await asyncio.to_thread(func, *args, **kwargs)
     except Exception as exc:
         text = str(exc) + json.dumps(getattr(exc, "plan", None), default=str)
-        if secret and secret in text:
+        candidates = secret if isinstance(secret, tuple) else (secret,)
+        if any(isinstance(value, str) and value and value in text for value in candidates):
             logger.error(
                 "%s failed with an error that quoted the new password; its text was withheld (%s)",
                 getattr(func, "__name__", "the change"),
@@ -641,6 +762,8 @@ def create_app(
         manager, acs, plans, activity=activity, state_path=settings.data_dir / MAINTENANCE_STATE_FILE
     )
     scheduler = RebootScheduler(manager, settings.data_dir / "scheduler_state.json", maintenance=maintenance)
+    # The manager's vault, so a record's Wi-Fi password sits beside every other router secret.
+    setup = SetupRecords(settings.data_dir, manager.secrets, manager, activity)
     check_pool = ThreadPoolExecutor(FIRMWARE_CHECK_WORKERS, thread_name_prefix="firmware-check")
     run_pool = ThreadPoolExecutor(MAINTENANCE_RUN_WORKERS, thread_name_prefix="maintenance-run")
 
@@ -715,20 +838,22 @@ def create_app(
     app.state.acs = acs
     app.state.activity = activity
     app.state.maintenance = maintenance
+    app.state.setup_records = setup
     # Set by the lifespan; started jobs set it so the poll loop need not sleep out
     # its idle interval before following them.
     app.state.acs_wake = None
 
-    def _harden(response, nonce=None):
+    def _harden(response, nonce=None, cacheable=False):
         """Apply the security headers to every response, including early returns.
 
         Authentication failures, CSRF rejections, and redirects are the responses an
-        attacker most wants to embed or cache, so they must be covered too.
+        attacker most wants to embed or cache, so they must be covered too. Only a
+        public asset served whole may be cached.
         """
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Cache-Control"] = "no-store"
+        response.headers["Cache-Control"] = ASSET_CACHE if cacheable else "no-store"
         # The dashboard has no third-party assets and no inline event handlers, so a
         # strict policy applies. The script nonce is injected per request in
         # _dashboard_page; 'strict-dynamic' lets that one script load nothing else.
@@ -753,7 +878,7 @@ def create_app(
         # One nonce per request, shared by the template body and the CSP header.
         request.state.csp_nonce = _nonce()
         path = request.url.path
-        public = path in {"/login", "/healthz", "/favicon.ico"}
+        public = path in {"/login", "/healthz"} or path in PUBLIC_ASSETS
         if not public:
             if not settings.password:
                 if path.startswith("/api/"):
@@ -794,7 +919,8 @@ def create_app(
             # Without this the server's bare 500 bypasses _harden entirely.
             logger.exception("unhandled error serving %s %s", request.method, path)
             response = JSONResponse({"detail": "internal server error"}, status_code=500)
-        return _harden(response, request.state.csp_nonce)
+        cacheable = path in PUBLIC_ASSETS and request.method == "GET" and response.status_code == 200
+        return _harden(response, request.state.csp_nonce, cacheable)
 
     @app.exception_handler(AdapterError)
     async def adapter_error_handler(_, exc: AdapterError):
@@ -855,6 +981,17 @@ def create_app(
         logger.error("maintenance: %s", exc)
         return JSONResponse({"detail": f"{str(exc)[:200]}; see the SkyRouter log"}, status_code=500)
 
+    # A ValidationError, so without its own handler it would answer 400.
+    @app.exception_handler(RecordNotFound)
+    async def record_not_found_handler(_, exc: RecordNotFound):
+        return JSONResponse({"detail": _error_detail(exc)}, status_code=404)
+
+    @app.exception_handler(SetupRecordsError)
+    async def setup_records_error_handler(_, exc: SetupRecordsError):
+        # The record file, the vault or the activity log needs the operator.
+        logger.error("setup records: %s", exc)
+        return JSONResponse({"detail": f"{str(exc)[:240]}; see the SkyRouter log"}, status_code=500)
+
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok", "authentication_configured": bool(settings.password)}
@@ -871,20 +1008,17 @@ def create_app(
         if not limiter.attempt(key):
             raise HTTPException(status_code=429, detail="too many login attempts")
         body = await _body(request)
-        username = str(body.get("username", ""))
-        password = str(body.get("password", ""))
-        # Both comparisons always run. Short-circuiting on the username would make a
-        # wrong username measurably faster than a wrong password, which is enough to
-        # enumerate the configured username. surrogatepass because JSON can carry a
-        # lone surrogate ("\ud800"), which a plain encode() refuses.
-        username_ok = hmac.compare_digest(
-            username.encode("utf-8", "surrogatepass"), settings.username.encode("utf-8", "surrogatepass")
-        )
-        password_ok = hmac.compare_digest(
-            password.encode("utf-8", "surrogatepass"), settings.password.encode("utf-8", "surrogatepass")
-        )
-        if not (username_ok and password_ok):
-            raise HTTPException(status_code=401, detail="invalid credentials")
+        # The passkey alone signs in. Older clients and scripts still send
+        # {"username", "password"}: the password is read as the passkey and the
+        # username is ignored, so it no longer has to match anything.
+        supplied = body.get("passkey", body.get("password"))
+        passkey = "" if supplied is None else str(supplied)
+        # Constant-time, and one comparison whatever the body held. surrogatepass
+        # because JSON can carry a lone surrogate ("\ud800"), which a plain encode() refuses.
+        if not hmac.compare_digest(
+            passkey.encode("utf-8", "surrogatepass"), settings.password.encode("utf-8", "surrogatepass")
+        ):
+            raise HTTPException(status_code=401, detail=WRONG_PASSKEY)
         limiter.success(key)
         session = sessions.create()
         response = JSONResponse({"authenticated": True, "csrf_token": session["csrf"]})
@@ -910,9 +1044,33 @@ def create_app(
     async def dashboard_page(request: Request):
         return HTMLResponse(_dashboard_page(request.state.csp_nonce))
 
+    async def asset(path: str) -> Response:
+        try:
+            data = await asyncio.to_thread((STATIC_DIR / PUBLIC_ASSETS[path]).read_bytes)
+        except OSError:
+            # A build that left the images out; the pages still work without them.
+            logger.warning("%s is missing from %s", PUBLIC_ASSETS[path], STATIC_DIR)
+            raise HTTPException(status_code=404, detail="not found") from None
+        return Response(data, media_type="image/png")
+
+    @app.get("/assets/skybre-icon.png")
+    async def skybre_icon():
+        return await asset("/assets/skybre-icon.png")
+
+    # A PNG under the name browsers ask for by themselves; they go by the content type.
+    @app.get("/favicon.ico")
+    async def favicon():
+        return await asset("/favicon.ico")
+
     @app.get("/api/csrf")
     async def csrf(request: Request):
         return {"csrf_token": request.state.session["csrf"]}
+
+    # Who the dashboard shows as signed in, and whom the activity log names for
+    # this session's changes: both from session_actor, so they cannot disagree.
+    @app.get("/api/me")
+    async def me(request: Request):
+        return {"actor": session_actor(request), "mode": SESSION_MODE}
 
     @app.get("/api/devices")
     async def list_devices(include_status: bool = Query(False)):
@@ -1219,7 +1377,9 @@ def create_app(
 
     @app.get("/api/acs")
     async def acs_health():
-        return await asyncio.to_thread(require_acs().health)
+        health = await asyncio.to_thread(require_acs().health)
+        # Configuration, not something GenieACS reports, so it is added here.
+        return {**health, "cwmp_url": settings.acs_cwmp_url}
 
     @app.get("/api/acs/devices")
     async def acs_devices(
@@ -1299,12 +1459,14 @@ def create_app(
     async def acs_remove_tag(acs_id: str, tag: str):
         return await asyncio.to_thread(require_acs().remove_tag, acs_id, tag)
 
-    # The "New devices" inbox (§3.9): adopting only removes the first-contact tag.
+    # The "New devices" inbox (§3.9): adopting removes the first-contact tag and links
+    # the router to the Vexar customer the dashboard names, which the list then shows.
     @app.post("/api/acs/devices/{acs_id}/adopt")
     async def acs_adopt(acs_id: str, request: Request):
         service = require_acs()
-        _only(await _body(request), set())
-        return await asyncio.to_thread(service.adopt, acs_id)
+        body = await _body(request)
+        _only(body, {"customer"})
+        return await asyncio.to_thread(service.adopt, acs_id, body.get("customer"), actor=session_actor(request))
 
     # Lets a reloaded dashboard pick up the jobs it was following.
     @app.get("/api/acs/jobs")
@@ -1380,13 +1542,21 @@ def create_app(
         limit_mib = MAX_FIRMWARE_UPLOAD // (1024 * 1024)
         data = await _read_capped(request, MAX_FIRMWARE_UPLOAD, f"the firmware file is larger than {limit_mib} MiB")
         record = await asyncio.to_thread(
-            service.add_firmware, data, values["filename"], values["model_hint"], version, oui, product_class
+            service.add_firmware,
+            data,
+            values["filename"],
+            values["model_hint"],
+            version,
+            oui,
+            product_class,
+            actor=session_actor(request),
         )
         return {"firmware": record}
 
     @app.delete("/api/acs/firmware/{name}")
-    async def acs_firmware_remove(name: str):
-        return await asyncio.to_thread(require_acs().remove_firmware, name)
+    async def acs_firmware_remove(name: str, request: Request):
+        service = require_acs()
+        return await asyncio.to_thread(service.remove_firmware, name, actor=session_actor(request))
 
     @app.post("/api/acs/devices/{acs_id}/firmware", status_code=202)
     async def acs_firmware_upgrade(acs_id: str, request: Request):
@@ -1464,6 +1634,36 @@ def create_app(
         count = _page_param(limit, "limit", 50, 1, 500)
         state = await asyncio.to_thread(maintenance.get_state)
         return {"runs": _recent_runs(state, _text_param(plan, "plan", 64), count)}
+
+    # --- setup records: the Setup page's "Program a new router". A record's Wi-Fi
+    # and admin passwords live in the vault only; the one route that returns the
+    # Wi-Fi password logs the view first.
+
+    @app.get("/api/setup/records")
+    async def setup_records_list():
+        return {"records": await asyncio.to_thread(setup.list), "models": list(SETUP_MODELS)}
+
+    @app.post("/api/setup/records", status_code=201)
+    async def setup_record_create(request: Request):
+        body = await _body(request)
+        who = session_actor(request)
+        secrets_given = (body.get("wifi_password"), body.get("admin_password"))
+        return await _call_with_secret(secrets_given, setup.create, body, who)
+
+    @app.post("/api/setup/records/{record_id}/reveal")
+    async def setup_record_reveal(record_id: str, request: Request):
+        body = await _body(request)
+        _only(body, {"confirm"})
+        if body.get("confirm") is not True:
+            raise HTTPException(
+                status_code=400,
+                detail="confirm must be true: viewing the saved Wi-Fi password is recorded in the activity log",
+            )
+        return {"wifi_password": await asyncio.to_thread(setup.reveal, record_id, session_actor(request))}
+
+    @app.delete("/api/setup/records/{record_id}")
+    async def setup_record_delete(record_id: str, request: Request):
+        return await asyncio.to_thread(setup.delete, record_id, session_actor(request))
 
     return app
 

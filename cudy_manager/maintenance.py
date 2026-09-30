@@ -1,10 +1,11 @@
 """Maintenance plans: routine work on a group of routers inside a chosen window.
 
-A plan names its routers (direct ones by device id, TR-069 ones by GenieACS id),
-a weekly or monthly window in a timezone, the actions to take and the guards that
-hold them back. MaintenanceRunner acts on each router at most once per window, an
-"occurrence" keyed on the plan and the local date the window opens, and records
-every outcome in the activity log under the plan's name.
+A plan names its routers (direct ones by device id, TR-069 ones by GenieACS id,
+or whole groups that are resolved each time it runs), a weekly or monthly window
+in a timezone, the actions to take and the guards that hold them back.
+MaintenanceRunner acts on each router at most once per window, an "occurrence"
+keyed on the plan and the local date the window opens, and records every outcome
+in the activity log under the plan's name.
 
 Direct routers are reached through DeviceManager, so the per-router lock and the
 rejected-credential latch apply exactly as they do to the dashboard. TR-069
@@ -26,7 +27,7 @@ import threading
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -55,6 +56,12 @@ ACTIONS = ("firmware_check", "auto_update_on", "firmware_update", "reboot")
 # guards exist for them; the cooldown is only counted from these.
 DISRUPTIVE = frozenset({"firmware_update", "reboot"})
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+# Router groups a plan can name instead of listing ids: every enabled direct router,
+# every adopted TR-069 router, and every Cudy of either kind. Each is resolved when
+# the plan runs, so a router added later is included without editing the plan.
+GROUPS = ("direct", "managed", "cudy")
+# The groups that can hold a TR-069 router, and so need the ACS fleet listed.
+_ACS_GROUPS = frozenset({"managed", "cudy"})
 
 PLANS_FILE = "maintenance.json"
 STATE_FILE = "maintenance_state.json"
@@ -201,6 +208,24 @@ def _display_name(device: Device) -> str:
     return name.strip() if isinstance(name, str) and name.strip() else device.identifier
 
 
+def _is_cudy_device(device: Device) -> bool:
+    # The vendor picks the adapter, so it is the make SkyRouter actually talks to;
+    # the model is free text.
+    return device.vendor == "cudy"
+
+
+def _direct_groups(device: Device) -> frozenset[str]:
+    return frozenset({"direct", "cudy"} if _is_cudy_device(device) else {"direct"})
+
+
+def _is_cudy_acs(summary: Mapping[str, Any]) -> bool:
+    """Whether a TR-069 router's own DeviceInfo says it is a Cudy."""
+    return any(
+        isinstance(value, str) and "cudy" in value.casefold()
+        for value in (summary.get("manufacturer"), summary.get("model"))
+    )
+
+
 def _refused(exc: BaseException) -> bool:
     """Whether SkyRouter declined the action itself, as opposed to trying and failing."""
     return isinstance(exc, (ValidationError, ManagerError, UnsupportedOperation, CredentialLatched, AcsBusy))
@@ -265,16 +290,37 @@ class PlanTargets:
     all_routers: bool = False
     devices: tuple[str, ...] = ()
     acs_devices: tuple[str, ...] = ()
+    groups: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, value: Any) -> "PlanTargets":
-        data = _fields(value, "targets", ("all", "devices", "acs_devices"))
+        data = _fields(value, "targets", ("all", "devices", "acs_devices", "groups"))
         every = _flag(data.get("all"), "targets.all", False)
         devices = cls._ids(data.get("devices"), "targets.devices", "a SkyRouter device id", _DEVICE_ID.fullmatch)
         acs_devices = cls._ids(data.get("acs_devices"), "targets.acs_devices", "a GenieACS device ID", _is_acs_id)
-        if not (every or devices or acs_devices):
-            raise ValidationError("targets must name at least one router, or set all to true")
-        return cls(every, devices, acs_devices)
+        groups = cls._groups(data.get("groups"))
+        if not (every or devices or acs_devices or groups):
+            raise ValidationError("targets must name at least one router or group, or set all to true")
+        return cls(every, devices, acs_devices, groups)
+
+    @staticmethod
+    def _groups(value: Any) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise ValidationError("targets.groups must be a list")
+        chosen = set()
+        for item in value:
+            group = item.strip().lower() if isinstance(item, str) else None
+            if group not in GROUPS:
+                raise ValidationError(f"targets.groups may only hold {', '.join(GROUPS)}")
+            chosen.add(group)
+        return tuple(group for group in GROUPS if group in chosen)
+
+    @property
+    def reaches_acs(self) -> bool:
+        """Whether the plan can reach a TR-069 router at all."""
+        return self.all_routers or bool(self.acs_devices) or not _ACS_GROUPS.isdisjoint(self.groups)
 
     @staticmethod
     def _ids(value: Any, name: str, what: str, check: Callable[[str], Any]) -> tuple[str, ...]:
@@ -293,7 +339,12 @@ class PlanTargets:
         return tuple(chosen)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"all": self.all_routers, "devices": list(self.devices), "acs_devices": list(self.acs_devices)}
+        return {
+            "all": self.all_routers,
+            "devices": list(self.devices),
+            "acs_devices": list(self.acs_devices),
+            "groups": list(self.groups),
+        }
 
 
 def _is_acs_id(value: str) -> bool:
@@ -484,9 +535,10 @@ class MaintenancePlan:
         if "firmware_update" in actions:
             if not firmware:
                 raise ValidationError("firmware_update needs a firmware file chosen for at least one product class")
-            if not (targets.all_routers or targets.acs_devices):
+            if not targets.reaches_acs:
                 raise ValidationError(
-                    "firmware_update is only sent to TR-069 routers; add acs_devices or set targets.all"
+                    "firmware_update is only sent to TR-069 routers; add acs_devices, "
+                    "the managed or cudy group, or set targets.all"
                 )
         stamps = [fields.get(key) or "" for key in ("created_at", "updated_at")]
         if any(not isinstance(stamp, str) for stamp in stamps):
@@ -695,6 +747,10 @@ class MaintenanceStore:
 class _Target:
     via: str  # "direct" or "acs"
     id: str
+    # The plan groups it belongs to, as far as this pass has learned. A TR-069
+    # router's make is only in the ACS fleet listing, which is read once per pass;
+    # this is how the checks later in the pass still know it.
+    groups: frozenset[str] = field(default=frozenset(), compare=False)
 
     @property
     def key(self) -> str:
@@ -971,23 +1027,42 @@ class MaintenanceRunner:
         chosen: dict[str, _Target] = {}
 
         def add(target: _Target) -> None:
-            chosen.setdefault(target.key, target)
+            # Once per router however many ways the plan names it, keeping what each
+            # way learned of the groups it belongs to.
+            existing = chosen.get(target.key)
+            if existing is not None:
+                target = replace(existing, groups=existing.groups | target.groups)
+            chosen[target.key] = target
 
-        if plan.targets.all_routers:
+        targets = plan.targets
+        groups = set(targets.groups)
+        if targets.all_routers or groups & {"direct", "cudy"}:
             for device in self.manager.get_all_devices():
                 # Disabling a device is how an operator stops SkyRouter contacting it;
                 # one named in the plan is still reported as held back.
-                if device.enabled:
-                    add(_Target("direct", device.identifier))
-        for identifier in plan.targets.devices:
+                member = _direct_groups(device)
+                if device.enabled and (targets.all_routers or member & groups):
+                    add(_Target("direct", device.identifier, member))
+        for identifier in targets.devices:
             add(_Target("direct", identifier))
-        for acs_id in plan.targets.acs_devices:
+        for acs_id in targets.acs_devices:
             add(_Target("acs", acs_id))
         problems: list[dict[str, Any]] = []
-        if plan.targets.all_routers and self.acs is not None:
+        if self.acs is None and "managed" in groups:
+            # Otherwise a plan for the TR-069 routers would quietly do nothing at all.
+            visit = _Visit(plan, occurrence, trigger, who, _Target("acs", "*"))
+            problem = self._held_back(
+                visit, "TR-069 management is off, so the managed group has no routers", "skipped", current
+            )
+            if problem is not None:
+                problems.append(problem)
+        elif self.acs is not None and (targets.all_routers or groups & _ACS_GROUPS):
             try:
-                for acs_id in self._acs_fleet():
-                    add(_Target("acs", acs_id))
+                for summary in self._acs_fleet():
+                    # Every router in the listing is adopted, so it is in the managed group.
+                    member = frozenset({"managed", "cudy"} if _is_cudy_acs(summary) else {"managed"})
+                    if targets.all_routers or member & groups:
+                        add(_Target("acs", summary["acs_id"], member))
             except (AcsError, ValidationError) as exc:
                 visit = _Visit(plan, occurrence, trigger, who, _Target("acs", "*"))
                 problem = self._held_back(visit, f"could not list the TR-069 routers: {_short(exc)}", "failed", current)
@@ -995,11 +1070,11 @@ class MaintenanceRunner:
                     problems.append(problem)
         return list(chosen.values()), problems
 
-    def _acs_fleet(self) -> list[str]:
-        """Every adopted TR-069 router. One still in the "new" inbox has not been vetted by anyone."""
+    def _acs_fleet(self) -> list[dict[str, Any]]:
+        """The summary of every adopted TR-069 router. One still in the "new" inbox has not been vetted by anyone."""
         if self.acs is None:
             return []
-        found: list[str] = []
+        found: dict[str, dict[str, Any]] = {}
         skip = 0
         while skip < MAX_ACS_FLEET:
             page = self.acs.list_devices(skip=skip, limit=ACS_PAGE)
@@ -1007,11 +1082,11 @@ class MaintenanceRunner:
             for device in devices:
                 acs_id = device.get("acs_id")
                 if isinstance(acs_id, str) and NEW_DEVICE_TAG not in (device.get("tags") or []) and acs_id not in found:
-                    found.append(acs_id)
+                    found[acs_id] = device
             skip += len(devices)
             if not devices or skip >= int(page.get("total") or 0):
                 break
-        return found
+        return list(found.values())
 
     def _plan_problem(self, plan: MaintenancePlan, reason: str) -> dict[str, Any]:
         logger.warning("maintenance plan %s: %s", plan.id, reason)
@@ -1083,11 +1158,21 @@ class MaintenanceRunner:
         """Now, on the pass's timeline."""
         return _utc(self.clock()) + visit.clock_offset
 
-    @staticmethod
-    def _names(plan: MaintenancePlan, target: _Target) -> bool:
-        if plan.targets.all_routers:
+    def _names(self, plan: MaintenancePlan, target: _Target) -> bool:
+        targets = plan.targets
+        if targets.all_routers:
             return True
-        return target.id in (plan.targets.devices if target.via == "direct" else plan.targets.acs_devices)
+        if target.via == "acs":
+            return target.id in targets.acs_devices or not target.groups.isdisjoint(targets.groups)
+        if target.id in targets.devices or "direct" in targets.groups:
+            return True
+        if "cudy" not in targets.groups:
+            return False
+        try:
+            return _is_cudy_device(self.manager.get_device(target.id))
+        except ManagerError:
+            # Gone from SkyRouter: the guard says so, which is the better reason to give.
+            return True
 
     def _still_due(self, visit: _Visit) -> str | None:
         """Why the visit must stop now, if it must, with the plan re-read from the store.

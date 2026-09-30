@@ -2,3 +2,5 @@
 exclude cudy_manager/cudy_devices.yaml cudy_manager/cudy_devices.yaml.lock
 # The ACS bootstrap installs these into GenieACS; they are data, not Python.
 recursive-include cudy_manager/acs/provisions *.js
+# The Skybre logo and favicon, served from the package by the web app.
+recursive-include cudy_manager/static *.png

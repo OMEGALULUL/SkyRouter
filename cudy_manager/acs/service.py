@@ -76,6 +76,7 @@ from .jobs import (
     WAITING_FOR_CHECKIN,
     WATCH_BOOT,
     WATCH_SCRUB,
+    AdoptionIndex,
     FirmwareIndex,
     JobStore,
     JobStoreError,
@@ -122,10 +123,15 @@ _ACTIVITY_RESULTS = {
     CANCELLED: "info",
 }
 SYSTEM_ACTOR = "system"
+# The longest Vexar customer the adopt dialog may link a router to: a customer number
+# and name, with room for a site ("#1080 Customer A, shop 2").
+CUSTOMER_MAX = 120
 
 # §3.8 allows fewer characters than GenieACS or the client would.
 _TAG_RE = re.compile(r"[a-z0-9_-]{1,32}")
 _SSID_BAD_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
+# Also line separators and bidirectional overrides, which can make a customer read as another.
+_CUSTOMER_BAD_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff]")
 # uniqueKey suffixes: one Wi-Fi change per band replaces the last (F14).
 _BAND_KEYS = {"2.4GHz": "24ghz", "5GHz": "5ghz", "6GHz": "6ghz", params.BAND_ALL: "all"}
 _REPLAN_CODES = frozenset({"9007", "9008"})
@@ -233,6 +239,26 @@ def validate_ssid(ssid: Any) -> str:
     return validate_wifi_ssid(ssid)
 
 
+def validate_customer(customer: Any) -> str | None:
+    """The Vexar customer an adopted router is linked to, trimmed; None when not given.
+
+    A tab or line break inside it is refused rather than turned into a space: it is
+    shown on one line in the list and the activity log, and nobody types one there.
+    """
+    if customer is None:
+        return None
+    if not isinstance(customer, str):
+        raise ValidationError("customer must be text")
+    text = customer.strip()
+    if not text:
+        raise ValidationError("Enter the Vexar customer.")
+    if _CUSTOMER_BAD_RE.search(text):
+        raise ValidationError("customer must not contain control characters")
+    if len(text) > CUSTOMER_MAX:
+        raise ValidationError(f"customer must be at most {CUSTOMER_MAX} characters")
+    return text
+
+
 def _short(exc: BaseException | str, limit: int = 200) -> str:
     return clean_text(str(exc), limit)
 
@@ -320,6 +346,7 @@ class AcsService:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.jobs = JobStore(self.data_dir, self._now)
         self.firmware = FirmwareIndex(self.data_dir)
+        self.adoptions = AdoptionIndex(self.data_dir)
         # Optional: the permanent who-changed-what log. Each Wi-Fi, reboot and
         # firmware job lands there once, when it first reaches a terminal state.
         self.activity = activity
@@ -368,6 +395,11 @@ class AcsService:
         except JobStoreError as exc:
             result["problems"].append(str(exc))
         try:
+            self.adoptions.all()
+        except JobStoreError as exc:
+            # The router list still loads without it, so this is where it shows.
+            result["problems"].append(f"{exc}: the routers' customers cannot be shown and adopting is refused")
+        try:
             result["version"] = self.client.version()
             self.client.check_db()
         except AcsError as exc:
@@ -415,7 +447,21 @@ class AcsService:
             "devices", query, projection=params.SUMMARY_PROJECTION, sort={"_lastInform": -1}, skip=skip, limit=limit
         )
         now = self._now()
-        return {"devices": [self._summary(doc, now) for doc in page.items], "total": page.total}
+        customers = self._customers()
+        devices = []
+        for doc in page.items:
+            summary = self._summary(doc, now)
+            summary["customer"] = customers.get(str(summary.get("acs_id")), {}).get("customer")
+            devices.append(summary)
+        return {"devices": devices, "total": page.total}
+
+    def _customers(self) -> dict[str, dict[str, Any]]:
+        """Every router's adoption record, or none while the file is damaged: the fleet must still list."""
+        try:
+            return self.adoptions.all()
+        except JobStoreError as exc:
+            logger.error("listing the TR-069 routers without their customers: %s", exc)
+            return {}
 
     def _summary(self, doc: dict[str, Any], now: datetime) -> dict[str, Any]:
         try:
@@ -431,6 +477,7 @@ class AcsService:
         validate_device_id(acs_id)
         doc = self._device(acs_id, params.DETAIL_PROJECTION)
         device = params.detail(doc, self._now(), self.inform_interval)
+        device["customer"] = self._customers().get(acs_id, {}).get("customer")
         device["pending_jobs"] = self.list_jobs(acs_id=acs_id, active_only=True)
         device["faults"] = [_fault_summary(fault) for fault in self.client.faults(device_id=acs_id)]
         return {"device": device}
@@ -658,6 +705,7 @@ class AcsService:
         version: str,
         oui: str,
         product_class: str,
+        actor: str = SYSTEM_ACTOR,
     ) -> dict[str, Any]:
         """Store a firmware image on the ACS and in SkyRouter's library; returns its record.
 
@@ -667,6 +715,7 @@ class AcsService:
         DeviceId), which every upgrade is checked against. The stored name is random:
         genieacs-fs hands any stored file, unauthenticated, to whoever knows its name.
         """
+        who = _actor(actor)
         if not isinstance(data, (bytes, bytearray)):
             raise ValidationError("the firmware must be given as bytes")
         if not data:
@@ -705,6 +754,7 @@ class AcsService:
         except (JobStoreError, OSError):
             self._discard_file(name)
             raise
+        self._log_library(who, record, f"Added {hint or product_class} {version} to the library")
         return {**record, "on_acs": True, "in_use_by": []}
 
     def list_firmware(self) -> list[dict[str, Any]]:
@@ -726,10 +776,12 @@ class AcsService:
         views.sort(key=lambda view: str(view.get("uploaded_at", "")), reverse=True)
         return views
 
-    def remove_firmware(self, name: str) -> dict[str, Any]:
+    def remove_firmware(self, name: str, actor: str = SYSTEM_ACTOR) -> dict[str, Any]:
         """Delete a library file from the ACS and the library. AcsBusy while an upgrade uses it."""
         nbi_tasks.validate_firmware_name(name)
-        if self.firmware.get(name) is None:
+        who = _actor(actor)
+        record = self.firmware.get(name)
+        if record is None:
             raise AcsNotFound("No such firmware in the library", status=404)
         # Under the lock, so an upgrade cannot start on the file between the check
         # and the delete and then have the router fetch a file that is gone.
@@ -742,7 +794,36 @@ class AcsService:
             with contextlib.suppress(AcsNotFound):
                 self.client.delete_file(name)
             self.firmware.remove(name)
+        model = record.get("model_hint") or record.get("product_class")
+        self._log_library(who, record, f"Removed {model} {record.get('version')} from the library")
         return {"name": name, "removed": True}
+
+    def _log_library(self, who: str, record: dict[str, Any], what: str) -> None:
+        # Under the file's own name: the library is not a router, and "acs:" names one.
+        self._log(
+            who=who,
+            router=f"library:{record.get('name')}",
+            router_name="Firmware library",
+            kind="firmware",
+            what=what,
+            result="applied",
+            details={
+                "file": record.get("name"),
+                "version": record.get("version"),
+                "oui": record.get("oui"),
+                "product_class": record.get("product_class"),
+                "size": record.get("size"),
+            },
+        )
+
+    def _log(self, **entry: Any) -> None:
+        """One activity entry for a change already made. Failing to record it never undoes the change."""
+        if self.activity is None:
+            return
+        try:
+            self.activity.record(**entry)
+        except Exception:  # noqa: BLE001 - the audit log must never turn a change that happened into an error
+            logger.exception("could not record in the activity log: %s", entry.get("what"))
 
     def _firmware_users(self) -> dict[str, list[str]]:
         users: dict[str, list[str]] = {}
@@ -929,9 +1010,46 @@ class AcsService:
         self.client.remove_tag(acs_id, tag)
         return {"acs_id": acs_id, "tags": self._tags(acs_id)}
 
-    def adopt(self, acs_id: str) -> dict[str, Any]:
-        """Take a router out of the "New devices" inbox (§3.9)."""
-        return self.remove_tag(acs_id, bootstrap.NEW_DEVICE_TAG)
+    def adopt(self, acs_id: str, customer: str | None = None, actor: str = SYSTEM_ACTOR) -> dict[str, Any]:
+        """Take a router out of the "New devices" inbox (§3.9), linked to its Vexar customer when one is given.
+
+        The link is stored before the tag goes, and put back if GenieACS refuses, so a
+        router never leaves the inbox with its customer unrecorded. Adopting again
+        replaces the customer.
+        """
+        validate_device_id(acs_id)
+        who = _actor(actor)
+        linked = validate_customer(customer)
+        # Also the 404 for an unknown router, before anything is stored.
+        summary = self._summary(self._device(acs_id, params.SUMMARY_PROJECTION), self._now())
+        previous = None
+        if linked is not None:
+            record = {"customer": linked, "adopted_at": iso(self._now()), "adopted_by": who}
+            previous = self.adoptions.put(acs_id, record)
+        try:
+            self.client.remove_tag(acs_id, bootstrap.NEW_DEVICE_TAG)
+        except Exception as exc:
+            # When the outcome is unknown the tag may be gone, so the link stays; if it
+            # is not, the router is still in the inbox and its next adoption replaces it.
+            if linked is not None and not (isinstance(exc, AcsUnavailable) and exc.outcome_unknown):
+                try:
+                    self.adoptions.put(acs_id, previous)
+                except (JobStoreError, OSError):
+                    logger.exception("could not undo the customer link of %s", acs_id)
+            raise
+        # The tag is gone, so from here the adoption stands: logged before the tags are
+        # read back, which only reports them and may fail on its own.
+        kept = linked if linked is not None else self._customers().get(acs_id, {}).get("customer")
+        self._log(
+            who=who,
+            router=f"acs:{acs_id}",
+            router_name=" · ".join(str(part) for part in (summary.get("model"), summary.get("serial")) if part),
+            kind="setup",
+            what=f"Adopted: linked to {linked}" if linked else "Adopted from the new routers list",
+            result="applied",
+            details={"customer": linked} if linked else None,
+        )
+        return {"acs_id": acs_id, "tags": self._tags(acs_id), "customer": kept}
 
     def bootstrap(self, remove_seeded: bool = False) -> dict[str, Any]:
         return bootstrap.install(self.client, self.inform_interval, remove_seeded=remove_seeded)
