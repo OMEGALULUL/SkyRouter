@@ -2890,3 +2890,64 @@ class TestPlanReach:
         direct_plan = {**PLAN, "targets": {"all": False, "groups": ["direct"], "devices": [], "acs_devices": []}}
         line, asked, _ = self.reach(tmp_path, direct_plan, self.SEARCH)
         assert line == "Direct (3)" and asked.startswith("It acts on 3 routers straight away")
+
+
+# --- the online count on the Connected devices tab --------------------------------------
+
+
+@needs_node
+class TestOnlineCount:
+    """The Connected devices tab says, in small, how many devices are online."""
+
+    CLIENTS = [{"name": "Phone", "cells": ["1", "Phone", "10.20.10.21", "aa:bb"]},
+               {"name": "Laptop", "cells": ["2", "Laptop", "10.20.10.22", "aa:cc"]}]
+    SCENARIO = """
+        await harness.open(%s);
+        const count = byId('t-devices-count');
+        return {text: count.textContent, hidden: count.hidden, tab: byId('t-devices').textContent.trim(),
+                overview: byId('t-overview').getAttribute('aria-selected'), paths: harness.paths()};
+        """
+
+    def _direct(self, tmp_path: Path, name: str, clients: list) -> dict:
+        return run_page(
+            tmp_path,
+            self.SCENARIO % json.dumps(name),
+            setup=NO_ACS + f"""
+            harness.handler = (req) => {{
+              if (req.path.endsWith('/clients')) return {reply({"clients": clients})};
+            }};
+            """,
+        )["result"]
+
+    def test_a_direct_router_shows_its_count_before_the_tab_is_opened(self, tmp_path: Path):
+        result = self._direct(tmp_path, "Hennenman kantoor", self.CLIENTS)
+        assert result["overview"] == "true", "the count is read while the Overview is showing"
+        assert (result["text"], result["hidden"]) == ("2 online", False)
+        assert result["tab"] == "Connected devices 2 online"
+        assert result["paths"].count("GET /api/devices/hk/clients") == 1
+
+    def test_a_router_with_nobody_connected_says_0_online(self, tmp_path: Path):
+        result = self._direct(tmp_path, "Hennenman kantoor", [])
+        assert (result["text"], result["hidden"]) == ("0 online", False)
+
+    @pytest.mark.parametrize("name", ["Tenda shop", "Tower 3 office"])
+    def test_an_offline_or_refused_direct_router_is_not_asked_and_shows_no_count(self, tmp_path: Path, name: str):
+        result = self._direct(tmp_path, name, self.CLIENTS)
+        assert (result["text"], result["hidden"]) == ("", True)
+        assert result["tab"] == "Connected devices"
+        assert not [path for path in result["paths"] if path.endswith("/clients")]
+
+    def test_a_managed_router_counts_only_hosts_still_connected(self, tmp_path: Path):
+        detail = {"clients": [{"mac": "aa", "hostname": "Laptop", "active": True},
+                              {"mac": "bb", "hostname": "Phone"},
+                              {"mac": "cc", "hostname": "Left an hour ago", "active": False}]}
+        result = run_page(
+            tmp_path,
+            self.SCENARIO % json.dumps("WR3000 · AB-1"),
+            setup=FLEET + f"harness.db.acsDetail[{json.dumps(ACS_ID)}] = {json.dumps(detail)};",
+        )["result"]
+        assert (result["text"], result["hidden"]) == ("2 online", False)
+
+    def test_an_offline_managed_router_shows_no_count(self, tmp_path: Path):
+        result = run_page(tmp_path, self.SCENARIO % json.dumps("WR1300 · CD1"), setup=FLEET)["result"]
+        assert (result["text"], result["hidden"]) == ("", True)

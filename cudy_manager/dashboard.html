@@ -165,6 +165,7 @@ td:last-child, th:last-child { padding-right: 24px; }
 .tabs { display: flex; gap: 2px; padding: 0 20px; border-bottom: 1px solid var(--line-soft); }
 .tabs button { height: 40px; padding: 0 12px; border: none; border-bottom: 2px solid transparent; background: none; color: var(--ink-2); font-weight: 600; cursor: pointer; }
 .tabs button[aria-selected="true"] { border-bottom-color: var(--accent); color: var(--accent-ink); }
+.tabs button small { margin-left: 4px; font-size: 11px; font-weight: 600; color: var(--muted); }
 .drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 20px 24px; display: flex; flex-direction: column; gap: 16px; }
 .band { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; }
 .band b { font-size: 15px; overflow-wrap: anywhere; }
@@ -500,7 +501,7 @@ dialog::backdrop { background: var(--scrim); }
       </div>
       <div class="tabs" role="tablist" aria-label="Router details">
         <button type="button" role="tab" id="t-overview" aria-selected="true" aria-controls="p-overview">Overview</button>
-        <button type="button" role="tab" id="t-devices" aria-selected="false" aria-controls="p-devices">Connected devices</button>
+        <button type="button" role="tab" id="t-devices" aria-selected="false" aria-controls="p-devices">Connected devices <small id="t-devices-count" hidden></small></button>
         <button type="button" role="tab" id="t-history" aria-selected="false" aria-controls="p-history">History</button>
       </div>
       <div class="drawer-body" id="p-overview" role="tabpanel" aria-labelledby="t-overview"></div>
@@ -1364,11 +1365,29 @@ function renderDrawer() {
   byId('d-remove').hidden = r.kind !== 'direct';
   markChosen(['overview', 'devices', 'history'].map((name) => byId(`t-${name}`)), 'aria-selected', (b) => b.id === `t-${tab}`);
   ['overview', 'devices', 'history'].forEach((name) => { byId(`p-${name}`).hidden = tab !== name; });
+  // A direct router's device list is read as the panel opens, so the tab can say how many
+  // are online before anyone clicks it; a managed router's comes with the overview's detail.
+  if (r.kind === 'direct' && !r.blocked) ensureClients(r);
   renderPanel(tab);
+}
+function onlineCount(r) {
+  if (r.blocked || r.away) return null;
+  const read = r.kind === 'direct' ? entry(r.key).clients : null;
+  if (read && Array.isArray(read.data)) return connected(read.data).length;
+  return typeof r.clients === 'number' ? r.clients : null;
+}
+function showOnlineCount(r) {
+  const n = onlineCount(r);
+  const node = byId('t-devices-count');
+  const text = n === null ? '' : `${n} online`;
+  if (node.textContent !== text) node.textContent = text;
+  node.hidden = !text;
 }
 // Redrawn with each poll and each read that lands, so a control in it keeps focus by its data-focus key.
 function renderPanel(name) {
-  const r = routerByKey(openKey); if (!r || tab !== name) return;
+  const r = routerByKey(openKey); if (!r) return;
+  showOnlineCount(r);
+  if (tab !== name) return;
   const panel = byId(`p-${name}`);
   keepingFocus(() => {
     if (name === 'overview') renderOverview(r, panel);
