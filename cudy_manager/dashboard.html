@@ -2269,11 +2269,16 @@ function planWindow(s) {
   const days = s.monthly_day ? `Day ${s.monthly_day} of each month` : (s.days || []).length === 7 ? 'Every day' : (s.days || []).map((d) => (DAYS.find((x) => x[0] === d) || [d, d])[1]).join(', ');
   return `${days} ${s.start}–${pad(Math.floor(end / 60))}:${pad(end % 60)}`;
 }
-// Shown in the plan's own timezone, which is where its window opens.
+// Shown in the plan's own timezone, which is where its window opens. Put together from
+// its parts: browsers and ICU versions punctuate the whole date differently.
 function zoned(iso, zone) {
   const d = when(iso); if (!d) return '—';
-  try { return new Intl.DateTimeFormat('en-GB', { timeZone: zone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(d).replace(',', ''); }
-  catch (_) { return stamp(iso); }
+  try {
+    const parts = {};
+    new Intl.DateTimeFormat('en-GB', { timeZone: zone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+      .formatToParts(d).forEach((part) => { parts[part.type] = part.value; });
+    return `${parts.weekday} ${parts.day} ${parts.month} ${parts.hour}:${parts.minute}`;
+  } catch (_) { return stamp(iso); }
 }
 function nextRun(plan) {
   if (!plan.enabled) return '—';
